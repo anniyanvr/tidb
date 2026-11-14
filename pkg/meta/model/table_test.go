@@ -1,0 +1,313 @@
+// Copyright 2024 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package model
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/charset"
+	"github.com/pingcap/tidb/pkg/parser/duration"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/parser/types"
+	"github.com/stretchr/testify/require"
+)
+
+func checkOffsets(t *testing.T, tbl *TableInfo, ids ...int) {
+	require.Equal(t, len(ids), len(tbl.Columns))
+	for i := range ids {
+		expected := fmt.Sprintf("c_%d", ids[i])
+		require.Equal(t, expected, tbl.Columns[i].Name.L)
+		require.Equal(t, i, tbl.Columns[i].Offset)
+	}
+	for _, col := range tbl.Columns {
+		for _, idx := range tbl.Indices {
+			for _, idxCol := range idx.Columns {
+				if col.Name.L != idxCol.Name.L {
+					continue
+				}
+				// Columns with the same name should have a same offset.
+				require.Equal(t, col.Offset, idxCol.Offset)
+			}
+		}
+	}
+}
+
+func TestMoveColumnInfo(t *testing.T) {
+	c0 := newColumnForTest(0, 0)
+	c1 := newColumnForTest(1, 1)
+	c2 := newColumnForTest(2, 2)
+	c3 := newColumnForTest(3, 3)
+	c4 := newColumnForTest(4, 4)
+
+	i0 := newIndexForTest(0, c0, c1, c2, c3, c4)
+	i1 := newIndexForTest(1, c4, c2)
+	i2 := newIndexForTest(2, c0, c4)
+	i3 := newIndexForTest(3, c1, c2, c3)
+	i4 := newIndexForTest(4, c3, c2, c1)
+
+	tbl := &TableInfo{
+		ID:      1,
+		Name:    ast.NewCIStr("t"),
+		Columns: []*ColumnInfo{c0, c1, c2, c3, c4},
+		Indices: []*IndexInfo{i0, i1, i2, i3, i4},
+	}
+
+	// Original offsets: [0, 1, 2, 3, 4]
+	tbl.MoveColumnInfo(4, 0)
+	checkOffsets(t, tbl, 4, 0, 1, 2, 3)
+	tbl.MoveColumnInfo(2, 3)
+	checkOffsets(t, tbl, 4, 0, 2, 1, 3)
+	tbl.MoveColumnInfo(3, 2)
+	checkOffsets(t, tbl, 4, 0, 1, 2, 3)
+	tbl.MoveColumnInfo(0, 4)
+	checkOffsets(t, tbl, 0, 1, 2, 3, 4)
+	tbl.MoveColumnInfo(2, 2)
+	checkOffsets(t, tbl, 0, 1, 2, 3, 4)
+	tbl.MoveColumnInfo(0, 0)
+	checkOffsets(t, tbl, 0, 1, 2, 3, 4)
+	tbl.MoveColumnInfo(1, 4)
+	checkOffsets(t, tbl, 0, 2, 3, 4, 1)
+	tbl.MoveColumnInfo(3, 0)
+	checkOffsets(t, tbl, 4, 0, 2, 3, 1)
+}
+
+func TestModelBasic(t *testing.T) {
+	column := &ColumnInfo{
+		ID:           1,
+		Name:         ast.NewCIStr("c"),
+		Offset:       0,
+		DefaultValue: 0,
+		FieldType:    *types.NewFieldType(0),
+		Hidden:       true,
+	}
+	column.AddFlag(mysql.PriKeyFlag)
+
+	index := &IndexInfo{
+		Name:  ast.NewCIStr("key"),
+		Table: ast.NewCIStr("t"),
+		Columns: []*IndexColumn{
+			{
+				Name:   ast.NewCIStr("c"),
+				Offset: 0,
+				Length: 10,
+			}},
+		Unique:  true,
+		Primary: true,
+	}
+
+	fk := &FKInfo{
+		RefCols: []ast.CIStr{ast.NewCIStr("a")},
+		Cols:    []ast.CIStr{ast.NewCIStr("a")},
+	}
+
+	seq := &SequenceInfo{
+		Increment: 1,
+		MinValue:  1,
+		MaxValue:  100,
+	}
+
+	table := &TableInfo{
+		ID:          1,
+		Name:        ast.NewCIStr("t"),
+		Charset:     "utf8",
+		Collate:     "utf8_bin",
+		Columns:     []*ColumnInfo{column},
+		Indices:     []*IndexInfo{index},
+		ForeignKeys: []*FKInfo{fk},
+		PKIsHandle:  true,
+	}
+
+	table2 := &TableInfo{
+		ID:       2,
+		Name:     ast.NewCIStr("s"),
+		Sequence: seq,
+	}
+
+	dbInfo := &DBInfo{
+		ID:      1,
+		Name:    ast.NewCIStr("test"),
+		Charset: "utf8",
+		Collate: "utf8_bin",
+	}
+	dbInfo.Deprecated.Tables = []*TableInfo{table}
+
+	n := dbInfo.Clone()
+	require.Equal(t, dbInfo, n)
+
+	pkName := table.GetPkName()
+	require.Equal(t, ast.NewCIStr("c"), pkName)
+	newColumn := table.GetPkColInfo()
+	require.Equal(t, true, newColumn.Hidden)
+	require.Equal(t, column, newColumn)
+	inIdx := table.ColumnIsInIndex(column)
+	require.Equal(t, true, inIdx)
+	tp := ast.IndexTypeBtree
+	require.Equal(t, "BTREE", tp.String())
+	tp = ast.IndexTypeHash
+	require.Equal(t, "HASH", tp.String())
+	tp = 1e5
+	require.Equal(t, "", tp.String())
+	has := index.HasPrefixIndex()
+	require.Equal(t, true, has)
+	require.Equal(t, TSConvert2Time(table.UpdateTS), table.GetUpdateTime())
+	require.True(t, table2.IsSequence())
+	require.False(t, table2.IsBaseTable())
+
+	// Corner cases
+	column.ToggleFlag(mysql.PriKeyFlag)
+	pkName = table.GetPkName()
+	require.Equal(t, ast.NewCIStr(""), pkName)
+	newColumn = table.GetPkColInfo()
+	require.Nil(t, newColumn)
+	anCol := &ColumnInfo{
+		Name: ast.NewCIStr("d"),
+	}
+	exIdx := table.ColumnIsInIndex(anCol)
+	require.Equal(t, false, exIdx)
+	anIndex := &IndexInfo{
+		Columns: []*IndexColumn{},
+	}
+	no := anIndex.HasPrefixIndex()
+	require.Equal(t, false, no)
+
+	extraPK := NewExtraHandleColInfo()
+	require.Equal(t, mysql.NotNullFlag|mysql.PriKeyFlag, extraPK.GetFlag())
+	require.Equal(t, charset.CharsetBin, extraPK.GetCharset())
+	require.Equal(t, charset.CollationBin, extraPK.GetCollate())
+}
+
+func TestTTLInfoClone(t *testing.T) {
+	ttlInfo := &TTLInfo{
+		ColumnName:       ast.NewCIStr("test"),
+		IntervalExprStr:  "test_expr",
+		IntervalTimeUnit: 5,
+		Enable:           true,
+	}
+
+	clonedTTLInfo := ttlInfo.Clone()
+	clonedTTLInfo.ColumnName = ast.NewCIStr("test_2")
+	clonedTTLInfo.IntervalExprStr = "test_expr_2"
+	clonedTTLInfo.IntervalTimeUnit = 9
+	clonedTTLInfo.Enable = false
+
+	require.Equal(t, "test", ttlInfo.ColumnName.O)
+	require.Equal(t, "test_expr", ttlInfo.IntervalExprStr)
+	require.Equal(t, 5, ttlInfo.IntervalTimeUnit)
+	require.Equal(t, true, ttlInfo.Enable)
+}
+
+func TestStorageClassTransitionsJSONIncludesAfterSeconds(t *testing.T) {
+	for _, seconds := range []uint{0, 17} {
+		rules := []StorageClassTransitRule{{Tier: StorageClassTierIA, AfterDays: 30, AfterSeconds: seconds}}
+		for _, metadata := range []any{
+			TableInfo{StorageClassTransitions: rules},
+			PartitionDefinition{StorageClassTransitions: rules},
+		} {
+			data, err := json.Marshal(metadata)
+			require.NoError(t, err)
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(data, &fields))
+			// CSE requires after_seconds to be present even for days-only rules.
+			expected := fmt.Sprintf(`[{"tier":"IA","after_days":30,"after_seconds":%d}]`, seconds)
+			require.JSONEq(t, expected, string(fields["storage_class_transitions"]))
+		}
+	}
+}
+
+func TestTableInfoCloneStorageClassTransitions(t *testing.T) {
+	tblInfo := &TableInfo{
+		StorageClassTransitions: []StorageClassTransitRule{{Tier: StorageClassTierIA, AfterDays: 30}},
+		Partition: &PartitionInfo{Definitions: []PartitionDefinition{{
+			ID:                      1,
+			StorageClassTransitions: []StorageClassTransitRule{{Tier: StorageClassTierIA, AfterDays: 7}},
+		}}},
+	}
+
+	cloned := tblInfo.Clone()
+	cloned.StorageClassTransitions[0].Tier = StorageClassTierStandard
+	cloned.Partition.Definitions[0].StorageClassTransitions[0].Tier = StorageClassTierStandard
+
+	require.Equal(t, StorageClassTierIA, tblInfo.StorageClassTransitions[0].Tier)
+	require.Equal(t, StorageClassTierIA, tblInfo.Partition.Definitions[0].StorageClassTransitions[0].Tier)
+}
+
+func TestMaterializedViewInfoClone(t *testing.T) {
+	info := &MaterializedViewInfo{
+		BaseTableIDs:                    []int64{1, 2},
+		SQLContent:                      "select 1",
+		DefinitionSQLMode:               mysql.ModeANSIQuotes,
+		RefreshScheduleSQLMode:          mysql.ModePipesAsConcat,
+		DefinitionDivPrecisionIncrement: 4,
+		DefinitionTimeZone:              TimeZoneLocation{Name: "UTC"},
+	}
+	_, err := info.DefinitionTimeZone.GetLocation()
+	require.NoError(t, err)
+
+	clone := info.Clone()
+	require.Equal(t, info.BaseTableIDs, clone.BaseTableIDs)
+	require.Equal(t, info.SQLContent, clone.SQLContent)
+	require.Equal(t, info.DefinitionSQLMode, clone.DefinitionSQLMode)
+	require.Equal(t, info.RefreshScheduleSQLMode, clone.RefreshScheduleSQLMode)
+	require.Equal(t, info.DefinitionDivPrecisionIncrement, clone.DefinitionDivPrecisionIncrement)
+	require.Equal(t, info.DefinitionTimeZone.Name, clone.DefinitionTimeZone.Name)
+	location, err := clone.DefinitionTimeZone.GetLocation()
+	require.NoError(t, err)
+	require.Equal(t, "UTC", location.String())
+}
+
+func TestTTLJobInterval(t *testing.T) {
+	ttlInfo := &TTLInfo{}
+
+	interval, err := ttlInfo.GetJobInterval()
+	require.NoError(t, err)
+	require.Equal(t, time.Hour, interval)
+
+	ttlInfo = &TTLInfo{JobInterval: "200h"}
+	interval, err = ttlInfo.GetJobInterval()
+	require.NoError(t, err)
+	require.Equal(t, time.Hour*200, interval)
+}
+
+func TestClearReorgIntermediateInfo(t *testing.T) {
+	ptInfo := &PartitionInfo{}
+	ptInfo.DDLType = ast.PartitionTypeHash
+	ptInfo.DDLExpr = "Test DDL Expr"
+	ptInfo.NewTableID = 1111
+
+	ptInfo.ClearReorgIntermediateInfo()
+	require.Equal(t, ast.PartitionTypeNone, ptInfo.DDLType)
+	require.Equal(t, "", ptInfo.DDLExpr)
+	require.Equal(t, true, ptInfo.DDLColumns == nil)
+	require.Equal(t, int64(0), ptInfo.NewTableID)
+}
+
+func TestTTLDefaultJobInterval(t *testing.T) {
+	// test default value of `DefaultTTLJobInterval` is valid.
+	d, err := duration.ParseDuration(DefaultTTLJobInterval)
+	require.NoError(t, err)
+	require.Equal(t, 24*time.Hour, d)
+	// test default value of `StarterDefaultTTLJobInterval` is valid.
+	d, err = duration.ParseDuration(StarterDefaultTTLJobInterval)
+	require.NoError(t, err)
+	require.Equal(t, 15*time.Minute, d)
+	// test default value of `OldDefaultTTLJobInterval` is valid.
+	d, err = duration.ParseDuration(OldDefaultTTLJobInterval)
+	require.NoError(t, err)
+	require.Equal(t, time.Hour, d)
+}

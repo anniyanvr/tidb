@@ -1,0 +1,870 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package index
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/domain/infosync"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/planner/util"
+	"github.com/pingcap/tidb/pkg/session/sessmgr"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
+	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/testkit/testdata"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNullConditionForPrefixIndex(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, testKit *testkit.TestKit, cascades, caller string) {
+		testKit.MustExec("use test")
+		testKit.MustExec(`CREATE TABLE t1 (
+  id char(1) DEFAULT NULL,
+  c1 varchar(255) DEFAULT NULL,
+  c2 text DEFAULT NULL,
+  KEY idx1 (c1),
+  KEY idx2 (c1,c2(5))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`)
+
+		testKit.MustExec("create table t2(a int, b varchar(10), index idx(b(5)))")
+		testKit.MustExec("create table t3(a int, b varchar(10), c int, primary key (a, b(5)) clustered)")
+		testKit.MustExec("set tidb_opt_prefix_index_single_scan = 1")
+		testKit.MustExec("insert into t1 values ('a', '0xfff', '111111'), ('b', '0xfff', '22    '), ('c', '0xfff', ''), ('d', '0xfff', null)")
+		testKit.MustExec("insert into t2 values (1, 'aaaaaa'), (2, 'bb    '), (3, ''), (4, null)")
+		testKit.MustExec("insert into t3 values (1, 'aaaaaa', 2), (1, 'bb    ', 3), (1, '', 4)")
+
+		var input []string
+		var output []struct {
+			SQL    string
+			Plan   []string
+			Result []string
+		}
+		integrationSuiteData := GetIntegrationSuiteData()
+		integrationSuiteData.LoadTestCases(t, &input, &output, cascades, caller)
+		for i, tt := range input {
+			testdata.OnRecord(func() {
+				output[i].SQL = tt
+				output[i].Plan = testdata.ConvertRowsToStrings(testKit.MustQuery("explain format = 'plan_tree' " + tt).Rows())
+				output[i].Result = testdata.ConvertRowsToStrings(testKit.MustQuery(tt).Sort().Rows())
+			})
+			testKit.MustQuery("explain format = 'plan_tree' " + tt).Check(testkit.Rows(output[i].Plan...))
+			testKit.MustQuery(tt).Sort().Check(testkit.Rows(output[i].Result...))
+		}
+
+		// test plan cache
+		testKit.MustExec(`set tidb_enable_prepared_plan_cache=1`)
+		testKit.MustExec("set @@tidb_enable_collect_execution_info=0")
+		testKit.MustExec("prepare stmt from 'select count(1) from t1 where c1 = ? and c2 is not null'")
+		testKit.MustExec("set @a = '0xfff'")
+		testKit.MustQuery("execute stmt using @a").Check(testkit.Rows("3"))
+		testKit.MustQuery("execute stmt using @a").Check(testkit.Rows("3"))
+
+		testKit.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+		testKit.MustQuery("execute stmt using @a").Check(testkit.Rows("3"))
+		tkProcess := testKit.Session().ShowProcess()
+		ps := []*sessmgr.ProcessInfo{tkProcess}
+		testKit.Session().SetSessionManager(&testkit.MockSessionManager{PS: ps})
+		testKit.MustQuery(fmt.Sprintf("explain format = 'brief' for connection %d", tkProcess.ID)).Check(testkit.Rows(
+			"StreamAgg 1.00 root  funcs:count(Column#8)->Column#6",
+			"└─IndexReader 1.00 root  index:StreamAgg",
+			"  └─StreamAgg 1.00 cop[tikv]  funcs:count(1)->Column#8",
+			"    └─IndexRangeScan 99.90 cop[tikv] table:t1, index:idx2(c1, c2) range:[\"0xfff\" -inf,\"0xfff\" +inf], keep order:false, stats:pseudo"))
+	})
+}
+
+func TestInvisibleIndex(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, testKit *testkit.TestKit, cascades, caller string) {
+		testKit.MustExec("use test")
+		testKit.MustExec("CREATE TABLE t1 ( a INT, KEY( a ) INVISIBLE );")
+		testKit.MustExec("INSERT INTO t1 VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);")
+		testKit.MustQuery(`explain format = 'plan_tree' SELECT a FROM t1;`).Check(
+			testkit.Rows(
+				`TableReader root  data:TableFullScan`,
+				`└─TableFullScan cop[tikv] table:t1 keep order:false, stats:pseudo`))
+		testKit.MustExec("set session tidb_opt_use_invisible_indexes=on;")
+		testKit.MustQuery(`explain format = 'plan_tree' SELECT a FROM t1;`).Check(
+			testkit.Rows(
+				`IndexReader root  index:IndexFullScan`,
+				`└─IndexFullScan cop[tikv] table:t1, index:a(a) keep order:false, stats:pseudo`))
+	})
+}
+
+func TestRangeDerivation(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, testKit *testkit.TestKit, cascades, caller string) {
+		testKit.MustExec("use test")
+		testKit.MustExec(`set @@tidb_opt_fix_control = "54337:ON"`)
+		testKit.MustExec("create table t1 (a1 int, b1 int, c1 int, primary key pkx (a1,b1));")
+		testKit.MustExec("create table t1char (a1 char(5), b1 char(5), c1 int, primary key pkx (a1,b1));")
+		testKit.MustExec("create table t(a int, b int, c int, primary key(a,b));")
+		testKit.MustExec("create table tuk (a int, b int, c int, unique key (a, b, c));")
+		testKit.MustExec("set @@session.tidb_regard_null_as_point=false;")
+
+		var input []string
+		var output []struct {
+			SQL  string
+			Plan []string
+		}
+		indexRangeSuiteData := GetIndexRangeSuiteData()
+		indexRangeSuiteData.LoadTestCases(t, &input, &output, cascades, caller)
+		for i, sql := range input {
+			plan := testKit.MustQuery("explain format = 'plan_tree' " + sql)
+			testdata.OnRecord(func() {
+				output[i].SQL = sql
+				output[i].Plan = testdata.ConvertRowsToStrings(plan.Rows())
+			})
+			plan.Check(testkit.Rows(output[i].Plan...))
+		}
+	})
+}
+
+func TestRowFunctionMatchTheIndexRangeScan(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, testKit *testkit.TestKit, cascades, caller string) {
+		testKit.MustExec("use test")
+		testKit.MustExec(`set @@tidb_opt_fix_control = "54337:ON"`)
+		testKit.MustExec(`CREATE TABLE t1 (k1 int , k2 int, k3 int, index pk1(k1, k2))`)
+		testKit.MustExec(`create table t2 (k1 int, k2 int)`)
+		var input []string
+		var output []struct {
+			SQL    string
+			Plan   []string
+			Result []string
+		}
+		integrationSuiteData := GetIntegrationSuiteData()
+		integrationSuiteData.LoadTestCases(t, &input, &output, cascades, caller)
+		for i, tt := range input {
+			testdata.OnRecord(func() {
+				output[i].SQL = tt
+				output[i].Plan = testdata.ConvertRowsToStrings(testKit.MustQuery("explain format = 'plan_tree' " + tt).Rows())
+				output[i].Result = testdata.ConvertRowsToStrings(testKit.MustQuery(tt).Sort().Rows())
+			})
+			testKit.MustQuery("explain format = 'plan_tree' " + tt).Check(testkit.Rows(output[i].Plan...))
+			testKit.MustQuery(tt).Sort().Check(testkit.Rows(output[i].Result...))
+		}
+	})
+}
+
+func TestRangeIntersection(t *testing.T) {
+	t.Run("issue72780", func(t *testing.T) {
+		tk := testkit.NewTestKit(t, testkit.CreateMockStore(t))
+		tk.MustExec("use test")
+		tk.MustExec("set @@tidb_opt_fix_control = '54337:ON'")
+		tk.MustExec("create table issue72780 (id int primary key, a int, b bigint, c bigint, key abc(a,b,c))")
+		tk.MustExec("insert into issue72780 values (1,0,null,1),(2,0,9,1),(3,0,10,null),(4,0,10,19),(5,0,10,20),(6,1,9,1),(7,2,10,19),(8,5,9,1),(9,0,11,1)")
+		cases := []struct {
+			predicate string
+			ranges    string
+		}{
+			{"a in (1,0,5,2) and ((a=0 and (b<10 or b is null)) or (a=0 and b=10 and (c<20 or c is null)))", "range:[0 NULL,0 10), [0 10 NULL,0 10 20)"},
+			{"a in (1,0,5,2) and (a=0 or (a=0 and b=1701659790724 and (c<209597 or c is null)))", "range:[0,0]"},
+			{"a in (-1,0,1) and ((a>0 and b=9) or (a=0 and b>9))", "range:(0 9,0 +inf], [1 9,1 +inf]"},
+		}
+		for _, tt := range cases {
+			query := "select id from issue72780 %s where " + tt.predicate + " order by a desc,b desc,c desc limit 3"
+			indexed := fmt.Sprintf(query, "force index(abc)")
+			found := false
+			for _, row := range tk.MustQuery("explain format='brief' " + indexed).Rows() {
+				if strings.Contains(fmt.Sprint(row[0]), "IndexRangeScan") {
+					found = true
+					require.Contains(t, fmt.Sprint(row), tt.ranges+", keep order:")
+				}
+			}
+			require.True(t, found)
+			for _, quota := range []int{0, 1, 1024} {
+				tk.MustExec(fmt.Sprintf("set @@tidb_opt_range_max_size = %d", quota))
+				for _, limit := range []int{3, 50} {
+					q := strings.Replace(query, "limit 3", fmt.Sprintf("limit %d", limit), 1)
+					tk.MustQuery(fmt.Sprintf(q, "force index(abc)")).Check(tk.MustQuery(fmt.Sprintf(q, "ignore index(abc)")).Rows())
+				}
+			}
+			tk.MustExec("set @@tidb_opt_range_max_size = default")
+		}
+		tk.MustQuery("select id from issue72780 force index(abc) where a in (1,2) and ((a=0 and b<10) or (a=0 and b=10 and c<20))").Check(testkit.Rows())
+		tk.MustExec("create table prefix72780 (a varchar(8), b int, key ab(a(1),b))")
+		tk.MustExec("insert into prefix72780 values ('aa',1),('ab',1),('ab',2),('ba',1),('ba',2),('bb',2)")
+		prefixQuery := "select a,b from prefix72780 %s where a in ('aa','ab','ba') and ((a='ab' and b=1) or (a='ba' and b=2)) order by a,b limit 10"
+		tk.MustQuery(fmt.Sprintf(prefixQuery, "force index(ab)")).Check(tk.MustQuery(fmt.Sprintf(prefixQuery, "ignore index(ab)")).Rows())
+		tk.MustExec("prepare stmt from 'select id from issue72780 force index(abc) where a in (?,?) and ((a=0 and b<10) or (a=0 and b=10 and c<20)) order by id'")
+		tk.MustExec("set @a=0,@b=1")
+		tk.MustQuery("execute stmt using @a,@b").Check(testkit.Rows("2", "4"))
+		tk.MustExec("set @a=1,@b=2")
+		tk.MustQuery("execute stmt using @a,@b").Check(testkit.Rows())
+		for _, typ := range []string{"enum('a','z','b')", "set('a','z','b')"} {
+			tk.MustExec("drop table if exists enum72780")
+			tk.MustExec("create table enum72780 (a int, b " + typ + ", c int, key abc(a,b,c))")
+			tk.MustExec("insert into enum72780 values (0,'a',1),(0,'z',1),(0,'b',1),(1,'a',1),(1,'z',1),(1,'b',1),(0,null,1)")
+			for _, predicate := range []string{
+				"a in (0,1) and b in ('a','z','b') and ((a=0 and b='z' and c>0) or (a=1 and b='a' and c>0))",
+				"a in (0,1) and ((a=0 and b in ('a','z','b') and c>0) or (a=1 and b='z' and c>0))",
+			} {
+				q := "select a,b,c from enum72780 %s where " + predicate + " order by a,b,c limit 50"
+				tk.MustQuery(fmt.Sprintf(q, "force index(abc)")).Check(tk.MustQuery(fmt.Sprintf(q, "ignore index(abc)")).Rows())
+			}
+		}
+
+		tk.MustExec("create table bit72780 (a int, b bit(16), key ab(a,b))")
+		tk.MustExec("insert into bit72780 values (1,255),(1,256),(1,511),(1,512),(2,255),(2,256),(2,511),(2,512),(1,null)")
+		bitQuery := "select a,b+0 from bit72780 %s where a in (1,2) and ((a=1 and b=255) or (a=2 and b<512)) order by a,b"
+		tk.MustQuery(fmt.Sprintf(bitQuery, "force index(ab)")).Check(testkit.Rows("1 255", "2 255", "2 256", "2 511"))
+		tk.MustQuery(fmt.Sprintf(bitQuery, "force index(ab)")).Check(tk.MustQuery(fmt.Sprintf(bitQuery, "ignore index(ab)")).Rows())
+
+		tk.MustExec("deallocate prepare stmt")
+	})
+
+	testkit.RunTestUnderCascades(t, func(t *testing.T, testKit *testkit.TestKit, cascades, caller string) {
+		testKit.MustExec("use test")
+		testKit.MustExec(`set @@tidb_opt_fix_control = "54337:ON"`)
+		testKit.MustExec("create table t1 (a1 int, b1 int, c1 int, key pkx (a1,b1));")
+
+		testKit.MustExec("create table t_inlist_test(a1 int,b1 int,c1 varbinary(767) DEFAULT NULL, KEY twoColIndex (a1,b1));")
+		testKit.MustExec("insert into t1 values (1,1,1);")
+		testKit.MustExec("insert into t1 values (null,1,1);")
+		testKit.MustExec("insert into t1 values (1,null,1);")
+		testKit.MustExec("insert into t1 values (1,1,null);")
+		testKit.MustExec("insert into t1 values (1,10,1);")
+		testKit.MustExec("insert into t1 values (10,20,1);")
+		testKit.MustExec("insert into t1 select a1+1,b1,c1+1 from t1;")
+		testKit.MustExec("insert into t1 select a1,b1+1,c1+1 from t1;")
+		testKit.MustExec("insert into t1 select a1-1,b1+1,c1+1 from t1;")
+		testKit.MustExec("insert into t1 select a1+2,b1+2,c1+2 from t1;")
+		testKit.MustExec("insert into t1 select a1+2,b1-2,c1+2 from t1;")
+		testKit.MustExec("insert into t1 select a1+2,b1-1,c1+2 from t1;")
+		testKit.MustExec("insert into t1 select null,b1,c1+1 from t1;")
+		testKit.MustExec("insert into t1 select a1,null,c1+1 from t1;")
+
+		testKit.MustExec("create table t11 (a1 int, b1 int, c1 int);")
+		testKit.MustExec("insert into t11 select * from t1;")
+
+		testKit.MustExec("CREATE TABLE `tablename` (`primary_key` varbinary(1024) NOT NULL,`secondary_key` varbinary(1024) NOT NULL,`timestamp` bigint(20) NOT NULL,`value` mediumblob DEFAULT NULL,PRIMARY KEY PKK (`primary_key`,`secondary_key`,`timestamp`));")
+
+		testKit.MustExec("create table t(a int, b int, c int, key PKK(a,b,c));")
+		testKit.MustExec("create table tt(a int, b int, c int, primary key PKK(a,b,c));")
+		testKit.MustExec("insert into t select * from t1;")
+		testKit.MustExec("insert into tt select * from t1 where a1 is not null and b1 is not null and c1 is not null;")
+		testKit.MustExec("CREATE TABLE tnull (a INT, KEY PK(a));")
+		testKit.MustExec("create table tkey_string(id1 CHAR(16) not null, id2 VARCHAR(16) not null, id3 BINARY(16) not null, id4 VARBINARY(16) not null, id5 BLOB not null, id6 TEXT not null, id7 ENUM('x-small', 'small', 'medium', 'large', 'x-large') not null, id8 SET ('a', 'b', 'c', 'd') not null, name varchar(16), primary key(id1, id2, id3, id4, id7, id8)) PARTITION BY KEY(id7) partitions 4;")
+		testKit.MustExec("INSERT INTO tkey_string VALUES('huaian','huaian','huaian','huaian','huaian','huaian','x-small','a','linpin');")
+		testKit.MustExec("INSERT INTO tkey_string VALUES('nanjing','nanjing','nanjing','nanjing','nanjing','nanjing','small','b','linpin');")
+		testKit.MustExec("INSERT INTO tkey_string VALUES('zhenjiang','zhenjiang','zhenjiang','zhenjiang','zhenjiang','zhenjiang','medium','c','linpin');")
+		testKit.MustExec("INSERT INTO tkey_string VALUES('suzhou','suzhou','suzhou','suzhou','suzhou','suzhou','large','d','linpin');")
+		testKit.MustExec("INSERT INTO tkey_string VALUES('wuxi','wuxi','wuxi','wuxi','wuxi','wuxi','x-large','a','linpin');")
+		testKit.MustExec("create table t_issue_60556(a int, b int, ac char(3), bc char(3), key ab(a,b), key acbc(ac,bc));")
+		testKit.MustExec("insert into t_issue_60556 values (100, 500, '100', '500');")
+
+		var input []string
+		var output []struct {
+			SQL    string
+			Plan   []string
+			Result []string
+		}
+		indexRangeSuiteData := GetIndexRangeSuiteData()
+		indexRangeSuiteData.LoadTestCases(t, &input, &output, cascades, caller)
+		for i, sql := range input {
+			plan := testKit.MustQuery("explain format = 'plan_tree' " + sql)
+			testdata.OnRecord(func() {
+				output[i].SQL = sql
+				output[i].Plan = testdata.ConvertRowsToStrings(plan.Rows())
+				output[i].Result = testdata.ConvertRowsToStrings(testKit.MustQuery(sql).Sort().Rows())
+			})
+			plan.Check(testkit.Rows(output[i].Plan...))
+			testKit.MustQuery(sql).Sort().Check(testkit.Rows(output[i].Result...))
+		}
+	})
+}
+
+func TestOrderedIndexWithIsNull(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, testKit *testkit.TestKit, cascades, caller string) {
+		testKit.MustExec("use test")
+		testKit.MustExec("CREATE TABLE t1 (a int key, b int, c int, index (b, c));")
+		testKit.MustQuery("explain format = 'plan_tree' select a from t1 where b is null order by c").Check(testkit.Rows(
+			"Projection root  test.t1.a",
+			"└─IndexReader root  index:IndexRangeScan",
+			"  └─IndexRangeScan cop[tikv] table:t1, index:b(b, c) range:[NULL,NULL], keep order:true, stats:pseudo",
+		))
+		// https://github.com/pingcap/tidb/issues/56116
+		testKit.MustExec("create table t2(id bigint(20) DEFAULT NULL, UNIQUE KEY index_on_id (id))")
+		testKit.MustExec("insert into t2 values (), (), ()")
+		testKit.MustExec("analyze table t2")
+		testKit.MustQuery("explain format = 'plan_tree' select count(*) from t2 where id is null;").Check(testkit.Rows(
+			"StreamAgg root  funcs:count(Column)->Column",
+			"└─IndexReader root  index:StreamAgg",
+			"  └─StreamAgg cop[tikv]  funcs:count(1)->Column",
+			"    └─IndexRangeScan cop[tikv] table:t2, index:index_on_id(id) range:[NULL,NULL], keep order:false"))
+	})
+}
+
+func TestVectorIndex(t *testing.T) {
+	testkit.RunTestUnderCascadesAndDomainWithSchemaLease(t, 600*time.Millisecond, []mockstore.MockTiKVStoreOption{mockstore.WithMockTiFlash(2)}, func(t *testing.T, testKit *testkit.TestKit, dom *domain.Domain, cascades, caller string) {
+		testKit.MustExec("use test")
+
+		tiflash := infosync.NewMockTiFlash()
+		infosync.SetMockTiFlash(tiflash)
+		defer func() {
+			tiflash.Lock()
+			tiflash.StatusServer.Close()
+			tiflash.Unlock()
+		}()
+
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess", `return(1)`)
+
+		testKit.MustExec("create table t (a int, b vector, c vector(3), d vector(4));")
+		testKit.MustExec("alter table t set tiflash replica 1;")
+		testKit.MustExec("alter table t add vector index vecIdx1((vec_cosine_distance(d))) USING HNSW;")
+		testkit.SetTiFlashReplica(t, dom, "test", "t")
+		testKit.MustUseIndex("select * from t use index(vecIdx1) order by vec_cosine_distance(d, '[1,1,1,1]') limit 1", "vecIdx1")
+		testKit.MustUseIndex("select * from t use index(vecIdx1) order by vec_cosine_distance('[1,1,1,1]', d) limit 1", "vecIdx1")
+		testKit.MustExecToErr("select * from t use index(vecIdx1) order by vec_l2_distance(d, '[1,1,1,1]') limit 1")
+		testKit.MustExecToErr("select * from t use index(vecIdx1) where a = 5 order by vec_cosine_distance(d, '[1,1,1,1]') limit 1")
+	})
+}
+
+func TestInvertedIndex(t *testing.T) {
+	testkit.RunTestUnderCascadesAndDomainWithSchemaLease(t, 600*time.Millisecond, []mockstore.MockTiKVStoreOption{mockstore.WithMockTiFlash(2)}, func(t *testing.T, testKit *testkit.TestKit, dom *domain.Domain, cascades, caller string) {
+		testKit.MustExec("use test")
+
+		tiflash := infosync.NewMockTiFlash()
+		infosync.SetMockTiFlash(tiflash)
+		defer func() {
+			tiflash.Lock()
+			tiflash.StatusServer.Close()
+			tiflash.Unlock()
+		}()
+
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess", `return(1)`)
+
+		testKit.MustExec("create table t (a int, b bigint, c tinyint, d smallint unsigned, columnar index idx_a (a) using inverted, columnar index idx_b (b) using inverted);")
+		testKit.MustExec("alter table t add columnar index idx_c (c) USING inverted;")
+		testKit.MustExec("alter table t add columnar index idx_d (d) USING inverted;")
+		testKit.MustExec("insert into t values (1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3), (4, 4, 4, 4);")
+		testkit.SetTiFlashReplica(t, dom, "test", "t")
+
+		testKit.MustUseIndex("select * from t force index(idx_a) where a > 0", "idx_a")
+		testKit.MustUseIndex("select * from t force index(idx_b) where b < 0", "idx_b")
+		testKit.MustUseIndex("select * from t force index(idx_c) where c = 0", "idx_c")
+		testKit.MustUseIndex("select * from t force index(idx_d) where d != 0", "idx_d")
+		testKit.MustNoIndexUsed("select * from t ignore index(idx_a) where a = 1")
+		testKit.MustNoIndexUsed("select * from t ignore index(idx_b) where b = 2")
+		testKit.MustNoIndexUsed("select * from t ignore index(idx_c) where c = 3")
+		testKit.MustNoIndexUsed("select * from t ignore index(idx_d) where d < 1")
+	})
+}
+
+func TestAnalyzeColumnarIndex(t *testing.T) {
+	testkit.RunTestUnderCascadesAndDomainWithSchemaLease(t, 200*time.Millisecond, []mockstore.MockTiKVStoreOption{mockstore.WithMockTiFlash(2)}, func(t *testing.T, testKit *testkit.TestKit, dom *domain.Domain, cascades, caller string) {
+		testKit.MustExec("use test")
+		testKit.MustExec("drop table if exists t;")
+
+		tiflash := infosync.NewMockTiFlash()
+		infosync.SetMockTiFlash(tiflash)
+		defer func() {
+			tiflash.Lock()
+			tiflash.StatusServer.Close()
+			tiflash.Unlock()
+		}()
+		testKit.MustExec(`create table t(a int, b vector(2), c datetime, j json, index(a))`)
+		testKit.MustExec("insert into t values(1, '[1, 0]', '2022-01-01 12:00:00', '{\"a\": 1}')")
+		testKit.MustExec("alter table t set tiflash replica 2 location labels 'a','b';")
+		tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
+		require.NoError(t, err)
+		tblInfo := tbl.Meta()
+		err = domain.GetDomain(testKit.Session()).DDLExecutor().UpdateTableReplicaInfo(testKit.Session(), tblInfo.ID, true)
+		require.NoError(t, err)
+		testkit.SetTiFlashReplica(t, dom, "test", "t")
+
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/MockCheckColumnarIndexProcess", `return(1)`)
+		testKit.MustExec("alter table t add vector index idx((VEC_COSINE_DISTANCE(b))) USING HNSW")
+		testKit.MustExec("alter table t add columnar index idx2(c) USING INVERTED")
+
+		testKit.MustUseIndex("select * from t use index(idx) order by vec_cosine_distance(b, '[1, 0]') limit 1", "idx")
+		testKit.MustUseIndex("select * from t order by vec_cosine_distance(b, '[1, 0]') limit 1", "idx")
+		testKit.MustNoIndexUsed("select * from t ignore index(idx) order by vec_cosine_distance(b, '[1, 0]') limit 1")
+
+		testKit.MustExec("set tidb_analyze_version=2")
+		testKit.MustExec("analyze table t")
+		testKit.MustQuery("show warnings").Sort().Check(testkit.Rows(
+			"Note 1105 Analyze use auto adjusted sample rate 1.000000 for table test.t, reason to use this rate is \"use min(1, 110000/10000) as the sample-rate=1\"",
+			"Warning 1105 analyzing columnar index is not supported, skip idx",
+			"Warning 1105 analyzing columnar index is not supported, skip idx2"))
+		testKit.MustExec("analyze table t index idx")
+		testKit.MustQuery("show warnings").Sort().Check(testkit.Rows(
+			"Note 1105 Analyze use auto adjusted sample rate 1.000000 for table test.t, reason to use this rate is \"use min(1, 110000/1) as the sample-rate=1\"",
+			"Warning 1105 The version 2 would collect all statistics not only the selected indexes",
+			"Warning 1105 analyzing columnar index is not supported, skip idx",
+			"Warning 1105 analyzing columnar index is not supported, skip idx2"))
+
+		statsHandle := dom.StatsHandle()
+		statsTbl := statsHandle.GetPhysicalTableStats(tblInfo.ID, tblInfo)
+		require.True(t, statsTbl.LastAnalyzeVersion > 0)
+		// int col
+		col := statsTbl.GetCol(1)
+		require.NotNil(t, col)
+		// It has stats.
+		require.True(t, (col.Histogram.Len()+col.TopN.Num()) > 0)
+		// vec col
+		col = statsTbl.GetCol(2)
+		require.NotNil(t, col)
+		// It doesn't have stats.
+		require.False(t, (col.Histogram.Len()+col.TopN.Num()) > 0)
+	})
+}
+
+func TestPartialIndexWithPlanCache(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, tk *testkit.TestKit, cascades, caller string) {
+		tk.MustExec(`set tidb_enable_prepared_plan_cache=1`)
+		tk.MustExec("use test")
+		tk.MustExec("set @@tidb_enable_collect_execution_info=0;")
+		tk.MustExec("drop table if exists t")
+		tk.MustExec("create table t(a int, b int, index idx1(a) where a is not null, index idx2(b) where b > 10)")
+
+		tk.MustExec("prepare stmt from 'select * from t where a = ?'")
+		tk.MustExec("set @a = 123")
+
+		// IS NOT NULL pre condition can use plan cache.
+		tk.MustExec("execute stmt using @a")
+		tk.MustExec("execute stmt using @a")
+		tkProcess := tk.Session().ShowProcess()
+		ps := []*sessmgr.ProcessInfo{tkProcess}
+		tk.Session().SetSessionManager(&testkit.MockSessionManager{PS: ps})
+		tk.MustQuery(fmt.Sprintf("explain for connection %d", tkProcess.ID)).CheckContain("idx1")
+		tk.MustExec("execute stmt using @a")
+		tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("1"))
+
+		// Normal pre condition can not use plan cache.
+		tk.MustExec("prepare stmt from 'select * from t where b = ?'")
+		tk.MustExec("set @a = 20")
+		tk.MustExec("execute stmt using @a")
+		tk.MustExec("execute stmt using @a")
+		tkProcess = tk.Session().ShowProcess()
+		ps[0] = tkProcess
+		tk.Session().SetSessionManager(&testkit.MockSessionManager{PS: ps})
+		tk.MustQuery(fmt.Sprintf("explain for connection %d", tkProcess.ID)).CheckContain("idx2")
+		tk.MustExec("execute stmt using @a")
+		tk.MustQuery("select @@last_plan_from_cache").Check(testkit.Rows("0"))
+	})
+}
+
+func TestPartialUniqueIndexDoesNotImplyGlobalUniqueness(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, tk *testkit.TestKit, _, _ string) {
+		tk.MustExec("use test")
+		tk.MustExec(`create table partial_unique (
+			id bigint primary key,
+			domain varchar(253) not null,
+			deleted_at datetime null,
+			unique index uk_domain_active(domain) where deleted_at is null
+		)`)
+		tk.MustExec(`insert into partial_unique values
+			(1, 'example.com', null),
+			(2, 'example.com', '2026-01-01'),
+			(3, 'example.com', '2026-01-02'),
+			(4, 'example.com', '2026-01-03')`)
+
+		tk.MustQuery("select count(distinct domain) from partial_unique").Check(testkit.Rows("1"))
+		tk.MustQuery("explain format = 'plan_tree' select count(distinct domain) from partial_unique").
+			CheckContain("Agg")
+		tk.MustQuery("select distinct domain from partial_unique").Check(testkit.Rows("example.com"))
+		tk.MustQuery("explain format = 'plan_tree' select distinct domain from partial_unique").
+			CheckContain("Agg")
+		tk.MustQuery("select domain, count(*) from partial_unique group by domain").
+			Check(testkit.Rows("example.com 4"))
+		tk.MustQuery("explain format = 'plan_tree' select domain, count(*) from partial_unique group by domain").
+			CheckContain("Agg")
+
+		tk.MustExec("create table partial_outer (id bigint primary key, domain varchar(253) not null)")
+		tk.MustExec("insert into partial_outer values (1, 'example.com')")
+		tk.MustQuery(`select o.id
+			from partial_outer o
+			left join partial_unique i
+				on o.domain = i.domain and i.deleted_at is not null`).
+			Check(testkit.Rows("1", "1", "1"))
+		err := tk.QueryToErr(`select (
+				select i.id
+				from partial_unique i
+				where i.domain = o.domain and i.deleted_at is not null
+			)
+			from partial_outer o`)
+		require.EqualError(t, err, "[executor:1242]Subquery returns more than 1 row")
+		tk.MustQuery(`select o.id
+			from partial_outer o
+			left join partial_unique i on o.domain = i.domain
+			order by o.id
+			limit 2 offset 1`).
+			Check(testkit.Rows("1", "1"))
+
+		tk.MustExec("set @@session.sql_mode = 'ONLY_FULL_GROUP_BY'")
+		for _, enabled := range []string{"off", "on"} {
+			tk.MustExec("set @@session.tidb_enable_new_only_full_group_by_check = " + enabled)
+			tk.MustGetErrCode("select domain, id from partial_unique group by domain", 1055)
+		}
+
+		tk.MustQuery(`explain format = 'plan_tree'
+			select * from partial_unique use index(uk_domain_active)
+			where domain = 'example.com' and deleted_at is null`).
+			CheckContain("uk_domain_active")
+		tk.MustQuery(`select id from partial_unique use index(uk_domain_active)
+			where domain = 'example.com' and deleted_at is null`).
+			Check(testkit.Rows("1"))
+		tk.MustQuery(`explain format = 'plan_tree'
+			select * from partial_unique use index(uk_domain_active)
+			where domain = 'example.com'`).
+			CheckNotContain("uk_domain_active")
+		tk.MustQuery(`select id from partial_unique use index(uk_domain_active)
+			where domain = 'example.com' order by id`).
+			Check(testkit.Rows("1", "2", "3", "4"))
+
+		tk.MustExec(`create table partial_composite (
+			a int null,
+			b int not null,
+			c int,
+			unique index uk_ab_active(a, b) where c = 1
+		)`)
+		tk.MustExec("insert into partial_composite values (1, 1, 1), (1, 1, 2), (1, 1, 3), (null, 1, 1), (null, 1, 2)")
+		tk.MustQuery("select a, b, count(*) from partial_composite group by a, b order by a").
+			Check(testkit.Rows("<nil> 1 2", "1 1 3"))
+		tk.MustQuery("select a, b, count(*) from partial_composite where a is not null group by a, b").
+			Check(testkit.Rows("1 1 3"))
+
+		tk.MustExec("create table regular_keys (id int primary key, a int not null unique, payload int)")
+		tk.MustExec("insert into regular_keys values (1, 10, 100), (2, 20, 200)")
+		for _, enabled := range []string{"off", "on"} {
+			tk.MustExec("set @@session.tidb_enable_new_only_full_group_by_check = " + enabled)
+			tk.MustQuery("select a, payload from regular_keys group by a order by a").
+				Check(testkit.Rows("10 100", "20 200"))
+			tk.MustQuery("select id, payload from regular_keys group by id order by id").
+				Check(testkit.Rows("1 100", "2 200"))
+		}
+	})
+}
+
+func TestPartialIndexWithIndexPrune(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, tk *testkit.TestKit, cascades, caller string) {
+		tk.MustExec("use test")
+		tk.MustExec("set @@tidb_enable_collect_execution_info=0;")
+		tk.MustExec("drop table if exists t")
+		tk.MustExec("create table t(a int, b int, index idx1(a) where a is not null, index idx2(b) where b > 10)")
+		tk.MustQuery("explain format = 'plan_tree' select * from t use index(idx1) where a > 1").CheckContain("idx1")
+
+		// Set the prune behavior to prune all non interesting ones.
+		tk.MustExec("set @@tidb_opt_index_prune_threshold=0")
+
+		// The failpoint will check whether all partial indexes are pruned.
+		fpName := "github.com/pingcap/tidb/pkg/planner/core/rule/InjectCheckForIndexPrune"
+		require.NoError(t, failpoint.EnableCall(fpName, func(paths []*util.AccessPath) {
+			for _, path := range paths {
+				if path != nil && path.Index != nil && path.Index.ConditionExprString != "" {
+					require.True(t, false, "Partial index should be pruned")
+				}
+			}
+		}))
+		tk.MustQuery("select * from t")
+
+		// idx1 is pruned because a is not referenced as interesting one.
+		// idx2 is kept though its constraint is not matched.
+		require.NoError(t, failpoint.EnableCall(fpName, func(paths []*util.AccessPath) {
+			idx2Found := false
+			for _, path := range paths {
+				if path != nil && path.Index != nil && path.Index.Name.L == "idx1" {
+					require.True(t, false, "Partial index idx1 should be pruned")
+				}
+				if path != nil && path.Index != nil && path.Index.Name.L == "idx2" {
+					idx2Found = true
+				}
+			}
+			require.True(t, idx2Found, "Partial index idx2 should not be pruned")
+		}))
+		tk.MustQuery("explain format = 'plan_tree' select * from t order by b").CheckNotContain("idx2")
+
+		// idx2 is pruned because b is not referenced as interesting one.
+		// idx1 is kept though its constraint is not matched.
+		require.NoError(t, failpoint.EnableCall(fpName, func(paths []*util.AccessPath) {
+			idx1Found := false
+			for _, path := range paths {
+				if path != nil && path.Index != nil && path.Index.Name.L == "idx2" {
+					require.True(t, false, "Partial index idx2 should be pruned")
+				}
+				if path != nil && path.Index != nil && path.Index.Name.L == "idx1" {
+					idx1Found = true
+				}
+			}
+			require.True(t, idx1Found, "Partial index idx1 should not be pruned")
+		}))
+		tk.MustQuery("explain format = 'plan_tree' select * from t where a is null").CheckNotContain("idx1")
+		require.NoError(t, failpoint.Disable(fpName))
+	})
+}
+
+func TestIndexPruneWithSharedClusteredPrefix(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, tk *testkit.TestKit, cascades, caller string) {
+		tk.MustExec("use test")
+		tk.MustExec("set @@tidb_enable_collect_execution_info=0")
+		tk.MustExec("drop table if exists tenant_obj")
+		// Multi-tenant shape: every secondary index leads with the clustered-key
+		// prefix column tenant_ws, so absolute coverage cannot differentiate them.
+		tk.MustExec(`create table tenant_obj (
+			id binary(16) not null,
+			tenant_ws varchar(64) not null,
+			label varchar(255),
+			obj_type_id binary(16),
+			payload text,
+			num1 decimal(10,2), num2 decimal(10,2), num3 decimal(10,2),
+			txt1 varchar(255), txt2 varchar(255), txt3 varchar(255), txt4 varchar(255),
+			txt5 varchar(255), txt6 varchar(255), txt7 varchar(255), txt8 varchar(255),
+			created_on timestamp,
+			primary key (tenant_ws, id) clustered,
+			key ix_tenant_label (tenant_ws, label),
+			key ix_tenant_obj_type (tenant_ws, obj_type_id),
+			unique key uk_tenant_type_num1 (tenant_ws, obj_type_id, num1),
+			key ix_tenant_num1 (tenant_ws, num1),
+			key ix_tenant_num2 (tenant_ws, num2),
+			key ix_tenant_num3 (tenant_ws, num3),
+			key ix_tenant_txt1 (tenant_ws, txt1),
+			key ix_tenant_txt2 (tenant_ws, txt2),
+			key ix_tenant_txt3 (tenant_ws, txt3),
+			key ix_tenant_txt4 (tenant_ws, txt4),
+			key ix_tenant_txt5 (tenant_ws, txt5),
+			key ix_tenant_txt6 (tenant_ws, txt6),
+			key ix_tenant_txt7 (tenant_ws, txt7),
+			key ix_tenant_txt8 (tenant_ws, txt8),
+			key ix_tenant_created (tenant_ws, created_on),
+			key ix_tenant_label_type (tenant_ws, label, obj_type_id))`)
+		// Force ranking mode: the default threshold (20) exceeds this table's path
+		// count and would fall into the prune-zero-score-only mode.
+		tk.MustExec("set @@tidb_opt_index_prune_threshold=10")
+
+		fpName := "github.com/pingcap/tidb/pkg/planner/core/rule/InjectCheckForIndexPrune"
+		// keptIndexes captures the secondary-index names kept for tenant_obj. The
+		// failpoint fires for every planned query (including internal ones), so
+		// callbacks identify relevance via the tenant_ws leading column.
+		var keptIndexes []string
+		seen := false
+		require.NoError(t, failpoint.EnableCall(fpName, func(paths []*util.AccessPath) {
+			names := make([]string, 0, len(paths))
+			relevant := false
+			for _, path := range paths {
+				if path == nil || path.Index == nil || len(path.Index.Columns) == 0 {
+					continue
+				}
+				if path.Index.Columns[0].Name.L == "tenant_ws" {
+					relevant = true
+				}
+				if !path.IsTablePath() {
+					names = append(names, path.Index.Name.L)
+				}
+			}
+			if relevant {
+				slices.Sort(names)
+				keptIndexes = names
+				seen = true
+			}
+		}))
+		defer func() {
+			require.NoError(t, failpoint.Disable(fpName))
+		}()
+		runQuery := func(sql string) []string {
+			keptIndexes, seen = nil, false
+			tk.MustQuery(sql)
+			require.True(t, seen, "prune callback did not fire for: %s", sql)
+			return keptIndexes
+		}
+
+		// Predicates on obj_type_id/num1/num3 plus ORDER BY label: only indexes
+		// covering those columns beyond the discounted tenant_ws prefix survive.
+		kept := runQuery(`explain format = 'plan_tree' select label from tenant_obj
+			where tenant_ws = 'w1' and obj_type_id = 0x01 and num1 = 1 and num3 = 2
+			order by label limit 10`)
+		require.Equal(t, []string{
+			"ix_tenant_label", "ix_tenant_label_type", "ix_tenant_num1",
+			"ix_tenant_num3", "ix_tenant_obj_type", "uk_tenant_type_num1",
+		}, kept)
+
+		// Only ORDER BY label beyond the tenant prefix: ix_tenant_label_type has the
+		// identical coverage signature as ix_tenant_label and is deduplicated.
+		kept = runQuery(`explain format = 'plan_tree' select label from tenant_obj
+			where tenant_ws = 'w1' order by label limit 10`)
+		require.Equal(t, []string{"ix_tenant_label"}, kept)
+
+		// Nothing interesting beyond the tenant prefix and no covering index: the
+		// clustered table path serves the query alone; all indexes are pruned.
+		kept = runQuery("explain format = 'plan_tree' select payload from tenant_obj where tenant_ws = 'w1'")
+		require.Empty(t, kept)
+
+		// The null-safe equality <=> binds the tenant prefix exactly as = does (the
+		// ranger builds the same access range), so the same all-pruned outcome holds.
+		kept = runQuery("explain format = 'plan_tree' select payload from tenant_obj where tenant_ws <=> 'w1'")
+		require.Empty(t, kept)
+
+		// Without an equality on tenant_ws there is no discount: indexes covering
+		// the predicate column are kept as before.
+		kept = runQuery("explain format = 'plan_tree' select label from tenant_obj where num1 = 1")
+		require.True(t, slices.Contains(kept, "ix_tenant_num1"), "kept: %v", kept)
+		for _, name := range kept {
+			require.False(t, strings.HasPrefix(name, "ix_tenant_txt"), "kept: %v", kept)
+		}
+
+		// Hinted indexes bypass pruning entirely.
+		tk.MustQuery(`explain format = 'plan_tree' select payload from tenant_obj
+			force index (ix_tenant_created) where tenant_ws = 'w1'`).CheckContain("ix_tenant_created")
+
+		// idx(tenant_ws, a) and idx(a) cover the same interesting columns but through
+		// different leading columns. The common handle (tenant_ws, id) is appended to a
+		// non-unique secondary index's key, so idx(a) accesses (a=, tenant_ws=) while
+		// idx(tenant_ws, a) accesses (tenant_ws=, a=). Neither consecutive prefix is a
+		// prefix of the other, so neither dominates and both must survive as distinct
+		// access orders. ix_tenant_a_c_b is declared before ix_tenant_a_c so that an
+		// index-ID tiebreak would keep the wider index; the column-count tiebreak must
+		// prefer the narrower one at any chain length.
+		tk.MustExec("drop table if exists tenant_dup")
+		tk.MustExec(`create table tenant_dup (
+			id binary(16) not null,
+			tenant_ws varchar(64) not null,
+			a int, b int, c int, payload text,
+			primary key (tenant_ws, id) clustered,
+			key ix_tenant_ws_a (tenant_ws, a),
+			key ix_dup_a (a),
+			key ix_dup_a_b (a, b),
+			key ix_tenant_a_c_b (tenant_ws, a, c, b),
+			key ix_tenant_a_c (tenant_ws, a, c))`)
+		tk.MustExec("set @@tidb_opt_index_prune_threshold=5")
+
+		// idx(tenant_ws, a) and idx(a) both kept (different chains); idx(a, b) is a
+		// duplicate of idx(a), and both 3/4-column tenant indexes duplicate the
+		// (tenant_ws, a) chain with unused trailing columns.
+		kept = runQuery("explain format = 'plan_tree' select payload from tenant_dup where tenant_ws = 'w' and a = 1")
+		require.Equal(t, []string{"ix_dup_a", "ix_tenant_ws_a"}, kept)
+
+		// Longer chain: ix_tenant_a_c and ix_tenant_a_c_b share the chain
+		// (tenant_ws, a, c); the narrower ix_tenant_a_c must win the tie despite
+		// its larger index ID.
+		kept = runQuery("explain format = 'plan_tree' select payload from tenant_dup where tenant_ws = 'w' and a = 1 and c = 2")
+		require.Equal(t, []string{"ix_dup_a", "ix_tenant_a_c", "ix_tenant_ws_a"}, kept)
+	})
+}
+
+func TestSkylinePruningWithMissingIndexStats(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set tidb_opt_prefer_range_scan = on")
+	tk.MustExec(`create table t (
+		id int not null, a int not null, b int not null, c int not null,
+		payload varchar(100), key idx_id(id))`)
+	var values strings.Builder
+	for i := 1; i <= 1000; i++ {
+		if i > 1 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "(%d, 1, 1, 1, 'payload')", i)
+	}
+	tk.MustExec("insert into t values " + values.String())
+	tk.MustExec("analyze table t")
+	tk.MustExec("alter table t add index idx_abc(a, b, c)")
+	// Only idx_id has statistics, and it is much more selective than idx_abc.
+	tk.MustQuery("show stats_histograms where db_name = 'test' and table_name = 't' and is_index = 1").CheckAt([]int{3}, testkit.Rows("idx_id"))
+	const query = "select * from t where id = 1 and a = 1 and b = 1 and c = 1"
+	tk.MustQuery("explain format = 'brief' " + query).CheckContain("index:idx_id(id)")
+	tk.MustQuery(query).Check(testkit.Rows("1 1 1 1 payload"))
+}
+
+func TestForceIndexLimit(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, tk *testkit.TestKit, cascades, caller string) {
+		tk.MustExec(`use test`)
+		tk.MustExec(`CREATE TABLE tb (
+  object_id bigint(20),
+  a bigint(20) ,
+  b bigint(20) ,
+  c bigint(20) ,
+  PRIMARY KEY (object_id),
+  KEY ab (a,b))`)
+		tk.MustQuery(`explain format = 'plan_tree' select count(1) from (select /* issue:54213 */ /*+ force_index(tb, ab) */ 1 from tb where a=1 and b=1 limit 100) a`).Check(
+			testkit.Rows("StreamAgg root  funcs:count(1)->Column",
+				"└─Limit root  offset:0, count:100",
+				"  └─IndexReader root  index:Limit",
+				"    └─Limit cop[tikv]  offset:0, count:100",
+				"      └─IndexRangeScan cop[tikv] table:tb, index:ab(a, b) range:[1 1,1 1], keep order:false, stats:pseudo"))
+	})
+}
+
+func TestCorrelatedColumnPathNotPrunedByRisk(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_enable_collect_execution_info=0")
+	tk.MustExec("create table t_outer (id char(36) primary key)")
+	tk.MustExec("insert into t_outer values (lpad(5,36,'0')), (lpad(7,36,'0'))")
+	// idx_a is only reachable through the correlated equality, so at plan time it
+	// starts from a full range, while idx_b covers 50 rows through a constant. The
+	// correlated estimate must carry a matching min/max: leaving idx_a with a
+	// table-sized MaxCountAfterAccess next to its one-row estimate makes skyline
+	// pruning drop it for phantom risk before cost is ever considered.
+	tk.MustExec(`create table t (
+		id char(36) primary key,
+		a char(36) default null,
+		b char(36) not null,
+		v char(36) not null,
+		key idx_a (a),
+		key idx_b (b))`)
+	var values strings.Builder
+	for i := 1; i <= 1000; i++ {
+		if i > 1 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "(lpad(%d,36,'0'),lpad(%d,36,'0'),lpad(%d,36,'0'),lpad(%d,36,'0'))", i, i, i%20, i)
+	}
+	tk.MustExec("insert into t values " + values.String())
+	tk.MustExec("analyze table t")
+	tk.MustExec("analyze table t_outer")
+
+	rows := tk.MustQuery(`explain format = 'brief'
+		select o.id, (select t.v from t where t.a = o.id and t.b = lpad(5,36,'0') limit 1) from t_outer o`).Rows()
+	plan := make([]string, 0, len(rows))
+	for _, row := range rows {
+		cols := make([]string, 0, len(row))
+		for _, col := range row {
+			cols = append(cols, fmt.Sprintf("%v", col))
+		}
+		plan = append(plan, strings.Join(cols, " "))
+	}
+	joined := strings.Join(plan, "\n")
+	require.Contains(t, joined, "index:idx_a(a) range: decided by [eq(test.t.a, test.t_outer.id)]", joined)
+	require.NotContains(t, joined, "index:idx_b(b)", joined)
+
+	tk.MustQuery(`select o.id, (select t.v from t where t.a = o.id and t.b = lpad(5,36,'0') limit 1) from t_outer o`).
+		Sort().Check(testkit.Rows(
+		"000000000000000000000000000000000005 000000000000000000000000000000000005",
+		"000000000000000000000000000000000007 <nil>"))
+}
+
+func TestPartialIndexInvalidTimestampRange(t *testing.T) {
+	testkit.RunTestUnderCascades(t, func(t *testing.T, tk *testkit.TestKit, cascades, caller string) {
+		tk.MustExec("use test")
+		tk.MustExec("set time_zone = 'UTC'")
+		tk.MustExec("set sql_mode = 'ALLOW_INVALID_DATES'")
+		tk.MustExec("create table t_invalid_timestamp (k int, ts timestamp, index idx(k) where ts < '0000-00-00 12:00:00')")
+		tk.MustExec("insert into t_invalid_timestamp values (0, '0000-00-00 00:00:00'), (1, '2017-03-01 00:00:00')")
+		tk.MustQuery("select k from t_invalid_timestamp ignore index (idx) where ts >= '2017-03-01'").Check(testkit.Rows("1"))
+		tk.MustQuery("select k from t_invalid_timestamp force index (idx) where ts >= '2017-03-01'").Check(testkit.Rows("1"))
+		tk.MustQuery("explain select k from t_invalid_timestamp force index (idx) where ts >= '2017-03-01'").CheckNotContain("index:idx")
+
+		// Exact predicate matching remains valid even when its range is approximate.
+		tk.MustQuery("select k from t_invalid_timestamp force index (idx) where ts < '0000-00-00 12:00:00'").Check(testkit.Rows("0"))
+		tk.MustQuery("explain select k from t_invalid_timestamp force index (idx) where ts < '0000-00-00 12:00:00'").CheckContain("index:idx")
+	})
+}

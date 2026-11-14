@@ -1,0 +1,285 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package storage
+
+import (
+	"strconv"
+	"time"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/infoschema"
+	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/statistics/handle/lockstats"
+	"github.com/pingcap/tidb/pkg/statistics/handle/types"
+	"github.com/pingcap/tidb/pkg/statistics/handle/util"
+	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/tikv/client-go/v2/oracle"
+	"go.uber.org/zap"
+)
+
+// statsGCImpl implements StatsGC interface.
+type statsGCImpl struct {
+	statsHandle types.StatsHandle
+}
+
+// NewStatsGC creates a new StatsGC.
+func NewStatsGC(statsHandle types.StatsHandle) types.StatsGC {
+	return &statsGCImpl{
+		statsHandle: statsHandle,
+	}
+}
+
+// GCStats will garbage collect the useless stats' info.
+// For dropped tables, we will first update their version
+// so that other tidb could know that table is deleted.
+func (gc *statsGCImpl) GCStats(is infoschema.InfoSchema, ddlLease time.Duration) (err error) {
+	return util.CallWithSCtx(gc.statsHandle.SPool(), func(sctx sessionctx.Context) error {
+		return GCStats(sctx, gc.statsHandle, is, ddlLease)
+	})
+}
+
+// DeleteTableStatsFromKV deletes table statistics from kv.
+// A statsID refers to statistic of a table or a partition.
+func (gc *statsGCImpl) DeleteTableStatsFromKV(statsIDs []int64, soft bool) (err error) {
+	return util.CallWithSCtx(gc.statsHandle.SPool(), func(sctx sessionctx.Context) error {
+		return DeleteTableStatsFromKV(sctx, statsIDs, soft)
+	}, util.FlagWrapTxn)
+}
+
+// GCStats will garbage collect the useless stats' info.
+// For dropped tables, we will first update their version
+// so that other tidb could know that table is deleted.
+func GCStats(
+	sctx sessionctx.Context,
+	statsHandle types.StatsHandle,
+	is infoschema.InfoSchema,
+	ddlLease time.Duration,
+) (err error) {
+	// To make sure that all the deleted tables' schema and stats info have been acknowledged to all tidb,
+	// we only garbage collect version before 10 lease.
+	lease := max(statsHandle.Lease(), ddlLease)
+	offset := util.DurationToTS(10 * lease)
+	now := oracle.GoTimeToTS(time.Now())
+	if now < offset {
+		return nil
+	}
+
+	failpoint.Inject("injectGCStatsLastTSOffset", func(val failpoint.Value) {
+		offset = uint64(val.(int))
+	})
+
+	// Get the last gc time.
+	gcVer := now - offset
+	lastGC, err := getLastGCTimestamp(sctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			return
+		}
+		err = writeGCTimestampToKV(sctx, gcVer)
+	}()
+
+	rows, _, err := util.ExecRows(sctx, "select table_id from mysql.stats_meta where version >= %? and version < %?", lastGC, gcVer)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for _, row := range rows {
+		if err := gcTableStats(sctx, statsHandle, is, row.GetInt64(0)); err != nil {
+			return errors.Trace(err)
+		}
+	}
+
+	return nil
+}
+
+// DeleteTableStatsFromKV deletes table statistics from kv.
+// A statsID refers to statistic of a table or a partition.
+func DeleteTableStatsFromKV(sctx sessionctx.Context, statsIDs []int64, soft bool) (err error) {
+	startTS, err := util.GetStartTS(sctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for _, statsID := range statsIDs {
+		// We update the version so that other tidb will know that this table is deleted.
+		// And we also update the last_stats_histograms_version to tell other tidb that the stats histogram is deleted
+		// and they should update their memory cache. It's mainly for soft delete triggered by DROP STATS.
+		if _, err = util.Exec(sctx, "update mysql.stats_meta set version = %?, last_stats_histograms_version = %? where table_id = %? ", startTS, startTS, statsID); err != nil {
+			return err
+		}
+		if soft {
+			// Soft delete is triggered by DROP STATS, we just reset the meta info of each column.
+			if _, err = util.Exec(sctx,
+				"update mysql.stats_histograms "+
+					"set distinct_count = 0, null_count = 0, tot_col_size = 0, modify_count = 0, version = %?,"+
+					"cm_sketch = null, stats_ver = 0, flag = 0, correlation = 0, last_analyze_pos = null where table_id = %?",
+				startTS, statsID); err != nil {
+				return
+			}
+		} else {
+			if _, err = util.Exec(sctx, "delete from mysql.stats_histograms where table_id = %?", statsID); err != nil {
+				return err
+			}
+		}
+		if _, err = util.Exec(sctx, "delete from mysql.stats_buckets where table_id = %?", statsID); err != nil {
+			return err
+		}
+		if _, err = util.Exec(sctx, "delete from mysql.stats_top_n where table_id = %?", statsID); err != nil {
+			return err
+		}
+		if _, err = util.Exec(sctx, "delete from mysql.stats_fm_sketch where table_id = %?", statsID); err != nil {
+			return err
+		}
+		if _, err = util.Exec(sctx, "delete from mysql.column_stats_usage where table_id = %?", statsID); err != nil {
+			return err
+		}
+		if _, err = util.Exec(sctx, "delete from mysql.analyze_options where table_id = %?", statsID); err != nil {
+			return err
+		}
+		if _, err = util.Exec(sctx, lockstats.DeleteLockSQL, statsID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteHistStatsFromKV deletes all records about a column or an index and updates version.
+func deleteHistStatsFromKV(sctx sessionctx.Context, physicalID int64, histID int64, isIndex int) (err error) {
+	startTS, err := util.GetStartTS(sctx)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// First of all, we update the version. If this table doesn't exist, it won't have any problem. Because we cannot delete anything.
+	if _, err = util.Exec(sctx, "update mysql.stats_meta set version = %?, last_stats_histograms_version = %? where table_id = %? ", startTS, startTS, physicalID); err != nil {
+		return err
+	}
+	// delete histogram meta
+	if _, err = util.Exec(sctx, "delete from mysql.stats_histograms where table_id = %? and hist_id = %? and is_index = %?", physicalID, histID, isIndex); err != nil {
+		return err
+	}
+	// delete top n data
+	if _, err = util.Exec(sctx, "delete from mysql.stats_top_n where table_id = %? and hist_id = %? and is_index = %?", physicalID, histID, isIndex); err != nil {
+		return err
+	}
+	// delete all buckets
+	if _, err = util.Exec(sctx, "delete from mysql.stats_buckets where table_id = %? and hist_id = %? and is_index = %?", physicalID, histID, isIndex); err != nil {
+		return err
+	}
+	// delete all fm sketch
+	if _, err := util.Exec(sctx, "delete from mysql.stats_fm_sketch where table_id = %? and hist_id = %? and is_index = %?", physicalID, histID, isIndex); err != nil {
+		return err
+	}
+	if isIndex == 0 {
+		// delete the record in mysql.column_stats_usage
+		if _, err = util.Exec(sctx, "delete from mysql.column_stats_usage where table_id = %? and column_id = %?", physicalID, histID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// gcTableStats GC this table's stats.
+// The GC of a table will be a two-phase process:
+// 1. Delete the column/index's stats from storage. Then other TiDB nodes will be aware that those stats are deleted.
+// 2. Then delete the record in stats_meta.
+func gcTableStats(sctx sessionctx.Context,
+	statsHandler types.StatsHandle,
+	is infoschema.InfoSchema, physicalID int64) error {
+	tbl, ok := statsHandler.TableInfoByID(is, physicalID)
+	rows, _, err := util.ExecRows(sctx, "select is_index, hist_id from mysql.stats_histograms where table_id = %?", physicalID)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if !ok {
+		if len(rows) > 0 {
+			// It's the first time to run into it. Delete column/index stats to notify other TiDB nodes.
+			logutil.BgLogger().Info("remove stats in GC due to dropped table", zap.Int64("tableID", physicalID))
+			return util.WrapTxn(sctx, func(sctx sessionctx.Context) error {
+				return errors.Trace(DeleteTableStatsFromKV(sctx, []int64{physicalID}, false))
+			})
+		}
+		// len(rows) == 0 => The table's stats is empty.
+		// The table has already been deleted in stats and acknowledged to all tidb,
+		// We can safely remove the meta info now.
+		_, _, err = util.ExecRows(sctx, "delete from mysql.stats_meta where table_id = %?", physicalID)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		return nil
+	}
+
+	tblInfo := tbl.Meta()
+	for _, row := range rows {
+		isIndex, histID := row.GetInt64(0), row.GetInt64(1)
+		find := false
+		if isIndex == 1 {
+			for _, idx := range tblInfo.Indices {
+				if idx.ID == histID {
+					find = true
+					break
+				}
+			}
+		} else {
+			for _, col := range tblInfo.Columns {
+				if col.ID == histID {
+					find = true
+					break
+				}
+			}
+		}
+		if !find {
+			err := util.WrapTxn(sctx, func(sctx sessionctx.Context) error {
+				return errors.Trace(deleteHistStatsFromKV(sctx, physicalID, histID, int(isIndex)))
+			})
+			if err != nil {
+				return errors.Trace(err)
+			}
+		}
+	}
+
+	return nil
+}
+
+const gcLastTSVarName = "tidb_stats_gc_last_ts"
+
+// getLastGCTimestamp loads the last gc time from mysql.tidb.
+func getLastGCTimestamp(sctx sessionctx.Context) (uint64, error) {
+	rows, _, err := util.ExecRows(sctx, "SELECT HIGH_PRIORITY variable_value FROM mysql.tidb WHERE variable_name=%?", gcLastTSVarName)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	lastGcTSString := rows[0].GetString(0)
+	lastGcTS, err := strconv.ParseUint(lastGcTSString, 10, 64)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	return lastGcTS, nil
+}
+
+// writeGCTimestampToKV write the GC timestamp to the storage.
+func writeGCTimestampToKV(sctx sessionctx.Context, newTS uint64) error {
+	_, _, err := util.ExecRows(sctx,
+		"insert into mysql.tidb (variable_name, variable_value) values (%?, %?) on duplicate key update variable_value = %?",
+		gcLastTSVarName,
+		newTS,
+		newTS,
+	)
+	return err
+}

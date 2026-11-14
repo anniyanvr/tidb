@@ -1,0 +1,240 @@
+// Copyright 2024 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package importintotest
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/dxf/framework/handle"
+	"github.com/pingcap/tidb/pkg/dxf/framework/storage"
+	"github.com/pingcap/tidb/pkg/dxf/importinto"
+	"github.com/pingcap/tidb/pkg/executor/importer"
+	"github.com/pingcap/tidb/pkg/infoschema"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
+	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
+	"github.com/pingcap/tidb/pkg/util/dbterror/plannererrors"
+	"github.com/pingcap/tidb/tests/realtikvtest"
+	"github.com/tikv/client-go/v2/util"
+)
+
+func (s *mockGCSSuite) prepareImportFromSelect() {
+	suiteTK := s.tk
+	s.T().Cleanup(func() { s.tk = suiteTK })
+	s.tk = testkit.NewTestKit(s.T(), s.store)
+	s.prepareAndUseDB("from_select")
+	if kerneltype.IsNextGen() {
+		previousURI := vardef.CloudStorageURI.Load()
+		s.tk.MustExec("set global tidb_cloud_storage_uri = ?", realtikvtest.GetNextGenObjStoreURI("from-select"))
+		s.T().Cleanup(func() { s.tk.MustExec("set global tidb_cloud_storage_uri = ?", previousURI) })
+	}
+	// The Query source route is only reachable from materialized view maintenance;
+	// simulate that precondition so these tests can exercise it directly.
+	vars := s.tk.Session().GetSessionVars()
+	vars.InMViewMaintenance = true
+	s.T().Cleanup(func() { vars.InMViewMaintenance = false })
+}
+
+func (s *mockGCSSuite) TestImportFromSelectBasic() {
+	s.prepareImportFromSelect()
+	s.tk.MustExec("create table src(id int, v varchar(64))")
+	s.tk.MustExec("create table dst(id int, v varchar(64))")
+	s.tk.MustExec("insert into src values(4, 'aaaaaa'), (5, 'bbbbbb'), (6, 'cccccc'), (7, 'dddddd')")
+
+	s.ErrorIs(s.tk.ExecToErr(`import into dst FROM select id from src`), plannererrors.ErrWrongValueCountOnRow)
+	s.ErrorIs(s.tk.ExecToErr(`import into dst(id) FROM select * from src`), plannererrors.ErrWrongValueCountOnRow)
+
+	s.tk.MustExec(`import into dst FROM select * from src`)
+	s.Equal(uint64(4), s.tk.Session().GetSessionVars().StmtCtx.AffectedRows())
+	s.Contains(s.tk.Session().LastMessage(), "Records: 4,")
+	s.tk.MustQuery("select * from dst").Check(testkit.Rows("4 aaaaaa", "5 bbbbbb", "6 cccccc", "7 dddddd"))
+	if kerneltype.IsNextGen() {
+		// The query runs on one DXF node and takes all of its slots.
+		jobID, err := strconv.ParseInt(fmt.Sprint(s.tk.MustQuery("select max(id) from mysql.tidb_import_jobs where table_name = 'dst'").Rows()[0][0]), 10, 64)
+		s.NoError(err)
+		ctx := util.WithInternalSourceType(context.Background(), kv.InternalDistTask)
+		mgr, err := storage.GetDXFSvcTaskMgr()
+		s.NoError(err)
+		task, err := mgr.GetTaskByKeyWithHistory(ctx, importinto.TaskKey(jobID))
+		s.NoError(err)
+		s.Equal(1, task.MaxNodeCount)
+		nodeCPU, err := handle.GetCPUCountOfNode(ctx)
+		s.NoError(err)
+		s.Equal(nodeCPU, task.RequiredSlots)
+		var meta importinto.TaskMeta
+		s.NoError(json.Unmarshal(task.Meta, &meta))
+		s.NotZero(meta.Plan.QuerySource.ReadTS)
+	}
+
+	// non-empty table
+	s.ErrorContains(s.tk.ExecToErr(`import into dst FROM select * from src`), "target table is not empty")
+
+	// with where
+	s.tk.MustExec("truncate table dst")
+	s.tk.MustExec(`import into dst FROM select * from src where id > 5`)
+	s.Equal(uint64(2), s.tk.Session().GetSessionVars().StmtCtx.AffectedRows())
+	s.Contains(s.tk.Session().LastMessage(), "Records: 2,")
+	s.tk.MustQuery("select * from dst").Check(testkit.Rows("6 cccccc", "7 dddddd"))
+
+	// parallel
+	testfailpoint.Enable(s.T(), "github.com/pingcap/tidb/pkg/util/cpu/mockNumCpu", `return(8)`)
+	s.tk.MustExec("truncate table src")
+	s.tk.MustExec("truncate table dst")
+	var count = 5000
+	values := make([]string, 0, count)
+	queryResult := make([]string, 0, count)
+	for i := range count {
+		values = append(values, fmt.Sprintf("(%d, 'abc-%d')", i, i))
+		queryResult = append(queryResult, fmt.Sprintf("%d abc-%d", i, i))
+	}
+	slices.Sort(queryResult)
+	s.tk.MustExec("insert into src values " + strings.Join(values, ","))
+	s.tk.MustExec(`import into dst FROM select * from src with thread = 8`)
+	s.Equal(uint64(count), s.tk.Session().GetSessionVars().StmtCtx.AffectedRows())
+	s.Contains(s.tk.Session().LastMessage(), fmt.Sprintf("Records: %d,", count))
+	s.tk.MustQuery("select * from dst").Sort().Check(testkit.Rows(queryResult...))
+
+	s.tk.MustExec("create table t(id varchar(100));")
+	s.tk.MustExec("import into t from select 1;")
+	s.tk.MustQuery("select * from t").Check(testkit.Rows("1"))
+}
+
+func (s *mockGCSSuite) TestImportFromSelectColumnList() {
+	s.prepareImportFromSelect()
+	s.tk.MustExec("create table src(id int, a varchar(64))")
+	s.tk.MustExec("create table dst(id int auto_increment primary key, a varchar(64), b int default 10, c int)")
+	s.tk.MustExec("insert into src values(4, 'aaaaaa'), (5, 'bbbbbb'), (6, 'cccccc'), (7, 'dddddd')")
+	if kerneltype.IsNextGen() {
+		s.tk.MustExec(`import into dst(c, a) FROM select * from src order by id`)
+		s.tk.MustQuery("select c,a,b from dst order by c").Check(testkit.Rows("4 aaaaaa 10", "5 bbbbbb 10", "6 cccccc 10", "7 dddddd 10"))
+		s.tk.MustQuery("select count(distinct id),min(id)>0 from dst").Check(testkit.Rows("4 1"))
+	} else {
+		s.tk.MustExec(`import into dst(c, a) FROM select * from src order by id`)
+		s.tk.MustQuery("select * from dst").Check(testkit.Rows("1 aaaaaa 10 4", "2 bbbbbb 10 5", "3 cccccc 10 6", "4 dddddd 10 7"))
+	}
+
+	s.tk.MustExec("truncate table dst")
+	s.tk.MustExec("create table src2(id int, a varchar(64))")
+	s.tk.MustExec("insert into src2 values(4, 'four'), (5, 'five')")
+	if kerneltype.IsNextGen() {
+		s.tk.MustExec(`import into dst(c, a) FROM select y.id, y.a from src x join src2 y on x.id = y.id`)
+		s.tk.MustQuery("select c,a,b from dst order by c").Check(testkit.Rows("4 four 10", "5 five 10"))
+	} else {
+		s.tk.MustExec(`import into dst(c, a) FROM select y.id, y.a from src x join src2 y on x.id = y.id order by y.id`)
+		s.tk.MustQuery("select * from dst").Check(testkit.Rows("1 four 10 4", "2 five 10 5"))
+	}
+}
+
+func (s *mockGCSSuite) TestWriteAfterImportFromSelect() {
+	s.prepareImportFromSelect()
+	s.tk.MustExec("create table dt(id int, v varchar(64))")
+	s.tk.MustExec("insert into dt values(4, 'aaaaaa'), (5, 'bbbbbb'), (6, 'cccccc'), (7, 'dddddd')")
+	s.testWriteAfterImport(`import into t FROM select * from from_select.dt`, importer.DataSourceTypeQuery)
+}
+
+func (s *mockGCSSuite) TestImportFromSelectStaleRead() {
+	s.prepareImportFromSelect()
+	// set tidb_snapshot might fail without this, not familiar about this part.
+	s.tk.MustExec(`replace into mysql.tidb(variable_name, variable_value) values ('tikv_gc_safe_point', '20240131-00:00:00.000 +0800')`)
+	s.tk.MustExec("create table src(id int, v varchar(64))")
+	s.tk.MustExec("insert into src values(1, 'a')")
+	time.Sleep(100 * time.Millisecond)
+	now := s.tk.MustQuery("select now(6)").Rows()[0][0].(string)
+	time.Sleep(100 * time.Millisecond)
+	s.tk.MustExec("insert into src values(2, 'b')")
+	s.tk.MustQuery("select * from src").Check(testkit.Rows("1 a", "2 b"))
+	staleReadSQL := fmt.Sprintf("select * from src as of timestamp '%s'", now)
+	s.tk.MustQuery(staleReadSQL).Check(testkit.Rows("1 a"))
+	s.tk.MustExec("create table dst(id int, v varchar(64))")
+	if kerneltype.IsNextGen() {
+		s.ErrorContains(s.tk.ExecToErr("import into dst from "+staleReadSQL), "stale reads in IMPORT INTO FROM SELECT")
+		return
+	}
+
+	//
+	// in below cases, dst table not exists at time 'now'
+	//
+	// using set tidb_snapshot
+	s.tk.MustExec("set tidb_snapshot = '" + now + "'")
+	s.ErrorIs(s.tk.ExecToErr("import into dst from "+staleReadSQL), infoschema.ErrTableNotExists)
+	s.ErrorIs(s.tk.ExecToErr("import into dst from select * from src"), infoschema.ErrTableNotExists)
+	// using AS OF TIMESTAMP
+	s.tk.MustExec("set tidb_snapshot = ''")
+	s.tk.MustExec("import into dst from " + staleReadSQL)
+	s.tk.MustQuery("select * from dst").Check(testkit.Rows("1 a"))
+
+	//
+	// in below cases, table exists at time 'now', and it's the latest version too.
+	//
+	s.tk.MustExec("truncate table dst")
+	time.Sleep(100 * time.Millisecond)
+	now = s.tk.MustQuery("select now(6)").Rows()[0][0].(string)
+	time.Sleep(100 * time.Millisecond)
+	staleReadSQL = fmt.Sprintf("select * from src as of timestamp '%s'", now)
+	s.tk.MustExec("insert into src values(3, 'c')")
+	s.tk.MustQuery("select * from src").Check(testkit.Rows("1 a", "2 b", "3 c"))
+	// using set tidb_snapshot
+	s.tk.MustExec("set tidb_snapshot = '" + now + "'")
+	s.ErrorContains(s.tk.ExecToErr("import into dst from "+staleReadSQL),
+		"can not execute write statement when 'tidb_snapshot' is set")
+	s.ErrorContains(s.tk.ExecToErr("import into dst from select * from src"),
+		"can not execute write statement when 'tidb_snapshot' is set")
+	// using AS OF TIMESTAMP
+	s.tk.MustExec("set tidb_snapshot = ''")
+	s.tk.MustExec("import into dst from " + staleReadSQL)
+	s.tk.MustQuery("select * from dst").Check(testkit.Rows("1 a", "2 b"))
+
+	//
+	// in below cases, table exists at time 'now', and it's NOT the latest version.
+	//
+	s.tk.MustExec("truncate table dst")
+	// using set tidb_snapshot
+	s.tk.MustExec("set tidb_snapshot = '" + now + "'")
+	s.ErrorContains(s.tk.ExecToErr("import into dst from "+staleReadSQL),
+		"can not execute IMPORT statement when 'tidb_snapshot' is set")
+	s.ErrorContains(s.tk.ExecToErr("import into dst from select * from src"),
+		"can not execute IMPORT statement when 'tidb_snapshot' is set")
+	// using AS OF TIMESTAMP
+	s.tk.MustExec("set tidb_snapshot = ''")
+	s.tk.MustExec("import into dst from " + staleReadSQL)
+	s.tk.MustQuery("select * from dst").Check(testkit.Rows("1 a", "2 b"))
+}
+
+func (s *mockGCSSuite) TestCastNegativeToUnsigned() {
+	s.prepareImportFromSelect()
+	s.tk.MustExec("create table dt(id int unsigned)")
+	s.ErrorContains(s.tk.ExecToErr("import into dt from select -1"), "constant -1 overflows int")
+	s.tk.MustExec("set sql_mode=''")
+	s.tk.MustExec("import into dt from select -1")
+	s.tk.MustQuery("select * from dt").Check(testkit.Rows("0"))
+}
+
+func (s *mockGCSSuite) TestDiskFullOnIngestFailFast() {
+	if kerneltype.IsNextGen() {
+		s.T().Skip("this test is for classic kernel only, skip it in nextgen")
+	}
+	s.prepareAndUseDB("from_select")
+	s.tk.MustExec("create table dt(id int unsigned)")
+	testfailpoint.Enable(s.T(), "github.com/pingcap/tidb/pkg/ingestor/ingestctrl/diskFullOnIngest", `return(true)`)
+	s.ErrorContains(s.tk.ExecToErr("import into dt from select 1"), "tikv disk full")
+}

@@ -1,0 +1,37 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "redact",
+    srcs = ["redact.go"],
+    importpath = "github.com/pingcap/tidb/pkg/util/redact",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/parser/ast",
+        "//pkg/util/intest",
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_pingcap_errors//:errors",
+        "@com_github_pingcap_kvproto//pkg/brpb",
+        "@com_github_pingcap_kvproto//pkg/errorpb",
+        "@com_github_pingcap_kvproto//pkg/kvrpcpb",
+    ],
+)
+
+go_test(
+    name = "redact_test",
+    timeout = "short",
+    srcs = ["redact_test.go"],
+    embed = [":redact"],
+    flaky = True,
+    deps = [
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_pingcap_errors//:errors",
+        "@com_github_pingcap_kvproto//pkg/brpb",
+        "@com_github_pingcap_kvproto//pkg/encryptionpb",
+        "@com_github_pingcap_kvproto//pkg/errorpb",
+        "@com_github_pingcap_kvproto//pkg/kvrpcpb",
+        "@com_github_pingcap_kvproto//pkg/metapb",
+        "@com_github_stretchr_testify//require",
+        "@org_uber_go_zap//:zap",
+        "@org_uber_go_zap//zapcore",
+    ],
+)

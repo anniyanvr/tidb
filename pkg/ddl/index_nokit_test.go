@@ -1,0 +1,429 @@
+// Copyright 2025 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ddl
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	ddlmock "github.com/pingcap/tidb/pkg/ddl/mock"
+	"github.com/pingcap/tidb/pkg/ddl/systable"
+	"github.com/pingcap/tidb/pkg/dxf/framework/mock"
+	"github.com/pingcap/tidb/pkg/dxf/framework/proto"
+	"github.com/pingcap/tidb/pkg/dxf/framework/storage"
+	"github.com/pingcap/tidb/pkg/ingestor/errdef"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
+	"github.com/pingcap/tidb/pkg/util/dbterror"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+)
+
+func TestAccountDistTaskRU(t *testing.T) {
+	t.Cleanup(config.RestoreFunc())
+	config.UpdateGlobal(func(cfg *config.Config) {
+		cfg.RUV2.DDLWeights.IngestKVBytes = 2
+	})
+
+	tests := []struct {
+		name string
+		task *proto.Task
+		want float64
+	}{
+		{
+			name: "successful task with summary",
+			task: &proto.Task{
+				TaskBase: proto.TaskBase{State: proto.TaskStateSucceed},
+				Meta:     []byte(`{"summary":{"index_kv_size":42}}`),
+			},
+			want: 42,
+		},
+		{
+			name: "unfinished task",
+			task: &proto.Task{
+				TaskBase: proto.TaskBase{State: proto.TaskStateRunning},
+				Meta:     []byte(`{"summary":{"index_kv_size":42}}`),
+			},
+			want: 0,
+		},
+		{
+			name: "successful task without summary",
+			task: &proto.Task{
+				TaskBase: proto.TaskBase{State: proto.TaskStateSucceed},
+				Meta:     []byte(`{}`),
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const jobID int64 = 1
+			rc := &reorgCtx{}
+			dc := &ddlCtx{}
+			dc.reorgCtx.reorgCtxMap = map[int64]*reorgCtx{jobID: rc}
+			err := (&worker{ddlCtx: dc}).recordDistTaskRU(jobID, tt.task)
+			require.NoError(t, err)
+			want := tt.want
+			if kerneltype.IsNextGen() {
+				want *= 2
+			} else {
+				want = 0
+			}
+			require.Equal(t, want, rc.getRU())
+
+			jobCtx := &jobContext{}
+			job := &model.Job{RU: 7}
+			stageReorgResultRU(jobCtx, reorgFnResult{ru: rc.getRU()})
+			accountPendingReorgRU(jobCtx, job, nil)
+			require.Equal(t, 7+want, job.RU)
+		})
+	}
+
+	t.Run("failed reorg does not stage collected RU v2", func(t *testing.T) {
+		jobCtx := &jobContext{}
+		job := &model.Job{RU: 7}
+		stageReorgResultRU(jobCtx, reorgFnResult{ru: 42, err: errors.New("reorg failed")})
+		accountPendingReorgRU(jobCtx, job, nil)
+		require.Equal(t, float64(7), job.RU)
+	})
+
+	t.Run("failed metadata transition does not account collected RU v2", func(t *testing.T) {
+		jobCtx := &jobContext{}
+		job := &model.Job{RU: 7}
+		stageReorgResultRU(jobCtx, reorgFnResult{ru: 42})
+		accountPendingReorgRU(jobCtx, job, errors.New("metadata update failed"))
+		require.Equal(t, float64(7), job.RU)
+		require.Zero(t, jobCtx.pendingReorgRU)
+	})
+
+	t.Run("multi-schema proxy preserves accounted RU v2", func(t *testing.T) {
+		parentJob := &model.Job{RU: 7}
+		proxyJob := (&model.SubJob{}).ToProxyJob(parentJob, 0)
+		require.Equal(t, parentJob.RU, proxyJob.RU)
+
+		proxyJob.RU += 42
+		updateParentJobFromProxy(parentJob, &proxyJob)
+		require.Equal(t, float64(49), parentJob.RU)
+	})
+}
+
+func TestDistTaskRU(t *testing.T) {
+	t.Cleanup(config.RestoreFunc())
+	const (
+		ingestWeight = 2
+		txnWeight    = 3
+	)
+	config.UpdateGlobal(func(cfg *config.Config) {
+		cfg.RUV2.DDLWeights.IngestKVBytes = ingestWeight
+		cfg.RUV2.DDLWeights.TxnKVBytes = txnWeight
+	})
+
+	// The global-sort ingest path accounts the ingested index KV size.
+	require.Equal(t,
+		float64(10*ingestWeight),
+		distTaskRU(&BackfillTaskMeta{Summary: &BackfillTaskSummary{IndexKVSize: 10}}),
+	)
+	// The temp-index merge path accounts its committed transaction bytes.
+	require.Equal(t,
+		float64(20*txnWeight),
+		distTaskRU(&BackfillTaskMeta{MergeTempIndex: true, Summary: &BackfillTaskSummary{MergeTempIndexTxnKVSize: 20}}),
+	)
+	// A task without recorded workload contributes no RU.
+	require.Zero(t, distTaskRU(&BackfillTaskMeta{}))
+}
+
+func TestResolveCloudStorageURI(t *testing.T) {
+	originalURI := vardef.CloudStorageURI.Load()
+	t.Cleanup(func() {
+		vardef.CloudStorageURI.Store(originalURI)
+	})
+
+	const jobID int64 = 900001
+	newTestWorker := func(cachedURI string) (*worker, *ReorgContext) {
+		jc := NewReorgContext()
+		jc.cloudStorageURI = cachedURI
+		dc := &ddlCtx{}
+		dc.jobCtx.jobCtxMap = map[int64]*ReorgContext{jobID: jc}
+		return &worker{workCtx: context.Background(), ddlCtx: dc}, jc
+	}
+	newJob := func(useCloudStorage bool) *model.Job {
+		return &model.Job{
+			ID: jobID,
+			ReorgMeta: &model.DDLReorgMeta{
+				UseCloudStorage: useCloudStorage,
+			},
+		}
+	}
+
+	t.Run("configured URI recovers empty owner cache", func(t *testing.T) {
+		vardef.CloudStorageURI.Store("s3://bucket")
+		w, jc := newTestWorker("")
+		uri, err := w.resolveCloudStorageURI(newJob(true), false)
+		require.NoError(t, err)
+		require.Equal(t, "s3://bucket/dxf/", uri)
+		require.Equal(t, uri, jc.cloudStorageURI)
+	})
+
+	t.Run("missing configured URI is unretryable", func(t *testing.T) {
+		vardef.CloudStorageURI.Store("")
+		w, _ := newTestWorker("")
+		_, err := w.resolveCloudStorageURI(newJob(true), false)
+		require.ErrorContains(t, err, "cloud storage URI is empty for add-index job 900001 with cloud storage enabled")
+		require.False(t, isRetryableJobError(err, 0))
+	})
+
+	t.Run("cached URI wins over changed configuration", func(t *testing.T) {
+		vardef.CloudStorageURI.Store("s3://new-bucket")
+		w, _ := newTestWorker("s3://cached-bucket/dxf/")
+		uri, err := w.resolveCloudStorageURI(newJob(true), false)
+		require.NoError(t, err)
+		require.Equal(t, "s3://cached-bucket/dxf/", uri)
+	})
+
+	t.Run("local sort permits empty URI", func(t *testing.T) {
+		vardef.CloudStorageURI.Store("")
+		w, _ := newTestWorker("")
+		uri, err := w.resolveCloudStorageURI(newJob(false), false)
+		require.NoError(t, err)
+		require.Empty(t, uri)
+	})
+
+	t.Run("merge temp index does not require cloud storage", func(t *testing.T) {
+		vardef.CloudStorageURI.Store("")
+		w, _ := newTestWorker("")
+		uri, err := w.resolveCloudStorageURI(newJob(true), true)
+		require.NoError(t, err)
+		require.Empty(t, uri)
+	})
+}
+
+func TestShouldAutoPauseExistingKVDiskFullTask(t *testing.T) {
+	task := &proto.Task{
+		TaskBase: proto.TaskBase{
+			ID:    123,
+			State: proto.TaskStatePaused,
+		},
+		Error: errdef.ErrKVDiskFull.GenWithStack("store 1 disk full"),
+	}
+	job := &model.Job{ID: 456}
+	require.True(t, shouldAutoPauseExistingKVDiskFullTask(job, task))
+
+	job.SetResumeReason(model.JobResumeReasonKVDiskFull)
+	require.False(t, shouldAutoPauseExistingKVDiskFullTask(job, task))
+
+	job.ClearResumeReason()
+	task.State = proto.TaskStateRunning
+	require.False(t, shouldAutoPauseExistingKVDiskFullTask(job, task))
+
+	task.State = proto.TaskStatePaused
+	task.Error = errors.New("not disk full")
+	require.False(t, shouldAutoPauseExistingKVDiskFullTask(job, task))
+
+	job.SetResumeReason(model.JobResumeReasonKVDiskFull)
+	err := errdef.ErrKVDiskFull.GenWithStack(
+		"the remaining storage capacity of TiFlash(127.0.0.1:3930) is less than 10%; please increase the storage capacity of TiFlash and try again")
+	err = autoPauseAddIndexJobOnKVDiskFull(job, task.ID, err)
+	require.True(t, dbterror.ErrDDLAutoPausedByKVDiskFull.Equal(err), "unexpected error: %v", err)
+	require.Contains(t, err.Error(), "TiFlash disk full")
+	require.NotContains(t, err.Error(), "because TiKV disk is full")
+	require.NotContains(t, err.Error(), "hit TiKV disk full")
+	require.True(t, job.IsPausingOrPausedBySystemForKVDiskFull())
+	require.Contains(t, job.PauseReason.Message, "TiFlash disk full")
+	require.Nil(t, job.ResumeReason)
+}
+
+func TestModifyTaskParamLoop(t *testing.T) {
+	type env struct {
+		ctrl          *gomock.Controller
+		ctx           context.Context
+		sysTblMgr     *ddlmock.MockManager
+		taskMgr       *mock.MockManager
+		done          chan struct{}
+		jobID, taskID int64
+
+		currentJob  *model.JobW
+		modifiedJob *model.JobW
+	}
+	newEnv := func(t *testing.T) *env {
+		ctrl := gomock.NewController(t)
+		bak := UpdateDDLJobReorgCfgInterval
+		t.Cleanup(func() {
+			ctrl.Finish()
+			UpdateDDLJobReorgCfgInterval = bak
+		})
+		UpdateDDLJobReorgCfgInterval = 10 * time.Millisecond
+		currentJob := &model.Job{ReorgMeta: &model.DDLReorgMeta{}}
+		currentJob.ReorgMeta.SetConcurrency(1)
+		currentJob.ReorgMeta.SetBatchSize(2)
+		currentJob.ReorgMeta.SetMaxWriteSpeed(3)
+
+		modifiedJob := &model.Job{ReorgMeta: &model.DDLReorgMeta{}}
+		modifiedJob.ReorgMeta.SetConcurrency(4)
+		modifiedJob.ReorgMeta.SetBatchSize(5)
+		modifiedJob.ReorgMeta.SetMaxWriteSpeed(6)
+		return &env{
+			ctrl:      ctrl,
+			ctx:       context.Background(),
+			sysTblMgr: ddlmock.NewMockManager(ctrl),
+			taskMgr:   mock.NewMockManager(ctrl),
+			done:      make(chan struct{}),
+			jobID:     int64(1),
+			taskID:    int64(1),
+
+			currentJob:  &model.JobW{Job: currentJob},
+			modifiedJob: &model.JobW{Job: modifiedJob},
+		}
+	}
+	t.Run("return on done", func(t *testing.T) {
+		e := newEnv(t)
+		close(e.done)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+
+	t.Run("retry on get job error; return on job not found", func(t *testing.T) {
+		e := newEnv(t)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(nil, errors.New("some error"))
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(nil, systable.ErrNotFound)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+
+	t.Run("adjust concurrency failed, retry", func(t *testing.T) {
+		e := newEnv(t)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.currentJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(0, errors.New("some error"))
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(nil, systable.ErrNotFound)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+
+	t.Run("nothing modified, retry", func(t *testing.T) {
+		e := newEnv(t)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.currentJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(nil, systable.ErrNotFound)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+
+	t.Run("detect modify, but the task has done", func(t *testing.T) {
+		e := newEnv(t)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(nil, storage.ErrTaskNotFound)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+
+	t.Run("detect modify, fail to get task, after retry, found task state is un-modifiable", func(t *testing.T) {
+		e := newEnv(t)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(nil, errors.New("some error"))
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(&proto.Task{TaskBase: proto.TaskBase{State: proto.TaskStateCancelling}}, nil)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(nil, storage.ErrTaskNotFound)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+
+	t.Run("detect modify, success after retry, and we update internal variable to avoid modify twice", func(t *testing.T) {
+		e := newEnv(t)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(&proto.Task{TaskBase: proto.TaskBase{State: proto.TaskStateRunning}}, nil)
+		modifyParam := &proto.ModifyParam{
+			PrevState: proto.TaskStateRunning,
+			Modifications: []proto.Modification{
+				{Type: proto.ModifyRequiredSlots, To: 4},
+				{Type: proto.ModifyBatchSize, To: 5},
+				{Type: proto.ModifyMaxWriteSpeed, To: 6},
+			},
+		}
+		e.taskMgr.EXPECT().ModifyTaskByID(e.ctx, e.taskID, modifyParam).Return(errors.New("some error"))
+		// retry and success
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(&proto.Task{TaskBase: proto.TaskBase{State: proto.TaskStateRunning}}, nil)
+		e.taskMgr.EXPECT().ModifyTaskByID(e.ctx, e.taskID, modifyParam).Return(nil)
+		// same param, but will continue this time, as nothing modified
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		// exit loop
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(nil, systable.ErrNotFound)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+
+	t.Run("modify twice, both success", func(t *testing.T) {
+		e := newEnv(t)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(&proto.Task{TaskBase: proto.TaskBase{State: proto.TaskStateRunning}}, nil)
+		modifyParam := &proto.ModifyParam{
+			PrevState: proto.TaskStateRunning,
+			Modifications: []proto.Modification{
+				{Type: proto.ModifyRequiredSlots, To: 4},
+				{Type: proto.ModifyBatchSize, To: 5},
+				{Type: proto.ModifyMaxWriteSpeed, To: 6},
+			},
+		}
+		e.taskMgr.EXPECT().ModifyTaskByID(e.ctx, e.taskID, modifyParam).Return(nil)
+		// same param, but will continue this time, as nothing modified
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(e.modifiedJob, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+
+		modifiedJob2 := &model.JobW{Job: &model.Job{ReorgMeta: &model.DDLReorgMeta{}}}
+		modifiedJob2.ReorgMeta.SetConcurrency(7)
+		modifiedJob2.ReorgMeta.SetBatchSize(8)
+		modifiedJob2.ReorgMeta.SetMaxWriteSpeed(9)
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(modifiedJob2, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		e.taskMgr.EXPECT().GetTaskByID(e.ctx, e.taskID).Return(&proto.Task{TaskBase: proto.TaskBase{State: proto.TaskStateRunning}}, nil)
+		modifyParam2 := &proto.ModifyParam{
+			PrevState: proto.TaskStateRunning,
+			Modifications: []proto.Modification{
+				{Type: proto.ModifyRequiredSlots, To: 7},
+				{Type: proto.ModifyBatchSize, To: 8},
+				{Type: proto.ModifyMaxWriteSpeed, To: 9},
+			},
+		}
+		e.taskMgr.EXPECT().ModifyTaskByID(e.ctx, e.taskID, modifyParam2).Return(nil)
+		// same param, but will continue this time, as nothing modified
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(modifiedJob2, nil)
+		e.taskMgr.EXPECT().GetCPUCountOfNode(e.ctx).Return(123, nil)
+		// exit loop
+		e.sysTblMgr.EXPECT().GetJobByID(e.ctx, e.jobID).Return(nil, systable.ErrNotFound)
+		modifyTaskParamLoop(e.ctx, e.sysTblMgr, e.taskMgr, e.done,
+			e.jobID, e.taskID, 1, 2, 3)
+		require.True(t, e.ctrl.Satisfied())
+	})
+}

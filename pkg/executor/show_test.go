@@ -1,0 +1,274 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package executor_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/pingcap/tidb/pkg/domain"
+	"github.com/pingcap/tidb/pkg/dxf/framework/proto"
+	"github.com/pingcap/tidb/pkg/dxf/importinto"
+	"github.com/pingcap/tidb/pkg/errno"
+	"github.com/pingcap/tidb/pkg/executor"
+	"github.com/pingcap/tidb/pkg/executor/importer"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/auth"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	plannercore "github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/execdetails"
+	"github.com/stretchr/testify/require"
+	tikvutil "github.com/tikv/client-go/v2/util"
+)
+
+func TestFillOneImportJobInfo(t *testing.T) {
+	fieldTypes := make([]*types.FieldType, 0, len(plannercore.ImportIntoSchemaFTypes))
+	for _, tp := range plannercore.ImportIntoSchemaFTypes {
+		fieldType := types.NewFieldType(tp)
+		flen, decimal := mysql.GetDefaultFieldLengthAndDecimal(tp)
+		fieldType.SetFlen(flen)
+		fieldType.SetDecimal(decimal)
+		charset, collate := types.DefaultCharsetForType(tp)
+		fieldType.SetCharset(charset)
+		fieldType.SetCollate(collate)
+		fieldTypes = append(fieldTypes, fieldType)
+	}
+	c := chunk.New(fieldTypes, 10, 10)
+	t2024 := types.NewTime(types.FromGoTime(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)), mysql.TypeTimestamp, 0)
+	t2025 := types.NewTime(types.FromGoTime(time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)), mysql.TypeTimestamp, 0)
+	jobInfo := &importer.JobInfo{
+		Parameters: importer.ImportParameters{},
+		UpdateTime: t2024,
+	}
+
+	fmap := plannercore.ImportIntoFieldMap
+	rowCntIdx := fmap["ImportedRows"]
+	sourceFileSizeIdx := fmap["SourceFileSize"]
+	startIdx := fmap["StartTime"]
+	endIdx := fmap["EndTime"]
+
+	executor.FillOneImportJobInfo(c, jobInfo, nil)
+	require.True(t, c.GetRow(0).IsNull(rowCntIdx))
+	require.True(t, c.GetRow(0).IsNull(startIdx))
+	require.True(t, c.GetRow(0).IsNull(endIdx))
+
+	executor.FillOneImportJobInfo(c, jobInfo, &importinto.RuntimeInfo{ImportRows: 0})
+	require.False(t, c.GetRow(1).IsNull(rowCntIdx))
+	require.Equal(t, uint64(0), c.GetRow(1).GetUint64(rowCntIdx))
+	require.True(t, c.GetRow(1).IsNull(startIdx))
+	require.True(t, c.GetRow(1).IsNull(endIdx))
+	// runtime info doesn't have update time, so use job info's update time
+	require.EqualValues(t, t2024, c.GetRow(1).GetTime(14))
+
+	jobInfo.Status = importer.JobStatusFinished
+	jobInfo.Summary = &importer.Summary{ImportedRows: 123}
+	jobInfo.StartTime = types.NewTime(types.FromGoTime(time.Now()), mysql.TypeTimestamp, 0)
+	jobInfo.EndTime = types.NewTime(types.FromGoTime(time.Now()), mysql.TypeTimestamp, 0)
+	executor.FillOneImportJobInfo(c, jobInfo, nil)
+	require.False(t, c.GetRow(2).IsNull(rowCntIdx))
+	require.Equal(t, uint64(123), c.GetRow(2).GetUint64(rowCntIdx))
+	require.False(t, c.GetRow(2).IsNull(startIdx))
+	require.False(t, c.GetRow(2).IsNull(endIdx))
+
+	ri := &importinto.RuntimeInfo{
+		Processed: 10,
+		Total:     100000,
+		Speed:     2,
+	}
+	jobInfo.Summary = &importer.Summary{ImportedRows: 0}
+	executor.FillOneImportJobInfo(c, jobInfo, ri)
+	require.Equal(t, "10B", c.GetRow(3).GetString(fmap["CurStepProcessedSize"]))
+	require.Equal(t, "97.66KiB", c.GetRow(3).GetString(fmap["CurStepTotalSize"]))
+	require.Equal(t, "0", c.GetRow(3).GetString(fmap["CurStepProgressPct"]))
+	require.Equal(t, "13:53:15", c.GetRow(3).GetString(fmap["CurStepETA"]))
+
+	// runtime info have update time, so use it
+	executor.FillOneImportJobInfo(c, jobInfo, &importinto.RuntimeInfo{ImportRows: 0, UpdateTime: t2025})
+	require.EqualValues(t, t2025, c.GetRow(4).GetTime(14))
+
+	// conflict-step runtime progress should use conflict count labels.
+	ri = &importinto.RuntimeInfo{
+		Step:      proto.ImportStepCollectConflicts,
+		Processed: 12,
+		Total:     34,
+		Speed:     5,
+	}
+	executor.FillOneImportJobInfo(c, jobInfo, ri)
+	require.Equal(t, "12 conflicts", c.GetRow(5).GetString(fmap["CurStepProcessedSize"]))
+	require.Equal(t, "34 conflicts", c.GetRow(5).GetString(fmap["CurStepTotalSize"]))
+	require.Equal(t, "5 conflicts/s", c.GetRow(5).GetString(fmap["CurStepSpeed"]))
+
+	// preparing phase should be visible while current business step is still init.
+	jobInfo.Step = importer.JobStepPreparing
+	ri = &importinto.RuntimeInfo{
+		Step: proto.StepInit,
+	}
+	executor.FillOneImportJobInfo(c, jobInfo, ri)
+	require.Equal(t, importer.JobStepPreparing, c.GetRow(6).GetString(fmap["Phase"]))
+	require.Equal(t, proto.Step2Str(proto.ImportInto, proto.StepInit), c.GetRow(6).GetString(fmap["CurStep"]))
+
+	// source_file_size may be unknown for pending or running(preparing) jobs in async prepare.
+	jobInfo.Status = "pending"
+	jobInfo.Step = ""
+	jobInfo.SourceFileSize = 0
+	executor.FillOneImportJobInfo(c, jobInfo, nil)
+	require.Equal(t, "N/A", c.GetRow(7).GetString(sourceFileSizeIdx))
+
+	jobInfo.Status = importer.JobStatusRunning
+	jobInfo.Step = importer.JobStepPreparing
+	executor.FillOneImportJobInfo(c, jobInfo, nil)
+	require.Equal(t, "N/A", c.GetRow(8).GetString(sourceFileSizeIdx))
+
+	// For other states/steps, keep the existing size formatting.
+	jobInfo.Step = importer.JobStepImporting
+	executor.FillOneImportJobInfo(c, jobInfo, nil)
+	require.Equal(t, "0B", c.GetRow(9).GetString(sourceFileSizeIdx))
+
+	jobInfo.Step = importer.JobStepPreparing
+	jobInfo.SourceFileSize = 3
+	executor.FillOneImportJobInfo(c, jobInfo, nil)
+	require.Equal(t, "3B", c.GetRow(10).GetString(sourceFileSizeIdx))
+}
+
+func TestShow(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+
+	tk.MustExec("use test")
+	tk.MustExec("create table t(id int, abclmn int);")
+	tk.MustExec("create table abclmn(a int);")
+
+	tk.MustGetErrCode("show columns from t like id", errno.ErrBadField)
+	tk.MustGetErrCode("show columns from t like `id`", errno.ErrBadField)
+
+	tk.MustQuery("show tables").Check(testkit.Rows("abclmn", "t"))
+	tk.MustQuery("show full tables").Check(testkit.Rows("abclmn BASE TABLE", "t BASE TABLE"))
+	tk.MustQuery("show tables like 't'").Check(testkit.Rows("t"))
+	tk.MustQuery("show tables like 'T'").Check(testkit.Rows("t"))
+	tk.MustQuery("show tables like 'ABCLMN'").Check(testkit.Rows("abclmn"))
+	tk.MustQuery("show tables like 'ABC%'").Check(testkit.Rows("abclmn"))
+	tk.MustQuery("show tables like '%lmn'").Check(testkit.Rows("abclmn"))
+	tk.MustQuery("show full tables like '%lmn'").Check(testkit.Rows("abclmn BASE TABLE"))
+	tk.MustGetErrCode("show tables like T", errno.ErrBadField)
+	tk.MustGetErrCode("show tables like `T`", errno.ErrBadField)
+
+	tk.MustExec("drop database test;")
+	tk.MustExec("create database test;")
+	tk.MustExec("create temporary table test.t1(id int);")
+	tk.MustQuery("show tables from test like 't1';").Check(testkit.Rows( /* empty */ ))
+	tk.MustExec("create global temporary table test.t2(id int) ON COMMIT DELETE ROWS;")
+	tk.MustQuery("show tables from test like 't2';").Check(testkit.Rows("t2"))
+
+	// filter internal session variables
+	tk.MustQuery("show variables like 'tidb_redact_log'").Check(testkit.Rows())
+	tk.MustQuery("show session variables like 'tidb_redact_log'").Check(testkit.Rows())
+	tk.MustQuery("show global variables like 'tidb_redact_log'").Check(testkit.Rows("tidb_redact_log OFF"))
+}
+
+func TestAdminShowSlowIARemoteReadStats(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("set tidb_slow_log_threshold=300000")
+
+	iaDetail := execdetails.ExecDetails{CopExecDetails: execdetails.CopExecDetails{
+		ScanDetail: &tikvutil.ScanDetail{
+			IaRemoteReadSegmentCount:    4,
+			IaRemoteReadSegmentBytes:    4096,
+			IaRemoteReadSegmentDuration: 15 * time.Millisecond,
+		},
+	}}
+	dom.LogSlowQuery(&domain.SlowQueryInfo{SQL: "user IA", Duration: 2 * time.Second, Detail: iaDetail})
+	dom.LogSlowQuery(&domain.SlowQueryInfo{SQL: "internal IA", Duration: 3 * time.Second, Detail: iaDetail, Internal: true})
+	dom.LogSlowQuery(&domain.SlowQueryInfo{SQL: "user standard", Duration: time.Second})
+	require.Eventually(t, func() bool {
+		return len(dom.ShowSlowQuery(&ast.ShowSlow{Tp: ast.ShowSlowRecent, Count: 3})) == 3
+	}, time.Second, 10*time.Millisecond)
+
+	commands := []string{
+		"admin show slow recent 2",
+		"admin show slow top 1",
+		"admin show slow top internal 1",
+		"admin show slow top all 1",
+	}
+	for _, command := range commands {
+		rs, err := tk.Exec(command)
+		require.NoError(t, err)
+		fields := rs.Fields()
+		require.Len(t, fields, 17)
+		require.Equal(t, "IA_REMOTE_READ_SEGMENT_COUNT", fields[14].ColumnAsName.O)
+		require.Equal(t, mysql.TypeLonglong, fields[14].Column.GetType())
+		require.True(t, mysql.HasUnsignedFlag(fields[14].Column.GetFlag()))
+		require.Equal(t, "IA_REMOTE_READ_SEGMENT_SIZE", fields[15].ColumnAsName.O)
+		require.Equal(t, mysql.TypeLonglong, fields[15].Column.GetType())
+		require.True(t, mysql.HasUnsignedFlag(fields[15].Column.GetFlag()))
+		require.Equal(t, "IA_REMOTE_READ_SEGMENT_WAIT_TIME", fields[16].ColumnAsName.O)
+		require.Equal(t, mysql.TypeDouble, fields[16].Column.GetType())
+		require.NoError(t, rs.Close())
+	}
+
+	rows := tk.MustQuery("admin show slow recent 2").Rows()
+	require.Len(t, rows, 2)
+	for _, row := range rows {
+		if row[0] == "user standard" {
+			require.Equal(t, []any{"0", "0", "0"}, row[14:17])
+		} else {
+			require.Equal(t, "internal IA", row[0])
+			require.Equal(t, []any{"4", "4096", "0.015"}, row[14:17])
+		}
+	}
+	tk.MustQuery("admin show slow top 1").CheckAt([]int{14, 15, 16}, testkit.Rows("4 4096 0.015"))
+	tk.MustQuery("admin show slow top internal 1").CheckAt([]int{14, 15, 16}, testkit.Rows("4 4096 0.015"))
+	tk.MustQuery("admin show slow top all 1").CheckAt([]int{14, 15, 16}, testkit.Rows("4 4096 0.015"))
+}
+
+func TestShowIndex(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+
+	tk.MustExec("use test")
+	tk.MustExec("create table t(id int, abclmn int);")
+
+	tk.MustExec("create index idx on t(abclmn);")
+	tk.MustQuery("show index from t").Check(testkit.Rows("t 1 idx 1 abclmn A 0 <nil> <nil> YES BTREE   YES <nil> NO NO"))
+}
+
+func TestShowIndexWithGlobalIndex(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+
+	tk.MustExec("use test")
+	tk.MustExec("set tidb_enable_global_index=true;")
+
+	defer tk.MustExec("set tidb_enable_global_index=false;")
+
+	tk.MustExec("create table test_t1 (a int, b int) partition by range (b) (partition p0 values less than (10),  partition p1 values less than (maxvalue));")
+
+	tk.MustExec("insert test_t1 values (1, 1);")
+	tk.MustExec("alter table test_t1 add unique index p_a (a) GLOBAL;")
+	tk.MustQuery("show index from test_t1").Check(testkit.Rows("test_t1 0 p_a 1 a A 0 <nil> <nil> YES BTREE   YES <nil> NO YES"))
+}
+
+func TestShowSessionStates(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustQuery("show session_states").CheckAt([]int{1}, testkit.Rows("<nil>"))
+
+	tk1 := testkit.NewTestKit(t, store)
+	require.NoError(t, tk1.Session().Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, nil, nil))
+	tk1.MustQuery("show session_states").CheckAt([]int{1}, testkit.Rows("<nil>"))
+}

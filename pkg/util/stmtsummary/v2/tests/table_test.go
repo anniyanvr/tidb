@@ -1,0 +1,1226 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tests
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/meta_storagepb"
+	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/domain/infosync"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/parser/auth"
+	plannercore "github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/session"
+	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
+	stmtsummaryv2 "github.com/pingcap/tidb/pkg/util/stmtsummary/v2"
+	"github.com/stretchr/testify/require"
+	clientutil "github.com/tikv/client-go/v2/util"
+	"github.com/tikv/pd/client/opt"
+	rmclient "github.com/tikv/pd/client/resource_group/controller"
+)
+
+func TestStmtSummaryIndexAdvisor(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec(`create table t (a int, b int, c int)`)
+
+	tk.MustQueryToErr(`recommend index run`) // no query
+
+	tk.MustQuery(`select a from t where a=1`)
+	rs := tk.MustQuery(`recommend index run`).Sort().Rows()
+	require.Equal(t, rs[0][2], "idx_a")
+
+	tk.MustQuery(`select b from t where b=1`)
+	rs = tk.MustQuery(`recommend index run`).Sort().Rows()
+	require.Equal(t, rs[0][2], "idx_a")
+	require.Equal(t, rs[1][2], "idx_b")
+
+	tk.MustQuery(`select index_columns, index_details->'$.Reason' from mysql.index_advisor_results`).Check(
+		testkit.Rows("a \"Column [a] appear in Equal or Range Predicate clause(s) in query: select `a` from `test` . `t` where `a` = ?\"",
+			"b \"Column [b] appear in Equal or Range Predicate clause(s) in query: select `b` from `test` . `t` where `b` = ?\""))
+}
+
+func TestStmtSummaryIndexAdvisorNullSchema(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec(`create table t (a int, b int, c int)`)
+
+	tk.MustQueryToErr(`recommend index run`) // no query
+
+	tk = testkit.NewTestKit(t, store)
+	require.NoError(t, tk.Session().Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, nil, nil))
+	tk.MustQuery(`select a from test.t where a=1`) // schema_name in statement_summary is NULL
+
+	rs := tk.MustQuery(`recommend index run`).Sort().Rows()
+	require.Equal(t, rs[0][2], "idx_a")
+
+	tk.MustQuery(`select b from test.t where b=1`)
+	rs = tk.MustQuery(`recommend index run`).Sort().Rows()
+	require.Equal(t, rs[0][2], "idx_a")
+	require.Equal(t, rs[1][2], "idx_b")
+
+	tk.MustQuery(`select index_columns, index_details->'$.Reason' from mysql.index_advisor_results`).Check(
+		testkit.Rows("a \"Column [a] appear in Equal or Range Predicate clause(s) in query: select `a` from `test` . `t` where `a` = ?\"",
+			"b \"Column [b] appear in Equal or Range Predicate clause(s) in query: select `b` from `test` . `t` where `b` = ?\""))
+}
+
+func TestStmtSummaryTable(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec(`set tidb_enable_non_prepared_plan_cache=0`) // affect est-rows in this UT
+
+	tk.MustExec("set @@tidb_enable_collect_execution_info=0;")
+	tk.MustQuery("select column_comment from information_schema.columns " +
+		"where table_name='STATEMENTS_SUMMARY' and column_name='STMT_TYPE'",
+	).Check(testkit.Rows("Statement type"))
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int, b varchar(10), key k(a))")
+
+	// Clear all statements.
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+	tk.MustQuery("select @@global.tidb_enable_stmt_summary").Check(testkit.Rows("1"))
+
+	// Create a new session to test.
+	tk = newTestKitWithRoot(t, store)
+	tk.MustExec(`set tidb_enable_non_prepared_plan_cache=0`) // affect est-rows in this UT
+
+	// Test INSERT
+	tk.MustExec("insert into t values(1, 'a')")
+	tk.MustExec("insert into t values(2, 'b')")
+	tk.MustExec("insert into t VALUES(3, 'c')")
+	tk.MustExec("/**/insert into t values(4, 'd')")
+
+	sql := "select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys, " +
+		"max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions, " +
+		"max_prewrite_regions, avg_affected_rows, query_sample_text " +
+		"from information_schema.statements_summary " +
+		"where digest_text like 'insert into `t`%'"
+	tk.MustQuery(sql).Check(testkit.Rows("Insert test test.t <nil> 4 0 0 0 0 0 2 2 1 1 1 insert into t values(1, 'a')"))
+
+	// Test point get.
+	tk.MustExec("drop table if exists p")
+	tk.MustExec("create table p(a int primary key, b int)")
+	for i := 1; i < 3; i++ {
+		tk.MustQuery("select b from p where a=1")
+		expectedResult := fmt.Sprintf("%d \tid         \ttask\testRows\toperator info\n\tPoint_Get_1\troot\t1      \ttable:p, handle:1 %s", i, "test.p")
+		// Also make sure that the plan digest is not empty
+		sql = "select exec_count, plan, table_names from information_schema.statements_summary " +
+			"where digest_text like 'select `b` from `p`%' and plan_digest != ''"
+		tk.MustQuery(sql).Check(testkit.Rows(expectedResult))
+	}
+
+	// Point get another database.
+	tk.MustQuery("select variable_value from mysql.tidb where variable_name = 'system_tz'")
+	// Test for Encode plan cache.
+	p1 := tk.Session().GetSessionVars().StmtCtx.GetEncodedPlan()
+	require.Greater(t, len(p1), 0)
+	rows := tk.MustQuery("select tidb_decode_plan('" + p1 + "');").Rows()
+	require.Equal(t, 1, len(rows))
+	require.Equal(t, 1, len(rows[0]))
+	if kerneltype.IsNextGen() {
+		// next-gen system tables use clustered index.
+		require.Regexp(t, "\n.*Point_Get.*table.tidb, clustered index.PRIMARY.VARIABLE_NAME", rows[0][0])
+	} else {
+		require.Regexp(t, "\n.*Point_Get.*table.tidb, index.PRIMARY.VARIABLE_NAME", rows[0][0])
+	}
+
+	sql = "select table_names from information_schema.statements_summary " +
+		"where digest_text like 'select `variable_value`%' and `schema_name`='test'"
+	tk.MustQuery(sql).Check(testkit.Rows("mysql.tidb"))
+
+	// Test `create database`.
+	tk.MustExec("create database if not exists test")
+	// Test for Encode plan cache.
+	p2 := tk.Session().GetSessionVars().StmtCtx.GetEncodedPlan()
+	require.Equal(t, "", p2)
+	tk.MustQuery(`select table_names
+			from information_schema.statements_summary
+			where digest_text like 'create database%' and schema_name='test'`,
+	).Check(testkit.Rows("<nil>"))
+
+	// Test SELECT.
+	const failpointName = "github.com/pingcap/tidb/pkg/planner/core/mockPlanRowCount"
+	require.NoError(t, failpoint.Enable(failpointName, "return(100)"))
+	defer func() { require.NoError(t, failpoint.Disable(failpointName)) }()
+	tk.MustQuery("select * from t where a=2")
+
+	// sum_cop_task_num is always 0 if tidb_enable_collect_execution_info disabled
+	sql = "select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys, " +
+		"max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions, " +
+		"max_prewrite_regions, avg_affected_rows, query_sample_text, plan " +
+		"from information_schema.statements_summary " +
+		"where digest_text like 'select * from `t`%'"
+	tk.MustQuery(sql).Check(testkit.Rows("Select test test.t t:k 1 0 0 0 0 0 0 0 0 0 0 select * from t where a=2 \tid                       \ttask     \testRows\toperator info\n" +
+		"\tIndexLookUp_7            \troot     \t100    \t\n" +
+		"\t├─IndexRangeScan_5(Build)\tcop[tikv]\t100    \ttable:t, index:k(a), range:[2,2], keep order:false, stats:pseudo\n" +
+		"\t└─TableRowIDScan_6(Probe)\tcop[tikv]\t100    \ttable:t, keep order:false, stats:pseudo"))
+
+	// select ... order by
+	tk.MustQuery(`select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys,
+		max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions,
+		max_prewrite_regions, avg_affected_rows, query_sample_text
+		from information_schema.statements_summary
+		order by exec_count desc limit 1`,
+	).Check(testkit.Rows("Insert test test.t <nil> 4 0 0 0 0 0 2 2 1 1 1 insert into t values(1, 'a')"))
+
+	// Test different plans with same digest.
+	require.NoError(t, failpoint.Enable(failpointName, "return(1000)"))
+	tk.MustQuery("select * from t where a=3")
+	sql = "select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys, " +
+		"max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions, " +
+		"max_prewrite_regions, avg_affected_rows, query_sample_text, plan " +
+		"from information_schema.statements_summary " +
+		"where digest_text like 'select * from `t`%'"
+	tk.MustQuery(sql).Check(testkit.Rows(
+		"Select test test.t t:k 2 0 0 0 0 0 0 0 0 0 0 select * from t where a=2 \tid                       \ttask     \testRows\toperator info\n" +
+			"\tIndexLookUp_7            \troot     \t100    \t\n" +
+			"\t├─IndexRangeScan_5(Build)\tcop[tikv]\t100    \ttable:t, index:k(a), range:[2,2], keep order:false, stats:pseudo\n" +
+			"\t└─TableRowIDScan_6(Probe)\tcop[tikv]\t100    \ttable:t, keep order:false, stats:pseudo"))
+
+	// Disable it again.
+	tk.MustExec("set global tidb_enable_stmt_summary = false")
+	defer tk.MustExec("set global tidb_enable_stmt_summary = 1")
+	tk.MustQuery("select @@global.tidb_enable_stmt_summary").Check(testkit.Rows("0"))
+
+	// Create a new session to test
+	tk = newTestKitWithRoot(t, store)
+	tk.MustExec(`set tidb_enable_non_prepared_plan_cache=0`) // affect est-rows in this UT
+
+	// This statement shouldn't be summarized.
+	tk.MustQuery("select * from t where a=2")
+
+	// The table should be cleared.
+	tk.MustQuery(`select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys,
+		max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions,
+		max_prewrite_regions, avg_affected_rows, query_sample_text, plan
+		from information_schema.statements_summary`,
+	).Check(testkit.Rows())
+
+	tk.MustExec("SET GLOBAL tidb_enable_stmt_summary = on")
+	// It should work immediately.
+	tk.MustExec("begin")
+	tk.MustExec("insert into t values(1, 'a')")
+	tk.MustExec("commit")
+	sql = "select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys, " +
+		"max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions, " +
+		"max_prewrite_regions, avg_affected_rows, query_sample_text, prev_sample_text " +
+		"from information_schema.statements_summary " +
+		"where digest_text like 'insert into `t`%'"
+	tk.MustQuery(sql).Check(testkit.Rows("Insert test test.t <nil> 1 0 0 0 0 0 0 0 0 0 1 insert into t values(1, 'a') "))
+	tk.MustQuery(`select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys,
+		max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions,
+		max_prewrite_regions, avg_affected_rows, query_sample_text, prev_sample_text
+		from information_schema.statements_summary
+		where digest_text='commit'`,
+	).Check(testkit.Rows("Commit test <nil> <nil> 1 0 0 0 0 0 2 2 1 1 0 commit insert into t values(1, 'a')"))
+
+	tk.MustQuery("select * from t where a=2")
+	sql = "select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys, " +
+		"max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions, " +
+		"max_prewrite_regions, avg_affected_rows, query_sample_text, plan " +
+		"from information_schema.statements_summary " +
+		"where digest_text like 'select * from `t`%'"
+	tk.MustQuery(sql).Check(testkit.Rows("Select test test.t t:k 1 0 0 0 0 0 0 0 0 0 0 select * from t where a=2 \tid                       \ttask     \testRows\toperator info\n" +
+		"\tIndexLookUp_7            \troot     \t1000   \t\n" +
+		"\t├─IndexRangeScan_5(Build)\tcop[tikv]\t1000   \ttable:t, index:k(a), range:[2,2], keep order:false, stats:pseudo\n" +
+		"\t└─TableRowIDScan_6(Probe)\tcop[tikv]\t1000   \ttable:t, keep order:false, stats:pseudo"))
+
+	// Disable it in global scope.
+	tk.MustExec("set global tidb_enable_stmt_summary = false")
+
+	// Create a new session to test.
+	tk = newTestKitWithRoot(t, store)
+
+	// Statement summary is disabled.
+	tk.MustQuery(`select stmt_type, schema_name, table_names, index_names, exec_count, sum_cop_task_num, avg_total_keys,
+		max_total_keys, avg_processed_keys, max_processed_keys, avg_write_keys, max_write_keys, avg_prewrite_regions,
+		max_prewrite_regions, avg_affected_rows, query_sample_text, plan
+		from information_schema.statements_summary`,
+	).Check(testkit.Rows())
+
+	tk.MustExec("set global tidb_enable_stmt_summary = on")
+	tk.MustExec("set global tidb_stmt_summary_history_size = 24")
+}
+
+func TestStmtSummaryRUVersion(t *testing.T) {
+	defer config.RestoreFunc()()
+	setupStmtSummary()
+	defer closeStmtSummary()
+	originalCollectExecutionInfo := config.GetGlobalConfig().Instance.EnableCollectExecutionInfo.Load()
+	config.GetGlobalConfig().Instance.EnableCollectExecutionInfo.Store(true)
+	defer config.GetGlobalConfig().Instance.EnableCollectExecutionInfo.Store(originalCollectExecutionInfo)
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec("create table stmt_summary_ru_version (id int primary key, v int)")
+	tk.MustExec("insert into stmt_summary_ru_version values (1, 10), (2, 20), (3, 30)")
+
+	for _, version := range []rmclient.RUVersion{rmclient.RUVersionV1, rmclient.RUVersionV2} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			baseProvider, ok := infosync.NewMockResourceManagerClient(1).(rmclient.ResourceGroupProvider)
+			require.True(t, ok)
+			provider := &stmtSummaryRUVersionProvider{ResourceGroupProvider: baseProvider, version: version}
+			controller, err := rmclient.NewResourceGroupController(context.Background(), 1, provider, nil, 1)
+			require.NoError(t, err)
+			originalController := dom.ResourceGroupsController()
+			dom.SetResourceGroupsController(controller)
+			t.Cleanup(func() { dom.SetResourceGroupsController(originalController) })
+			require.Equal(t, version, dom.GetRUVersion())
+
+			for _, tc := range []struct {
+				name  string
+				sql   string
+				write bool
+			}{
+				{"read", "select * from stmt_summary_ru_version order by id", false},
+				{"write", "update stmt_summary_ru_version set v = v + 1 where id = 1", true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					// Keep each digest at one execution and avoid mixing RU versions.
+					tk.MustExec("set global tidb_enable_stmt_summary=0")
+					tk.MustExec("set global tidb_enable_stmt_summary=1")
+					ruDetails := clientutil.NewRUDetailsWith(11, 7, 20*time.Millisecond)
+					ctx := context.WithValue(context.Background(), clientutil.RUDetailsCtxKey, ruDetails)
+					if tc.write {
+						tk.MustExecWithContext(ctx, tc.sql)
+					} else {
+						tk.MustQueryWithContext(ctx, tc.sql)
+					}
+					_, digest := tk.Session().GetSessionVars().StmtCtx.SQLDigest()
+					// Read the finalized total before the assertion query replaces LastQueryInfo.
+					totalRUV2 := tk.Session().GetSessionVars().LastQueryInfo.RUV2Consumption
+					if kerneltype.IsNextGen() {
+						require.Positive(t, totalRUV2)
+					} else {
+						require.Zero(t, totalRUV2)
+					}
+					wantRead, wantWrite := ruDetails.RRU(), ruDetails.WRU()
+					require.GreaterOrEqual(t, wantRead, float64(11))
+					require.GreaterOrEqual(t, wantWrite, float64(7))
+					require.NotEqual(t, wantRead, totalRUV2)
+					require.NotEqual(t, wantWrite, totalRUV2)
+					if version == rmclient.RUVersionV2 {
+						wantRead, wantWrite = totalRUV2, 0
+						if tc.write {
+							wantRead, wantWrite = 0, totalRUV2
+						}
+					}
+
+					rows := tk.MustQuery("select exec_count, avg_request_unit_read, max_request_unit_read, "+
+						"avg_request_unit_write, max_request_unit_write, avg_queued_rc_time, max_queued_rc_time "+
+						"from information_schema.statements_summary where digest = ?", digest.String()).Rows()
+					require.Len(t, rows, 1)
+					require.Equal(t, "1", fmt.Sprint(rows[0][0]))
+					waitNanos := float64(ruDetails.RUWaitDuration().Nanoseconds())
+					for i, want := range []float64{wantRead, wantRead, wantWrite, wantWrite, waitNanos, waitNanos} {
+						got, err := strconv.ParseFloat(fmt.Sprint(rows[0][i+1]), 64)
+						require.NoError(t, err)
+						require.InDelta(t, want, got, 1e-9)
+					}
+				})
+			}
+		})
+	}
+}
+
+type stmtSummaryRUVersionProvider struct {
+	rmclient.ResourceGroupProvider
+	version rmclient.RUVersion
+}
+
+func (p *stmtSummaryRUVersionProvider) Get(context.Context, []byte, ...opt.MetaStorageOption) (*meta_storagepb.GetResponse, error) {
+	config := fmt.Sprintf(`{"ru-version-policy":{"default":%d}}`, p.version)
+	return &meta_storagepb.GetResponse{Kvs: []*meta_storagepb.KeyValue{{Value: []byte(config)}}}, nil
+}
+
+func TestStmtSummaryTablePrivilege(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int, b varchar(10), key k(a))")
+	defer tk.MustExec("drop table if exists t")
+
+	// Clear all statements.
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+
+	// Create a new user to test statements summary table privilege
+	tk.MustExec("drop user if exists 'test_user'@'localhost'")
+	tk.MustExec("create user 'test_user'@'localhost'")
+	defer tk.MustExec("drop user if exists 'test_user'@'localhost'")
+	tk.MustExec("grant select on test.t to 'test_user'@'localhost'")
+	tk.MustExec("select * from t where a=1")
+	result := tk.MustQuery("select * from information_schema.statements_summary where digest_text like 'select * from `t`%'")
+	require.Equal(t, 1, len(result.Rows()))
+	result = tk.MustQuery("select *	from information_schema.statements_summary_history	where digest_text like 'select * from `t`%'")
+	require.Equal(t, 1, len(result.Rows()))
+
+	tk1 := newTestKit(t, store)
+	tk1.Session().Auth(&auth.UserIdentity{
+		Username:     "test_user",
+		Hostname:     "localhost",
+		AuthUsername: "test_user",
+		AuthHostname: "localhost",
+	}, nil, nil, nil)
+
+	result = tk1.MustQuery("select * from information_schema.statements_summary where digest_text like 'select * from `t`%'")
+	// Ordinary users can not see others' records
+	require.Equal(t, 0, len(result.Rows()))
+	result = tk1.MustQuery("select *	from information_schema.statements_summary_history where digest_text like 'select * from `t`%'")
+	require.Equal(t, 0, len(result.Rows()))
+	tk1.MustExec("select * from t where b=1")
+	result = tk1.MustQuery("select *	from information_schema.statements_summary	where digest_text like 'select * from `t`%'")
+	// Ordinary users can see his own records
+	require.Equal(t, 1, len(result.Rows()))
+	result = tk1.MustQuery("select *	from information_schema.statements_summary_history	where digest_text like 'select * from `t`%'")
+	require.Equal(t, 1, len(result.Rows()))
+
+	tk.MustExec("grant process on *.* to 'test_user'@'localhost'")
+	result = tk1.MustQuery("select *	from information_schema.statements_summary	where digest_text like 'select * from `t`%'")
+	// Users with 'PROCESS' privileges can query all records.
+	require.Equal(t, 2, len(result.Rows()))
+	result = tk1.MustQuery("select *	from information_schema.statements_summary_history	where digest_text like 'select * from `t`%'")
+	require.Equal(t, 2, len(result.Rows()))
+}
+
+func TestStmtSummaryErrorCount(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+
+	// Clear summaries.
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists stmt_summary_test")
+	tk.MustExec("create table stmt_summary_test(id int primary key)")
+	tk.MustExec("insert into stmt_summary_test values(1)")
+	_, err := tk.Exec("insert into stmt_summary_test values(1)")
+	require.Error(t, err)
+
+	sql := "select exec_count, sum_errors, sum_warnings from information_schema.statements_summary where digest_text like \"insert into `stmt_summary_test`%\""
+	tk.MustQuery(sql).Check(testkit.Rows("2 1 0"))
+
+	tk.MustExec("insert ignore into stmt_summary_test values(1)")
+	sql = "select exec_count, sum_errors, sum_warnings from information_schema.statements_summary where digest_text like \"insert ignore into `stmt_summary_test`%\""
+	tk.MustQuery(sql).Check(testkit.Rows("1 0 1"))
+}
+
+func TestStmtSummaryPreparedStatements(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+
+	// Clear summaries.
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+
+	tk.MustExec("use test")
+	tk.MustExec("prepare stmt from 'select ?'")
+	tk.MustExec("set @number=1")
+	tk.MustExec("execute stmt using @number")
+
+	tk.MustQuery(`select exec_count
+		from information_schema.statements_summary
+		where digest_text like "prepare%"`).Check(testkit.Rows())
+	tk.MustQuery(`select exec_count
+		from information_schema.statements_summary
+		where digest_text like "select ?"`).Check(testkit.Rows("1"))
+}
+
+func TestStmtSummaryBinaryValues(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1 (c1 binary(16) not null primary key)")
+	tk.MustExec("insert into t1 values (0xd2e4a6b8c1f3e5d7a9b2c4d6e8f1a3b5)")
+
+	tk.MustQuery("select count(*) from t1 where c1 = '\xd2\xe4\xa6\xb8\xc1\xf3\xe5\xd7\xa9\xb2\xc4\xd6\xe8\xf1\xa3\xb5'").Check(testkit.Rows("1"))
+
+	rows := tk.MustQuery("select query_sample_text from information_schema.statements_summary " +
+		"where digest_text like 'select count%from `t1` where%'").Rows()
+	require.Len(t, rows, 1)
+	sampleText := rows[0][0].(string)
+	// Verify the binary value is converted to a replayable 0x hex literal
+	require.Equal(t, "select count(*) from t1 where c1 = 0xd2e4a6b8c1f3e5d7a9b2c4d6e8f1a3b5", sampleText)
+}
+
+func TestStmtSummarySensitiveQuery(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+	tk.MustExec("drop user if exists user_sensitive;")
+	tk.MustExec("create user user_sensitive identified by '123456789';")
+	tk.MustExec("alter user 'user_sensitive'@'%' identified by 'abcdefg';")
+	tk.MustExec("set password for 'user_sensitive'@'%' = 'xyzuvw';")
+	tk.MustQuery("select query_sample_text from `information_schema`.`STATEMENTS_SUMMARY` " +
+		"where query_sample_text like '%user_sensitive%' and " +
+		"(query_sample_text like 'set password%' or query_sample_text like 'create user%' or query_sample_text like 'alter user%') " +
+		"order by query_sample_text;").
+		Check(testkit.Rows(
+			"alter user {user_sensitive@% password = ***}",
+			"create user {user_sensitive@% password = ***}",
+			"set password for user user_sensitive@%",
+		))
+}
+
+func TestStmtSummarySampleRedaction(t *testing.T) {
+	t.Cleanup(config.RestoreFunc())
+	oldSummary := stmtsummaryv2.GlobalStmtSummary
+	t.Cleanup(func() { stmtsummaryv2.GlobalStmtSummary = oldSummary })
+	filename := filepath.Join(t.TempDir(), "statements.log")
+	summary, err := stmtsummaryv2.NewStmtSummary(&stmtsummaryv2.Config{Filename: filename})
+	require.NoError(t, err)
+	t.Cleanup(summary.Close)
+	stmtsummaryv2.GlobalStmtSummary = summary
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Instance.StmtSummaryEnablePersistent = true
+		conf.Instance.StmtSummaryFilename = filename
+	})
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	oldMode := tk.MustQuery("select @@global.tidb_redact_log").Rows()[0][0].(string)
+	t.Cleanup(func() { tk.MustExec("set global tidb_redact_log = " + oldMode) })
+	tk.MustExec("set global tidb_redact_log = ON")
+	tk.MustExec("set tidb_enable_non_prepared_plan_cache = 0")
+	tk.MustExec("create table sample_redaction (a varchar(64))")
+	const sql = "select * from sample_redaction where a = 'unique_secret_42'"
+	const normalizedSQL = "select * from `sample_redaction` where `a` = ?"
+	tk.MustQuery(sql)
+	rows := tk.MustQuery("select digest, query_sample_text from information_schema.statements_summary where digest_text = '" + normalizedSQL + "'").Rows()
+	require.Len(t, rows, 1)
+	require.Equal(t, sql, rows[0][1])
+	digest := rows[0][0].(string)
+
+	summary.Close()
+	data, err := os.ReadFile(filename)
+	require.NoError(t, err)
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var record struct {
+			Digest    string `json:"digest"`
+			SampleSQL string `json:"sample_sql"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(line), &record))
+		if record.Digest == digest {
+			found = true
+			require.Equal(t, normalizedSQL, record.SampleSQL)
+			require.NotContains(t, record.SampleSQL, "unique_secret_42")
+		}
+	}
+	require.True(t, found, "statement sample must be written to the log")
+}
+
+func TestStmtSummaryTableOther(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+
+	tk.MustExec("set global tidb_enable_stmt_summary=0")
+	tk.MustExec("set global tidb_enable_stmt_summary=1")
+	// set stmt size to 1
+	// first sql
+	tk.MustExec("set global tidb_stmt_summary_max_stmt_count=1")
+	defer tk.MustExec("set global tidb_stmt_summary_max_stmt_count=100")
+	// second sql, evict first sql from stmt_summary
+	tk.MustExec("show databases;")
+	// third sql, evict second sql from stmt_summary
+	tk.MustQuery("SELECT DIGEST_TEXT, DIGEST FROM `INFORMATION_SCHEMA`.`STATEMENTS_SUMMARY`;").
+		Check(testkit.Rows(
+			// digest in cache
+			// "show databases ;"
+			"show databases 0e247706bf6e791fbf4af8c8e7658af5ffc45c63179871202d8f91551ee03161",
+			// digest evicted
+			" <nil>",
+		))
+	// forth sql, evict third sql from stmt_summary
+	tk.MustQuery("SELECT SCHEMA_NAME FROM `INFORMATION_SCHEMA`.`STATEMENTS_SUMMARY`;").
+		Check(testkit.Rows(
+			// digest in cache
+			"test", // select xx from yy;
+			// digest evicted
+			"<nil>",
+		))
+}
+
+func TestStmtSummaryHistoryTableOther(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+
+	tk.MustExec("set global tidb_stmt_summary_max_stmt_count = 1")
+	defer tk.MustExec("set global tidb_stmt_summary_max_stmt_count = 100")
+
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+	// first sql
+	tk.MustExec("set global tidb_stmt_summary_max_stmt_count=1")
+	// second sql, evict first sql from stmt_summary
+	tk.MustExec("show databases;")
+	// third sql, evict second sql from stmt_summary
+	tk.MustQuery("SELECT DIGEST_TEXT, DIGEST FROM `INFORMATION_SCHEMA`.`STATEMENTS_SUMMARY_HISTORY`;").
+		Check(testkit.Rows(
+			// digest in cache
+			// "show databases ;"
+			"show databases 0e247706bf6e791fbf4af8c8e7658af5ffc45c63179871202d8f91551ee03161",
+			// digest evicted
+			" <nil>",
+		))
+	// forth sql, evict third sql from stmt_summary
+	tk.MustQuery("SELECT SCHEMA_NAME FROM `INFORMATION_SCHEMA`.`STATEMENTS_SUMMARY_HISTORY`;").
+		Check(testkit.Rows(
+			// digest in cache
+			"test", // select xx from yy;
+			// digest evicted
+			"<nil>",
+		))
+}
+
+func TestStmtSummaryHistoryOpenEndedTimeRange(t *testing.T) {
+	restore := config.RestoreFunc()
+	defer restore()
+
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "tidb-statements.log")
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Instance.StmtSummaryFilename = filename
+		conf.Instance.StmtSummaryEnablePersistent = true
+	})
+	require.NoError(t, stmtsummaryv2.Setup(&stmtsummaryv2.Config{Filename: filename}))
+	defer stmtsummaryv2.Close()
+
+	intervals := []struct {
+		begin  time.Time
+		end    time.Time
+		digest string
+	}{
+		{
+			begin:  time.Date(2022, 12, 27, 10, 0, 0, 0, time.Local),
+			end:    time.Date(2022, 12, 27, 10, 10, 0, 0, time.Local),
+			digest: "history_early",
+		},
+		{
+			begin:  time.Date(2022, 12, 27, 14, 0, 0, 0, time.Local),
+			end:    time.Date(2022, 12, 27, 14, 10, 0, 0, time.Local),
+			digest: "history_middle",
+		},
+		{
+			begin:  time.Date(2022, 12, 27, 18, 0, 0, 0, time.Local),
+			end:    time.Date(2022, 12, 27, 18, 10, 0, 0, time.Local),
+			digest: "history_late",
+		},
+	}
+	for _, interval := range intervals {
+		path := filepath.Join(dir, fmt.Sprintf("tidb-statements-%s.log", interval.end.Format("2006-01-02T15-04-05.000")))
+		content := fmt.Sprintf("{\"begin\":%d,\"end\":%d,\"digest\":%q,\"exec_count\":1}\n", interval.begin.Unix(), interval.end.Unix(), interval.digest)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	}
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec("set time_zone = 'SYSTEM'")
+
+	tk.MustQuery(`select digest, date_format(summary_begin_time, '%Y-%m-%d %H:%i:%s')
+		from information_schema.statements_summary_history
+		where summary_end_time >= '2022-12-27 12:00:00'
+			and digest in ('history_early', 'history_middle', 'history_late')
+		order by summary_begin_time`).Check(testkit.Rows(
+		"history_middle 2022-12-27 14:00:00",
+		"history_late 2022-12-27 18:00:00",
+	))
+
+	tk.MustQuery(`select digest, date_format(summary_begin_time, '%Y-%m-%d %H:%i:%s')
+		from information_schema.statements_summary_history
+		where summary_begin_time <= '2022-12-27 16:00:00'
+			and digest in ('history_early', 'history_middle', 'history_late')
+		order by summary_begin_time`).Check(testkit.Rows(
+		"history_early 2022-12-27 10:00:00",
+		"history_middle 2022-12-27 14:00:00",
+	))
+}
+
+// TestStmtSummaryHistoryPreparedTimeRange exercises Dashboard's real prepared
+// query through the persistent reader, including the session prepared-statement
+// API with bound arguments.
+func TestStmtSummaryHistoryPreparedTimeRange(t *testing.T) {
+	defer config.RestoreFunc()()
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "tidb-statements.log")
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Instance.StmtSummaryFilename = filename
+		conf.Instance.StmtSummaryEnablePersistent = true
+	})
+	require.NoError(t, stmtsummaryv2.Setup(&stmtsummaryv2.Config{Filename: filename}))
+	defer stmtsummaryv2.Close()
+
+	const begin = int64(1672106400) // 2022-12-27 02:00:00 UTC
+	for i := range 3 {
+		start := begin + int64(i)*3600
+		end := start + 600
+		name := time.Unix(end, 0).In(time.Local).Format("2006-01-02T15-04-05.000")
+		path := filepath.Join(dir, "tidb-statements-"+name+".log")
+		content := fmt.Sprintf("{\"begin\":%d,\"end\":%d,\"digest\":\"window%d\",\"exec_count\":1}\n", start, end, i)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	}
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	const query = "select digest, sum(exec_count) from information_schema.statements_summary_history where summary_begin_time <= from_unixtime(?) and summary_end_time >= from_unixtime(?) group by digest order by digest"
+	tk.MustExec("prepare stmt from '" + query + "'")
+	var scans, parses atomic.Int64
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/util/stmtsummary/v2/stmtSummaryHistoryScanFile", func(string) {
+		scans.Add(1)
+	})
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/util/stmtsummary/v2/stmtSummaryHistoryParseRecord", func() {
+		parses.Add(1)
+	})
+
+	for _, cache := range []int{1, 0} {
+		tk.MustExec(fmt.Sprintf("set tidb_enable_prepared_plan_cache = %d", cache))
+		for _, tz := range []string{"+00:00", "+09:00"} {
+			tk.MustExec("set time_zone = '" + tz + "'")
+			for _, i := range []int{1, 0, 2, 1} {
+				start := begin + int64(i)*3600
+				// The exact boundary overlaps the persisted window at its end.
+				for _, bounds := range [][2]int64{{start + 600, start}, {start + 600, start + 600}} {
+					end, start := bounds[0], bounds[1]
+					tk.MustExec(fmt.Sprintf("set @end = %d, @begin = %d", end, start))
+					scans.Store(0)
+					parses.Store(0)
+					prepared := tk.MustQuery("execute stmt using @end, @begin").Rows()
+					require.Equal(t, int64(1), scans.Load(), "cache=%d tz=%s window=%d", cache, tz, i)
+					require.Equal(t, int64(1), parses.Load())
+					require.Equal(t, testkit.Rows(fmt.Sprintf("window%d 1", i)), prepared)
+					scans.Store(0)
+					parses.Store(0)
+					tk.MustQuery(query, end, start).Check(prepared)
+					require.Equal(t, int64(1), scans.Load(), "binary prepared execution")
+					// Disable predicate extraction to compare with a genuine full scan.
+					testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor", "return(true)")
+					scans.Store(0)
+					parses.Store(0)
+					tk.MustQuery("execute stmt using @end, @begin").Check(prepared)
+					require.Equal(t, int64(3), scans.Load(), "unpruned baseline")
+					require.Equal(t, int64(3), parses.Load())
+					testfailpoint.Disable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor")
+				}
+			}
+			tk.MustExec(fmt.Sprintf("set @end = %d, @begin = %d", begin-1, begin-600))
+			scans.Store(0)
+			parses.Store(0)
+			tk.MustQuery("execute stmt using @end, @begin").Check(testkit.Rows())
+			require.Zero(t, scans.Load(), "nonoverlapping time range")
+			require.Zero(t, parses.Load())
+			tk.MustExec(fmt.Sprintf("set @end = %d, @begin = %d", begin, begin+7200))
+			tk.MustQuery("execute stmt using @end, @begin").Check(testkit.Rows())
+			tk.MustExec(fmt.Sprintf("set @end = %d, @begin = %d", begin+600, begin))
+			tk.MustQuery("execute stmt using @end, @begin").Check(testkit.Rows("window0 1"))
+			tk.MustQuery(query, fmt.Sprint(begin+600), fmt.Sprint(begin)).Check(testkit.Rows("window0 1"))
+			tk.MustExec("set @end = null, @begin = null")
+			tk.MustQuery("execute stmt using @end, @begin").Check(testkit.Rows())
+			// Missing time predicates still scan all retained files.
+			scans.Store(0)
+			parses.Store(0)
+			tk.MustQuery("select distinct digest from information_schema.statements_summary_history where digest like 'window%' order by digest").Check(testkit.Rows("window0", "window1", "window2"))
+			require.Equal(t, int64(3), scans.Load())
+		}
+	}
+	t.Log("Prepared range: 1 file scanned / 1 record parsed; unpruned baseline: 3 files / 3 records; no match: 0 / 0. File-header reads are not counted.")
+
+	// Fractional-second bounds must never prune a window the exact predicates keep:
+	// the coarse range may only widen, and the retained SQL predicates filter exactly.
+	tk.MustExec("set time_zone = '+00:00'")
+	fractionalCases := []struct {
+		query string
+		end   string
+		begin string
+	}{
+		{
+			// window0 begins exactly at `begin`; begin_time < begin+500us keeps it.
+			"select digest from information_schema.statements_summary_history where summary_begin_time < from_unixtime(?) and summary_end_time >= from_unixtime(?) order by digest",
+			fmt.Sprintf("%d.000500", begin), fmt.Sprint(begin - 1),
+		},
+		{
+			"select digest from information_schema.statements_summary_history where summary_begin_time <= from_unixtime(?) and summary_end_time > from_unixtime(?) order by digest",
+			fmt.Sprintf("%d.000500", begin), fmt.Sprint(begin - 600),
+		},
+	}
+	for _, fc := range fractionalCases {
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor", "return(true)")
+		baseline := tk.MustQuery(fc.query, fc.end, fc.begin).Rows()
+		testfailpoint.Disable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor")
+		require.Equal(t, testkit.Rows("window0"), baseline)
+		tk.MustQuery(fc.query, fc.end, fc.begin).Check(baseline)
+	}
+
+	// Time pruning must preserve windows containing both bounds, and bounds
+	// outside UnixNano's range must not turn into unrelated historical dates.
+	for _, cache := range []int{0, 1} {
+		for _, ca := range []struct {
+			name      string
+			predicate string
+			args      []any
+			want      []string
+		}{
+			{
+				name:      "CrossedEndpoints",
+				predicate: "summary_begin_time <= from_unixtime(?) and summary_end_time >= from_unixtime(?)",
+				args:      []any{begin + 100, begin + 500},
+				want:      []string{"window0"},
+			},
+			{
+				name:      "StrictPoint",
+				predicate: "summary_begin_time < from_unixtime(?) and summary_end_time > from_unixtime(?)",
+				args:      []any{begin + 300, begin + 300},
+				want:      []string{"window0"},
+			},
+			{
+				name:      "FractionalPoint",
+				predicate: "summary_begin_time < from_unixtime(?) and summary_end_time >= from_unixtime(?)",
+				args:      []any{fmt.Sprintf("%d.000500", begin), begin},
+				want:      []string{"window0"},
+			},
+			{
+				name:      "FutureOverflow",
+				predicate: "summary_begin_time <= from_unixtime(?)",
+				args:      []any{int64(32536771199)},
+				want:      []string{"window0", "window1", "window2"},
+			},
+			{
+				name:      "FutureOverflowWithSafeLowerBound",
+				predicate: "summary_begin_time <= from_unixtime(?) and summary_end_time >= from_unixtime(?)",
+				args:      []any{int64(32536771199), begin + 3600},
+				want:      []string{"window1", "window2"},
+			},
+		} {
+			t.Run(fmt.Sprintf("%s/cache%d", ca.name, cache), func(t *testing.T) {
+				tk := newTestKitWithRoot(t, store)
+				tk.MustExec("set time_zone = '+00:00'")
+				tk.MustExec(fmt.Sprintf("set tidb_enable_prepared_plan_cache = %d", cache))
+				// Exclude the live summary so collecting the test SQL cannot affect
+				// the far-future upper-bound baseline between repeated executions.
+				query := "select digest from information_schema.statements_summary_history where digest in ('window0', 'window1', 'window2') and " + ca.predicate + " order by digest"
+				testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor", "return(true)")
+				baseline := tk.MustQuery(query, ca.args...).Rows()
+				testfailpoint.Disable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor")
+				require.Equal(t, testkit.Rows(ca.want...), baseline)
+				tk.MustQuery(query, ca.args...).Check(baseline)
+
+				tk.MustExec("prepare review_stmt from '" + strings.ReplaceAll(query, "'", "''") + "'")
+				vars := make([]string, 0, len(ca.args))
+				for i, arg := range ca.args {
+					name := fmt.Sprintf("@review%d", i)
+					value := fmt.Sprint(arg)
+					if _, ok := arg.(string); ok {
+						value = "'" + strings.ReplaceAll(value, "'", "''") + "'"
+					}
+					tk.MustExec("set " + name + " = " + value)
+					vars = append(vars, name)
+				}
+				tk.MustQuery("execute review_stmt using " + strings.Join(vars, ", ")).Check(baseline)
+			})
+		}
+	}
+}
+
+func TestStmtSummaryHistoryPreparedTimeRangeDST(t *testing.T) {
+	for _, ca := range []struct {
+		name     string
+		timezone string
+		first    time.Time
+		second   time.Time
+	}{
+		{
+			name:     "NewYork",
+			timezone: "America/New_York",
+			first:    time.Date(2024, 11, 3, 5, 30, 0, 0, time.UTC),
+			second:   time.Date(2024, 11, 3, 6, 30, 0, 0, time.UTC),
+		},
+		{
+			name:     "LordHowe",
+			timezone: "Australia/Lord_Howe",
+			first:    time.Date(2024, 4, 6, 14, 45, 0, 0, time.UTC),
+			second:   time.Date(2024, 4, 6, 15, 15, 0, 0, time.UTC),
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			defer config.RestoreFunc()()
+			dir := t.TempDir()
+			filename := filepath.Join(dir, "tidb-statements.log")
+			config.UpdateGlobal(func(conf *config.Config) {
+				conf.Instance.StmtSummaryFilename = filename
+				conf.Instance.StmtSummaryEnablePersistent = true
+			})
+			require.NoError(t, stmtsummaryv2.Setup(&stmtsummaryv2.Config{Filename: filename}))
+			defer stmtsummaryv2.Close()
+			// Both windows have the same wall-clock time, but distinct Unix times.
+			for i, point := range []time.Time{ca.first, ca.second} {
+				end := point.Add(time.Minute)
+				// Keep filenames distinct even when the server's local time also folds.
+				path := filepath.Join(dir, "tidb-statements-"+end.Add(time.Duration(i)*time.Millisecond).In(time.Local).Format("2006-01-02T15-04-05.000")+".log")
+				content := fmt.Sprintf("{\"begin\":%d,\"end\":%d,\"digest\":\"fold%d\",\"exec_count\":1}\n", point.Add(-time.Minute).Unix(), end.Unix(), i)
+				require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+			}
+			store := testkit.CreateMockStore(t)
+			tk := newTestKitWithRoot(t, store)
+			tk.MustExec("set time_zone = '" + ca.timezone + "'")
+			for _, cache := range []int{0, 1} {
+				tk.MustExec(fmt.Sprintf("set tidb_enable_prepared_plan_cache = %d", cache))
+				for _, predicate := range []string{
+					"summary_begin_time <= from_unixtime(?) and summary_end_time >= from_unixtime(?)",
+					"summary_begin_time <= from_unixtime(?)",
+					"summary_end_time >= from_unixtime(?)",
+				} {
+					query := "select digest, sum(exec_count) from information_schema.statements_summary_history where " + predicate + " and digest in ('fold0', 'fold1') group by digest order by digest"
+					tk.MustExec("prepare dst_stmt from '" + strings.ReplaceAll(query, "'", "''") + "'")
+					for _, bounds := range [][2]int64{
+						{ca.first.Unix(), ca.first.Unix()},
+						{ca.second.Unix(), ca.second.Unix()},
+						// Unix bounds are reversed, while their local-time interval is valid.
+						{ca.first.Add(5 * time.Minute).Unix(), ca.second.Add(-5 * time.Minute).Unix()},
+					} {
+						tk.MustExec(fmt.Sprintf("set @end = %d, @begin = %d", bounds[0], bounds[1]))
+						execute := "execute dst_stmt using @end, @begin"
+						if predicate == "summary_begin_time <= from_unixtime(?)" {
+							execute = "execute dst_stmt using @end"
+						}
+						if predicate == "summary_end_time >= from_unixtime(?)" {
+							execute = "execute dst_stmt using @begin"
+						}
+						testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor", "return(true)")
+						baseline := tk.MustQuery(execute).Rows()
+						testfailpoint.Disable(t, "github.com/pingcap/tidb/pkg/planner/core/operator/logicalop/skipExtractor")
+						require.Equal(t, testkit.Rows("fold0 1", "fold1 1"), baseline)
+						tk.MustQuery(execute).Check(baseline)
+						if predicate == "summary_begin_time <= from_unixtime(?)" {
+							tk.MustQuery(query, bounds[0]).Check(baseline)
+							continue
+						}
+						if predicate == "summary_end_time >= from_unixtime(?)" {
+							tk.MustQuery(query, bounds[1]).Check(baseline)
+							continue
+						}
+						tk.MustQuery(query, bounds[0], bounds[1]).Check(baseline)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestPerformanceSchemaforNonPrepPlanCache(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec(`create table t (a int, key(a))`)
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+	tk.MustExec(`set tidb_enable_non_prepared_plan_cache=1`)
+
+	tk.MustExec(`select * from t where a=1`)
+	tk.MustExec(`select * from t where a=1`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+	tk.MustQuery("select exec_count, digest_text, prepared, plan_in_cache, plan_cache_hits, query_sample_text " +
+		"from information_schema.statements_summary where digest_text='select * from `t` where `a` = ?'").Check(testkit.Rows(
+		"2 select * from `t` where `a` = ? 0 1 1 select * from t where a=1"))
+
+	tk.MustExec(`select * from t where a=2`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+	tk.MustExec(`select * from t where a=3`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("1"))
+
+	// exec_count 2->4, plan_cache_hits 1->3
+	tk.MustQuery("select exec_count, digest_text, prepared, plan_in_cache, plan_cache_hits, query_sample_text " +
+		"from information_schema.statements_summary where digest_text='select * from `t` where `a` = ?'").Check(testkit.Rows(
+		"4 select * from `t` where `a` = ? 0 1 3 select * from t where a=1"))
+
+	tk.MustExec(`set tidb_enable_non_prepared_plan_cache=0`)
+	tk.MustExec(`select * from t where a=2`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+	tk.MustExec(`select * from t where a=3`)
+	tk.MustQuery(`select @@last_plan_from_cache`).Check(testkit.Rows("0"))
+
+	// exec_count 4->6, plan_cache_hits 3->3
+	tk.MustQuery("select exec_count, digest_text, prepared, plan_in_cache, plan_cache_hits, query_sample_text " +
+		"from information_schema.statements_summary where digest_text='select * from `t` where `a` = ?'").Check(testkit.Rows(
+		"6 select * from `t` where `a` = ? 0 0 3 select * from t where a=1"))
+}
+
+func TestPlanCacheUnqualified2(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+
+	// queries accessing temporary tables or generated columns
+	tk.MustExec(`create table t1 (a int, b int)`)
+	tk.MustExec(`create temporary table t_temp_unqualified_test (a int)`)
+	tk.MustExec(`create table t_gen_unqualified_test (id int, addr json, city VARCHAR(64) AS (JSON_UNQUOTE(JSON_EXTRACT(addr, '$.city'))))`)
+	tk.MustExec(`prepare st from 'select * from t1, t_temp_unqualified_test where t1.a > 10'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_temp_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select * from `t1` , `t_temp_unqualified_test` where `t1` . `a` > ? 1 1 query accesses temporary tables is un-cacheable"))
+
+	tk.MustExec(`set @@tidb_opt_fix_control = "45798:off"`)
+	tk.MustExec(`prepare st from 'select * from t1, t_gen_unqualified_test where t1.a > 10'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_gen_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select * from `t1` , `t_gen_unqualified_test` where `t1` . `a` > ? 1 1 query accesses generated columns is un-cacheable"))
+
+	// queries containing non-correlated sub-queries
+	tk.MustExec(`create table t_subquery_unqualified_test (a int, b int)`)
+	tk.MustExec(`prepare st from 'select * from t1 where t1.a > (select max(a) from t_subquery_unqualified_test)'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_subquery_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select * from `t1` where `t1` . `a` > ( select max ( `a` ) from `t_subquery_unqualified_test` ) 1 1 query has uncorrelated sub-queries is un-cacheable"))
+
+	// query plans that contain PhysicalApply
+	tk.MustExec(`create table t_apply_unqualified_test (a int, b int)`)
+	tk.MustExec(`prepare st from 'select * from t1 where t1.a > (select a from t_apply_unqualified_test where t1.b > t_apply_unqualified_test.b)'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_apply_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select * from `t1` where `t1` . `a` > ( select `a` from `t_apply_unqualified_test` where `t1` . `b` > `t_apply_unqualified_test` . `b` ) 1 1 PhysicalApply plan is un-cacheable"))
+
+	// queries containing ignore_plan_cache hints
+	tk.MustExec(`create table t_ignore_unqualified_test (a int, b int)`)
+	tk.MustExec(`prepare st from 'select /*+ ignore_plan_cache() */ * from t_ignore_unqualified_test'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_ignore_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select * from `t_ignore_unqualified_test` 1 1 ignore_plan_cache hint used in SQL query"))
+
+	// queries containing non-deterministic functions
+	tk.MustExec(`create table t_non_deterministic_1_unqualified_test (a int, b int)`)
+	tk.MustExec(`prepare st from 'select user() from t_non_deterministic_1_unqualified_test'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_non_deterministic_1_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select user ( ) from `t_non_deterministic_1_unqualified_test` 1 1 query has 'user' is un-cacheable"))
+
+	tk.MustExec(`create table t_non_deterministic_2_unqualified_test (a int, b int)`)
+	tk.MustExec(`prepare st from 'select version() from t_non_deterministic_2_unqualified_test'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_non_deterministic_2_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select `version` ( ) from `t_non_deterministic_2_unqualified_test` 1 1 query has 'version' is un-cacheable"))
+
+	// queries with a larger LIMIT
+	tk.MustExec(`create table t_limit_unqualified_test (a int, b int)`)
+	tk.MustExec(`prepare st from 'select * from t_limit_unqualified_test limit ?'`)
+	tk.MustExec(`set @x=1000000`)
+	tk.MustExec(`execute st using @x`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_limit_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select * from `t_limit_unqualified_test` limit ? 1 1 limit count is too large"))
+
+	// queries accessing any system tables
+	tk.MustExec(`create table t_system_unqualified_test (a int, b int)`)
+	tk.MustExec(`prepare st from 'select 1 from t_system_unqualified_test, information_schema.tables'`)
+	tk.MustExec(`execute st`)
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%select%from%t_system_unqualified_test%'`).Sort().Check(testkit.Rows(
+		"select ? from `t_system_unqualified_test` , `information_schema` . `tables` 1 1 PhysicalMemTable plan is un-cacheable"))
+}
+
+func TestPlanCacheUnqualified(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tk := newTestKitWithRoot(t, store)
+	tk.MustExec(`use test`)
+	tk.MustExec(`create table t1 (a int, b int)`)
+	tk.MustExec(`create table t2 (a int, b int)`)
+
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+
+	tk.MustExec(`prepare st1 from 'select * from t1 where a<=?'`)
+	tk.MustExec(`set @x1 = '123'`)
+	tk.MustExec(`prepare st2 from 'select * from t1 where t1.a > (select 1 from t2 where t2.b<1)'`)
+	tk.MustExec(`prepare st3 from 'select /*+ ignore_plan_cache() */ * from t1'`)
+	tk.MustExec(`prepare st4 from 'select database() from t1';`)
+
+	tk.MustExec(`execute st1 using @x1`)
+	tk.MustExec(`execute st1 using @x1`)
+	tk.MustExec(`execute st1 using @x1`)
+	tk.MustExec(`execute st1 using @x1`)
+
+	tk.MustExec(`execute st2`)
+	tk.MustExec(`execute st2`)
+	tk.MustExec(`execute st2`)
+
+	tk.MustExec(`execute st3`)
+	tk.MustExec(`execute st3`)
+
+	tk.MustExec(`execute st4`)
+	tk.MustExec(`execute st4`)
+
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where plan_cache_unqualified > 0`).Sort().Check(testkit.Rows(
+		"select * from `t1` 2 2 ignore_plan_cache hint used in SQL query",
+		"select * from `t1` where `a` <= ? 4 4 '123' may be converted to INT",
+		"select * from `t1` where `t1` . `a` > ( select ? from `t2` where `t2` . `b` < ? ) 3 3 query has uncorrelated sub-queries is un-cacheable",
+		"select database ( ) from `t1` 2 2 query has 'database' is un-cacheable"))
+
+	for range 100 {
+		tk.MustExec(`execute st3`)
+		tk.MustExec(`execute st4`)
+	}
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where plan_cache_unqualified > 0`).Sort().Check(testkit.Rows(
+		"select * from `t1` 102 102 ignore_plan_cache hint used in SQL query",
+		"select * from `t1` where `a` <= ? 4 4 '123' may be converted to INT",
+		"select * from `t1` where `t1` . `a` > ( select ? from `t2` where `t2` . `b` < ? ) 3 3 query has uncorrelated sub-queries is un-cacheable",
+		"select database ( ) from `t1` 102 102 query has 'database' is un-cacheable"))
+
+	tk.MustExec(`set @x2=123`)
+	for range 20 {
+		tk.MustExec(`execute st1 using @x1`)
+		tk.MustExec(`execute st1 using @x2`)
+	}
+	tk.MustQuery(`select digest_text, exec_count, plan_cache_unqualified, plan_cache_unqualified_last_reason
+    from information_schema.statements_summary where digest_text like '%<= ?%'`).Check(
+		testkit.Rows("select * from `t1` where `a` <= ? 44 24 '123' may be converted to INT"))
+}
+
+func TestPerformanceSchemaforPlanCache(t *testing.T) {
+	setupStmtSummary()
+	defer closeStmtSummary()
+
+	store := testkit.CreateMockStore(t)
+	tmp := testkit.NewTestKit(t, store)
+	tmp.MustExec("set tidb_enable_prepared_plan_cache=ON")
+	tk := newTestKitWithPlanCache(t, store)
+
+	// Clear summaries.
+	tk.MustExec("set global tidb_enable_stmt_summary = 0")
+	tk.MustExec("set global tidb_enable_stmt_summary = 1")
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int)")
+	tk.MustExec("prepare stmt from 'select * from t'")
+	tk.MustExec("execute stmt")
+	tk.MustQuery("select plan_cache_hits, plan_in_cache from information_schema.statements_summary where digest_text='select * from `t`'").Check(
+		testkit.Rows("0 0"))
+	tk.MustExec("execute stmt")
+	tk.MustExec("execute stmt")
+	tk.MustExec("execute stmt")
+	tk.MustQuery("select plan_cache_hits, plan_in_cache from information_schema.statements_summary where digest_text='select * from `t`'").Check(
+		testkit.Rows("3 1"))
+}
+
+func newTestKit(t *testing.T, store kv.Storage) *testkit.TestKit {
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	return tk
+}
+
+func newTestKitWithRoot(t *testing.T, store kv.Storage) *testkit.TestKit {
+	tk := newTestKit(t, store)
+	require.NoError(t, tk.Session().Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, nil, nil))
+	return tk
+}
+
+func newTestKitWithPlanCache(t *testing.T, store kv.Storage) *testkit.TestKit {
+	tk := testkit.NewTestKit(t, store)
+	se, err := session.CreateSession4TestWithOpt(store, &session.Opt{
+		PreparedPlanCache: plannercore.NewLRUPlanCache(100, 0.1, math.MaxUint64, tk.Session(), false),
+	})
+	require.NoError(t, err)
+	tk.SetSession(se)
+	tk.RefreshConnectionID()
+	require.NoError(t, tk.Session().Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, nil, nil))
+	return tk
+}
+
+func setupStmtSummary() {
+	stmtsummaryv2.Setup(&stmtsummaryv2.Config{
+		Filename: "tidb-statements.log",
+	})
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Instance.StmtSummaryEnablePersistent = true
+	})
+}
+
+func closeStmtSummary() {
+	config.UpdateGlobal(func(conf *config.Config) {
+		conf.Instance.StmtSummaryEnablePersistent = false
+	})
+	stmtsummaryv2.GlobalStmtSummary.Close()
+	_ = os.Remove(config.GetGlobalConfig().Instance.StmtSummaryFilename)
+}

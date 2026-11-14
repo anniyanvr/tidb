@@ -1,0 +1,1135 @@
+// Copyright 2023 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package stmtsummary
+
+import (
+	"bufio"
+	"bytes"
+	"cmp"
+	"context"
+	"encoding/json"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/auth"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util"
+	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/pingcap/tidb/pkg/util/set"
+	"github.com/pingcap/tidb/pkg/util/timeutil"
+	"go.uber.org/zap"
+)
+
+const (
+	logFileTimeFormat = "2006-01-02T15-04-05.000" // depends on lumberjack.go#backupTimeFormat
+	maxLineSize       = 1073741824
+
+	batchScanSize = 64
+)
+
+// StmtTimeRange is the time range type used in the stmtsummary package.
+// [Begin, End)
+type StmtTimeRange struct {
+	Begin int64
+	End   int64
+}
+
+// MemReader is used to read the current window's data maintained in memory by StmtSummary.
+type MemReader struct {
+	s            *StmtSummary
+	columns      []*model.ColumnInfo
+	instanceAddr string
+	timeLocation *time.Location
+
+	columnFactories []columnFactory
+	checker         *stmtChecker
+}
+
+// NewMemReader creates a MemReader from StmtSummary and other necessary parameters.
+func NewMemReader(s *StmtSummary,
+	columns []*model.ColumnInfo,
+	instanceAddr string,
+	timeLocation *time.Location,
+	user *auth.UserIdentity,
+	hasProcessPriv bool,
+	digests set.StringSet,
+	timeRanges []*StmtTimeRange) *MemReader {
+	return &MemReader{
+		s:               s,
+		columns:         columns,
+		instanceAddr:    instanceAddr,
+		timeLocation:    timeLocation,
+		columnFactories: makeColumnFactories(columns),
+		checker: &stmtChecker{
+			user:           user,
+			hasProcessPriv: hasProcessPriv,
+			digests:        digests,
+			timeRanges:     timeRanges,
+		},
+	}
+}
+
+// Rows returns rows converted from the current window's data maintained
+// in memory by StmtSummary. All evicted data will be aggregated into a
+// single row appended at the end.
+func (r *MemReader) Rows() [][]types.Datum {
+	if r.s == nil {
+		return nil
+	}
+	end := timeNow().Unix()
+	r.s.windowLock.Lock()
+	w := r.s.window
+	if !r.checker.isTimeValid(w.begin.Unix(), end) {
+		r.s.windowLock.Unlock()
+		return nil
+	}
+	values := w.lru.Values()
+	evicted := w.evicted
+	r.s.windowLock.Unlock()
+	rows := make([][]types.Datum, 0, len(values)+1)
+	for _, v := range values {
+		record := v.(*lockedStmtRecord)
+		if !r.checker.isDigestValid(record.Digest) {
+			continue
+		}
+		func() {
+			record.Lock()
+			defer record.Unlock()
+			if !r.checker.hasPrivilege(record.AuthUsers) {
+				return
+			}
+			record.Begin = w.begin.Unix()
+			record.End = end
+			row := make([]types.Datum, len(r.columnFactories))
+			for i, factory := range r.columnFactories {
+				row[i] = types.NewDatum(factory(r, record.StmtRecord))
+			}
+			rows = append(rows, row)
+		}()
+	}
+	if r.checker.digests == nil {
+		func() {
+			evicted.Lock()
+			defer evicted.Unlock()
+			if evicted.other.ExecCount == 0 {
+				return
+			}
+			if !r.checker.hasPrivilege(evicted.other.AuthUsers) {
+				return
+			}
+			evicted.other.Begin = w.begin.Unix()
+			evicted.other.End = end
+			row := make([]types.Datum, len(r.columnFactories))
+			for i, factory := range r.columnFactories {
+				row[i] = types.NewDatum(factory(r, evicted.other))
+			}
+			rows = append(rows, row)
+		}()
+	}
+	return rows
+}
+
+// getInstanceAddr implements columnInfo.
+func (r *MemReader) getInstanceAddr() string {
+	return r.instanceAddr
+}
+
+// getInstanceAddr implements columnInfo.
+func (r *MemReader) getTimeLocation() *time.Location {
+	return r.timeLocation
+}
+
+// HistoryReader is used to read data that has been persisted to files.
+type HistoryReader struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	instanceAddr string
+	timeLocation *time.Location
+
+	columnFactories []columnFactory
+	projection      *stmtRecordProjection
+	checker         *stmtChecker
+	files           *stmtFiles
+
+	concurrent int
+	rowsCh     <-chan [][]types.Datum
+	errCh      <-chan error
+}
+
+// NewHistoryReader creates a HisroryReader from StmtSummary and other
+// necessary parameters. If timeRanges is present, only files within
+// the time range will be read.
+func NewHistoryReader(
+	ctx context.Context,
+	columns []*model.ColumnInfo,
+	instanceAddr string,
+	timeLocation *time.Location,
+	user *auth.UserIdentity,
+	hasProcessPriv bool,
+	digests set.StringSet,
+	timeRanges []*StmtTimeRange,
+	concurrent int,
+) (*HistoryReader, error) {
+	files, err := newStmtFiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if concurrent < 2 {
+		concurrent = 2
+	}
+	rowsCh := make(chan [][]types.Datum, concurrent)
+	errCh := make(chan error, concurrent)
+
+	ctx, cancel := context.WithCancel(ctx)
+	r := &HistoryReader{
+		ctx:    ctx,
+		cancel: cancel,
+
+		instanceAddr:    instanceAddr,
+		timeLocation:    timeLocation,
+		columnFactories: makeColumnFactories(columns),
+		projection:      makeStmtRecordProjection(columns),
+		checker: &stmtChecker{
+			user:           user,
+			hasProcessPriv: hasProcessPriv,
+			digests:        digests,
+			timeRanges:     timeRanges,
+		},
+		files:      files,
+		concurrent: concurrent,
+		rowsCh:     rowsCh,
+		errCh:      errCh,
+	}
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.scheduleTasks(rowsCh, errCh)
+	}()
+	return r, nil
+}
+
+// Rows returns rows converted from records in files. Reading and parsing
+// works asynchronously. If (nil, nil) is returned, it means that the
+// reading has been completed.
+func (r *HistoryReader) Rows() ([][]types.Datum, error) {
+	ctx := r.ctx
+	for {
+		select {
+		case err := <-r.errCh:
+			return nil, err
+		case rows, ok := <-r.rowsCh:
+			if !ok {
+				select {
+				case err := <-r.errCh:
+					return nil, err
+				default:
+					return nil, nil
+				}
+			}
+			if len(rows) == 0 {
+				continue
+			}
+			return rows, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// Close ends reading and closes all files.
+func (r *HistoryReader) Close() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.wg.Wait()
+	return nil
+}
+
+// 4 roles to handle the read task in pipeline:
+//
+// ## Pipeline
+// .           +--------------+             +---------------+
+// == files => | scan workers | == lines => | parse workers | == rows =>
+// . filesCh   +--------------+   linesCh   +---------------+   rowsCh
+//
+// ## Roles
+// +--------------+--------------+------------------------------------+
+// |     ROLE     |    COUNT     |          DESCRIPTION               |
+// +--------------+--------------+------------------------------------+
+// | Scan Worker  | concurrent/2 | Scan files (I/O) first, then help  |
+// |              |              | parse workers to parse lines (CPU) |
+// +--------------+--------------+------------------------------------+
+// | Parse Worker | concurrent-  | Parse lines (CPU) to rows          |
+// |              | concurrent/2 |                                    |
+// +--------------+--------------+------------------------------------+
+// |   Manager    |      1       | Drive the whole process and notify |
+// |              |              | scan workers to switch role        |
+// +--------------+--------------+------------------------------------+
+// |   Monitor    |      1       | Cover failures and notify workers  |
+// |              |              | to exit                            |
+// +--------------+--------------+------------------------------------+
+func (r *HistoryReader) scheduleTasks(
+	rowsCh chan<- [][]types.Datum,
+	errCh chan<- error,
+) {
+	if r.files == nil || len(r.files.files) == 0 {
+		close(rowsCh)
+		return
+	}
+	defer r.files.close()
+
+	ctx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+
+	scanWorker := &stmtScanWorker{
+		ctx:       ctx,
+		batchSize: batchScanSize,
+		checker:   r.checker,
+	}
+	parseWorker := &stmtParseWorker{
+		ctx:             ctx,
+		instanceAddr:    r.instanceAddr,
+		timeLocation:    r.timeLocation,
+		checker:         r.checker,
+		columnFactories: r.columnFactories,
+		projection:      r.projection,
+	}
+
+	concurrent := r.concurrent
+	// Keep this channel unbuffered so the manager cannot accumulate open file handles.
+	filesCh := make(chan *stmtFile)
+	linesCh := make(chan [][]byte, concurrent)
+	innerErrCh := make(chan error, concurrent)
+
+	var scanWg sync.WaitGroup
+	scanWg.Add(concurrent / 2)
+	scanDone := scanWg.Done
+	waitScanAllDone := scanWg.Wait
+
+	var parseWg sync.WaitGroup
+	parseWg.Add(concurrent) // finally all workers will become parse workers
+	parseDone := parseWg.Done
+	waitParseAllDone := parseWg.Wait
+
+	// Half of workers are scheduled to scan files and then parse lines.
+	for range concurrent / 2 {
+		go func() {
+			scanWorker.run(filesCh, linesCh, innerErrCh)
+			scanDone()
+
+			parseWorker.run(linesCh, rowsCh, innerErrCh)
+			parseDone()
+		}()
+	}
+
+	// Remaining workers are scheduled to parse lines.
+	for i := concurrent / 2; i < concurrent; i++ {
+		go func() {
+			parseWorker.run(linesCh, rowsCh, innerErrCh)
+			parseDone()
+		}()
+	}
+
+	// Manager drives the whole process
+	var mgrWg sync.WaitGroup
+	mgrWg.Add(1)
+	go func() {
+		defer mgrWg.Done()
+
+		func() {
+			for _, candidate := range r.files.files {
+				if isCtxDone(ctx) {
+					return
+				}
+				file := candidate
+				if file.file == nil {
+					var err error
+					file, err = openStmtFile(candidate.path)
+					if err != nil {
+						logutil.BgLogger().Warn("failed to open or parse statements file", zap.Error(err), zap.String("path", candidate.path))
+						continue
+					}
+					if r.files.currentFileInfo != nil {
+						fileInfo, err := file.file.Stat()
+						if err != nil {
+							file.closeAndLogError()
+							select {
+							case innerErrCh <- err:
+							case <-ctx.Done():
+							}
+							return
+						}
+						if os.SameFile(r.files.currentFileInfo, fileInfo) {
+							file.closeAndLogError()
+							continue
+						}
+					}
+				}
+				if !r.checker.isTimeValid(file.begin, file.end) {
+					file.closeAndLogError()
+					continue
+				}
+				select {
+				case filesCh <- file:
+					failpoint.InjectCall("stmtSummaryHistoryScanFile", file.path)
+				case <-ctx.Done():
+					file.closeAndLogError()
+					return
+				}
+			}
+		}()
+		// No scan tasks to be generating. Notify idle scan
+		// workers to become parse workers
+		close(filesCh)
+
+		// No parse tasks to be generating once all scan
+		// tasks are done. Notify idle parse workers to exit
+		waitScanAllDone()
+		close(linesCh)
+
+		// No rows to be generating once all parse tasks
+		// are done. Notify monitor to close rowsCh
+		waitParseAllDone()
+		cancel()
+	}()
+
+	// Monitor to cover failures and notify workers to exit
+	select {
+	case err := <-innerErrCh:
+		select {
+		case errCh <- err:
+		default:
+		}
+		cancel() // notify workers to exit
+	case <-ctx.Done():
+		// notified by manager or parent ctx is canceled
+	}
+	mgrWg.Wait()
+	close(rowsCh) // task done
+}
+
+type stmtChecker struct {
+	user           *auth.UserIdentity
+	hasProcessPriv bool // If the user has the 'PROCESS' privilege, he can read all statements.
+	digests        set.StringSet
+	timeRanges     []*StmtTimeRange
+}
+
+func (c *stmtChecker) hasPrivilege(authUsers map[string]struct{}) bool {
+	authed := true
+	if c.user != nil && !c.hasProcessPriv {
+		if len(authUsers) == 0 {
+			return false
+		}
+		_, authed = authUsers[c.user.Username]
+	}
+	return authed
+}
+
+func (c *stmtChecker) isDigestValid(digest string) bool {
+	if c.digests == nil {
+		return true
+	}
+	return c.digests.Exist(digest)
+}
+
+func (c *stmtChecker) isTimeValid(begin, end int64) bool {
+	if len(c.timeRanges) == 0 {
+		return true
+	}
+	for _, tr := range c.timeRanges {
+		if timeRangeOverlap(begin, end, tr.Begin, tr.End) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *stmtChecker) needStop(curBegin int64) bool {
+	if len(c.timeRanges) == 0 {
+		return false
+	}
+	stop := true
+	for _, tr := range c.timeRanges {
+		if tr.End == 0 || tr.End >= curBegin {
+			stop = false
+		}
+	}
+	return stop
+}
+
+type stmtTinyRecord struct {
+	Begin int64 `json:"begin"`
+	End   int64 `json:"end"`
+}
+
+// extractDigest returns the digest value of a persisted JSON line exactly as the
+// full decode would see it: top-level keys are walked in order and the last unescaped
+// digest key wins, including case-insensitive matches, just like encoding/json. Only keys
+// are examined — every other value is skipped byte-wise without decoding or
+// allocation. Escaped keys/values and invalid UTF-8 digest values fall back to
+// the standard decoder. This is not a JSON validator: matching and unrecognized
+// lines still pass through the standard decoder before a row can be returned.
+func extractDigest(line []byte) (digest string, ok bool) {
+	i := skipJSONSpace(line, 0)
+	if i >= len(line) || line[i] != '{' {
+		return "", false
+	}
+	i = skipJSONSpace(line, i+1)
+	found := false
+	var value string
+	for {
+		if i >= len(line) {
+			return "", false
+		}
+		if line[i] == '}' {
+			if found {
+				return value, true
+			}
+			// End of the object and no plain digest key was seen.
+			return "", false
+		}
+		key, next, okKey := scanJSONString(line, i)
+		if !okKey || hasJSONEscape(key) {
+			// Escaped keys can't be compared cheaply; defer to the full decode.
+			return "", false
+		}
+		i = skipJSONSpace(line, next)
+		if i >= len(line) || line[i] != ':' {
+			return "", false
+		}
+		i = skipJSONSpace(line, i+1)
+		if bytes.EqualFold(key, []byte("digest")) {
+			v, next, okValue := scanJSONString(line, i)
+			if !okValue || hasJSONEscape(v) || !utf8.Valid(v) {
+				return "", false
+			}
+			value, found = string(v), true
+			i = next
+		} else {
+			next, okValue := skipJSONValue(line, i)
+			if !okValue {
+				return "", false
+			}
+			i = next
+		}
+		i = skipJSONSpace(line, i)
+		if i >= len(line) {
+			return "", false
+		}
+		if line[i] == ',' {
+			i = skipJSONSpace(line, i+1)
+		} else if line[i] != '}' {
+			return "", false
+		}
+	}
+}
+
+func skipJSONSpace(line []byte, i int) int {
+	for i < len(line) {
+		switch line[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// scanJSONString reads a JSON string starting at the opening quote line[i]. It
+// returns the raw content between the quotes with escapes left as-is, the position
+// after the closing quote, and whether a closing quote was found.
+func scanJSONString(line []byte, i int) (content []byte, next int, ok bool) {
+	if i >= len(line) || line[i] != '"' {
+		return nil, 0, false
+	}
+	i++
+	start := i
+	for i < len(line) {
+		switch line[i] {
+		case '\\':
+			i += 2
+		case '"':
+			return line[start:i], i + 1, true
+		default:
+			i++
+		}
+	}
+	return nil, 0, false
+}
+
+func hasJSONEscape(content []byte) bool {
+	for _, c := range content {
+		if c == '\\' {
+			return true
+		}
+	}
+	return false
+}
+
+// skipJSONValue skips one JSON value (string, number, literal, or a balanced
+// container with strings honored) and reports the position after it.
+func skipJSONValue(line []byte, i int) (next int, ok bool) {
+	if i >= len(line) {
+		return 0, false
+	}
+	switch line[i] {
+	case '"':
+		_, next, ok = scanJSONString(line, i)
+		return next, ok
+	case '{', '[':
+		opening := line[i]
+		closing := byte('}')
+		if opening == '[' {
+			closing = ']'
+		}
+		depth := 0
+		for i < len(line) {
+			c := line[i]
+			if c == '"' {
+				_, next, ok = scanJSONString(line, i)
+				if !ok {
+					return 0, false
+				}
+				i = next
+				continue
+			}
+			if c == opening {
+				depth++
+			} else if c == closing {
+				depth--
+				if depth == 0 {
+					return i + 1, true
+				}
+			}
+			i++
+		}
+		return 0, false
+	default:
+		start := i
+		for i < len(line) {
+			switch line[i] {
+			case ',', '}', ']', ' ', '\t', '\n', '\r':
+				return i, i > start
+			}
+			i++
+		}
+		return i, i > start
+	}
+}
+
+type stmtPersistedRecord struct {
+	StmtRecord
+	Evicted bool `json:"evicted"`
+}
+
+type stmtFile struct {
+	path  string
+	file  *os.File
+	begin int64
+	end   int64
+}
+
+func openStmtFile(path string) (*stmtFile, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY, os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+	begin, err := parseBeginTsAndReseek(file)
+	if err != nil {
+		if err != io.EOF {
+			_ = file.Close()
+			return nil, err
+		}
+	}
+	end, err := parseEndTs(file)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+
+	return &stmtFile{
+		path:  path,
+		file:  file,
+		begin: begin,
+		end:   end,
+	}, nil
+}
+
+func parseBeginTsAndReseek(file *os.File) (int64, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	reader := bufio.NewReader(file)
+	var record stmtTinyRecord
+	for { // ignore invalid lines
+		line, err := readLine(reader)
+		if err != nil {
+			return 0, err
+		}
+		err = json.Unmarshal(line, &record)
+		if err == nil {
+			break
+		}
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return record.Begin, nil
+}
+
+func parseEndTs(file *os.File) (int64, error) {
+	// The rotated filename is compared by basename, so derive its prefix from
+	// the configured basename as well when the configured path is absolute.
+	configured := filepath.Base(config.GetGlobalConfig().Instance.StmtSummaryFilename)
+	// .log
+	ext := filepath.Ext(configured)
+	// tidb-statements
+	prefix := configured[:len(configured)-len(ext)]
+
+	// tidb-statements-2022-12-27T16-21-20.245.log
+	filename := filepath.Base(file.Name())
+	// .log
+	ext = filepath.Ext(file.Name())
+	// tidb-statements-2022-12-27T16-21-20.245
+	filename = filename[:len(filename)-len(ext)]
+
+	if strings.HasPrefix(filename, prefix+"-") {
+		// 2022-12-27T16-21-20.245
+		timeStr := strings.TrimPrefix(filename, prefix+"-")
+		end, err := time.ParseInLocation(logFileTimeFormat, timeStr, time.Local)
+		if err != nil {
+			return 0, err
+		}
+		// Rotation names contain local wall time without an offset. A repeated
+		// time can denote a later instant, so it is not a safe pruning bound.
+		if end.Format(logFileTimeFormat) != timeStr || !timeutil.IsUniqueLocalTime(end) {
+			return 0, nil
+		}
+		return end.Unix(), nil
+	}
+	return 0, nil
+}
+
+func (f *stmtFile) close() error {
+	if f.file != nil {
+		err := f.file.Close()
+		f.file = nil
+		return err
+	}
+	return nil
+}
+
+func (f *stmtFile) closeAndLogError() {
+	if err := f.close(); err != nil {
+		logutil.BgLogger().Warn("failed to close statements file", zap.Error(err), zap.String("path", f.path))
+	}
+}
+
+type stmtFiles struct {
+	files           []*stmtFile
+	currentFileInfo os.FileInfo
+}
+
+func (f *stmtFiles) close() {
+	for _, file := range f.files {
+		file.closeAndLogError()
+	}
+}
+
+func newStmtFiles(ctx context.Context) (*stmtFiles, error) {
+	return newStmtFilesWithReadDir(ctx, os.ReadDir)
+}
+
+func newStmtFilesWithReadDir(
+	ctx context.Context,
+	readDir func(string) ([]os.DirEntry, error),
+) (*stmtFiles, error) {
+	filename := config.GetGlobalConfig().Instance.StmtSummaryFilename
+	ext := filepath.Ext(filename)
+	prefix := filename[:len(filename)-len(ext)]
+
+	if isCtxDone(ctx) {
+		return nil, ctx.Err()
+	}
+	// Pin the active inode before enumerating rotated files. If rotation happens
+	// during enumeration, the directory entry for this inode is deduplicated below.
+	currentFile, err := openStmtFile(filename)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logutil.BgLogger().Warn("failed to snapshot current statements file", zap.Error(err), zap.String("path", filename))
+		}
+		currentFile = nil
+	}
+
+	var files []*stmtFile
+	var currentFileInfo os.FileInfo
+	if currentFile != nil {
+		currentFileInfo, err = currentFile.file.Stat()
+		if err != nil {
+			currentFile.closeAndLogError()
+			return nil, err
+		}
+		files = append(files, currentFile)
+	}
+
+	dir := filepath.Dir(filename)
+	entries, err := readDir(dir)
+	if err != nil {
+		(&stmtFiles{files: files}).close()
+		return nil, err
+	}
+	if isCtxDone(ctx) {
+		(&stmtFiles{files: files}).close()
+		return nil, ctx.Err()
+	}
+	walkFn := func(path string, entry os.DirEntry) error {
+		if entry.IsDir() {
+			return nil
+		}
+		if !strings.HasPrefix(path, prefix) {
+			return nil
+		}
+		if isCtxDone(ctx) {
+			return ctx.Err()
+		}
+		if path == filename {
+			if currentFile == nil {
+				files = append(files, &stmtFile{path: path})
+			}
+			return nil
+		}
+		if currentFileInfo != nil {
+			fileInfo, infoErr := entry.Info()
+			if infoErr == nil && os.SameFile(currentFileInfo, fileInfo) {
+				return nil
+			}
+			// If Info fails, keep the path and deduplicate the opened inode later.
+		}
+		files = append(files, &stmtFile{path: path})
+		return nil
+	}
+
+	for _, entry := range entries {
+		if err := walkFn(filepath.Join(dir, entry.Name()), entry); err != nil {
+			(&stmtFiles{files: files}).close()
+			return nil, err
+		}
+	}
+	slices.SortFunc(files, func(i, j *stmtFile) int {
+		return cmp.Compare(i.path, j.path)
+	})
+	return &stmtFiles{files: files, currentFileInfo: currentFileInfo}, nil
+}
+
+type stmtScanWorker struct {
+	ctx       context.Context
+	batchSize int
+	checker   *stmtChecker
+}
+
+func (w *stmtScanWorker) run(
+	fileCh <-chan *stmtFile,
+	linesCh chan<- [][]byte,
+	errCh chan<- error,
+) {
+	for {
+		select {
+		case file, ok := <-fileCh:
+			if !ok {
+				return
+			}
+			w.handleFile(file, linesCh, errCh)
+		case <-w.ctx.Done():
+			return
+		}
+	}
+}
+
+func (w *stmtScanWorker) handleFile(
+	file *stmtFile,
+	linesCh chan<- [][]byte,
+	errCh chan<- error,
+) {
+	if file == nil || file.file == nil {
+		return
+	}
+	defer file.closeAndLogError()
+
+	reader := bufio.NewReader(file.file)
+	for {
+		if isCtxDone(w.ctx) {
+			return
+		}
+
+		lines, err := w.readlines(reader)
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			w.putErr(err, errCh)
+			return
+		}
+
+		w.putLines(lines, linesCh)
+	}
+}
+
+func (w *stmtScanWorker) putErr(
+	err error,
+	errCh chan<- error,
+) {
+	select {
+	case errCh <- err:
+	case <-w.ctx.Done():
+	}
+}
+
+func (w *stmtScanWorker) putLines(
+	lines [][]byte,
+	linesCh chan<- [][]byte,
+) {
+	select {
+	case linesCh <- lines:
+	case <-w.ctx.Done():
+	}
+}
+
+func (w *stmtScanWorker) readlines(reader *bufio.Reader) ([][]byte, error) {
+	var firstLine []byte
+	var record *stmtTinyRecord
+	for { // ingore invalid lines
+		var err error
+		firstLine, err = readLine(reader)
+		if err != nil {
+			return nil, err
+		}
+
+		record, err = w.parse(firstLine)
+		if err == nil {
+			break
+		}
+	}
+
+	if w.needStop(record) {
+		// done because remaining lines in file
+		// are not in the time range
+		return nil, io.EOF
+	}
+
+	lines := make([][]byte, 0, w.batchSize)
+	lines = append(lines, firstLine)
+
+	newLines, err := readLines(reader, w.batchSize-1)
+	if err == io.EOF {
+		return lines, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	lines = append(lines, newLines...)
+	return lines, nil
+}
+
+func (*stmtScanWorker) parse(raw []byte) (*stmtTinyRecord, error) {
+	var record stmtTinyRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return nil, err
+	}
+	return &record, nil
+}
+
+func (w *stmtScanWorker) needStop(record *stmtTinyRecord) bool {
+	return w.checker.needStop(record.Begin)
+}
+
+type stmtParseWorker struct {
+	ctx             context.Context
+	instanceAddr    string
+	timeLocation    *time.Location
+	checker         *stmtChecker
+	columnFactories []columnFactory
+	projection      *stmtRecordProjection
+}
+
+func (w *stmtParseWorker) run(
+	linesCh <-chan [][]byte,
+	rowsCh chan<- [][]types.Datum,
+	errCh chan<- error,
+) {
+	for {
+		select {
+		case lines, ok := <-linesCh:
+			if !ok {
+				return
+			}
+			w.handleLines(lines, rowsCh, errCh)
+		case <-w.ctx.Done():
+			return
+		}
+	}
+}
+
+func (w *stmtParseWorker) handleLines(
+	lines [][]byte,
+	rowsCh chan<- [][]types.Datum,
+	_ chan<- error,
+) {
+	if len(lines) == 0 {
+		return
+	}
+
+	rows := make([][]types.Datum, 0, len(lines))
+	for _, line := range lines {
+		if w.checker.digests != nil {
+			// Cheap digest pre-filter: records whose digest cannot match skip the full
+			// unmarshal. Only keys are walked — values are skipped byte-wise — and the
+			// last case-insensitive digest key wins, matching the full decode; anything not
+			// cheaply skippable falls back to the full decode.
+			if digest, ok := extractDigest(line); ok && !w.checker.isDigestValid(digest) {
+				continue
+			}
+		}
+		failpoint.InjectCall("stmtSummaryHistoryParseRecord")
+		record, skipped, err := w.parse(line)
+		if err != nil {
+			// ignore invalid lines
+			continue
+		}
+		if skipped {
+			continue
+		}
+
+		if w.needStop(record) {
+			break
+		}
+
+		if !w.matchConds(record) {
+			continue
+		}
+
+		row := w.buildRow(record)
+		rows = append(rows, row)
+	}
+
+	if len(rows) > 0 {
+		w.putRows(rows, rowsCh)
+	}
+}
+
+func (w *stmtParseWorker) putRows(
+	rows [][]types.Datum,
+	rowsCh chan<- [][]types.Datum,
+) {
+	select {
+	case rowsCh <- rows:
+	case <-w.ctx.Done():
+	}
+}
+
+func (w *stmtParseWorker) parse(raw []byte) (*StmtRecord, bool, error) {
+	if w.projection != nil {
+		return w.projection.parse(raw)
+	}
+	var record stmtPersistedRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return nil, false, err
+	}
+	if record.Evicted {
+		return nil, true, nil
+	}
+	return &record.StmtRecord, false, nil
+}
+
+func (w *stmtParseWorker) needStop(record *StmtRecord) bool {
+	return w.checker.needStop(record.Begin)
+}
+
+func (w *stmtParseWorker) matchConds(record *StmtRecord) bool {
+	if !w.checker.isTimeValid(record.Begin, record.End) {
+		return false
+	}
+	if !w.checker.isDigestValid(record.Digest) {
+		return false
+	}
+	if !w.checker.hasPrivilege(record.AuthUsers) {
+		return false
+	}
+	return true
+}
+
+func (w *stmtParseWorker) buildRow(record *StmtRecord) []types.Datum {
+	row := make([]types.Datum, len(w.columnFactories))
+	for n, factory := range w.columnFactories {
+		row[n] = types.NewDatum(factory(w, record))
+	}
+	return row
+}
+
+// getInstanceAddr implements columnInfo.
+func (w *stmtParseWorker) getInstanceAddr() string {
+	return w.instanceAddr
+}
+
+// getInstanceAddr implements columnInfo.
+func (w *stmtParseWorker) getTimeLocation() *time.Location {
+	return w.timeLocation
+}
+
+func isCtxDone(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func readLine(reader *bufio.Reader) ([]byte, error) {
+	return util.ReadLine(reader, maxLineSize)
+}
+
+func readLines(reader *bufio.Reader, count int) ([][]byte, error) {
+	return util.ReadLines(reader, count, maxLineSize)
+}
+
+func timeRangeOverlap(aBegin, aEnd, bBegin, bEnd int64) bool {
+	if aEnd == 0 || aEnd < aBegin {
+		aEnd = math.MaxInt64
+	}
+	if bEnd == 0 || bEnd < bBegin {
+		bEnd = math.MaxInt64
+	}
+	// https://stackoverflow.com/questions/3269434/whats-the-most-efficient-way-to-test-if-two-ranges-overlap
+	return aBegin <= bEnd && aEnd >= bBegin
+}

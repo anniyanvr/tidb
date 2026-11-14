@@ -18,15 +18,13 @@ func newSimpleRowReceiver(length int) *simpleRowReceiver {
 	return &simpleRowReceiver{data: make([]string, length)}
 }
 
-func (s *simpleRowReceiver) BindAddress(args []interface{}) {
+func (s *simpleRowReceiver) BindAddress(args []any) {
 	for i := range args {
 		args[i] = &s.data[i]
 	}
 }
 
 func TestRowIter(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -42,7 +40,7 @@ func TestRowIter(t *testing.T) {
 	require.NoError(t, err)
 
 	iter := newRowIter(rows, 1)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		require.True(t, iter.HasNext())
 	}
 
@@ -66,8 +64,6 @@ func TestRowIter(t *testing.T) {
 }
 
 func TestChunkRowIter(t *testing.T) {
-	t.Parallel()
-
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 	defer func() {
@@ -77,7 +73,7 @@ func TestChunkRowIter(t *testing.T) {
 	twentyBytes := strings.Repeat("x", 20)
 	thirtyBytes := strings.Repeat("x", 30)
 	expectedRows := mock.NewRows([]string{"a", "b"})
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		expectedRows.AddRow(twentyBytes, thirtyBytes)
 	}
 	mock.ExpectQuery("SELECT a, b FROM t").WillReturnRows(expectedRows)
@@ -87,45 +83,19 @@ func TestChunkRowIter(t *testing.T) {
 		require.NoError(t, rows.Close())
 	}()
 
-	var (
-		testFileSize      uint64 = 200
-		testStatementSize uint64 = 101
-
-		expectedSize = [][]uint64{
-			{50, 50},
-			{100, 100},
-			{150, 150},
-			{200, 50},
-		}
-	)
-
 	sqlRowIter := newRowIter(rows, 2)
-
 	res := newSimpleRowReceiver(2)
-	wp := newWriterPipe(nil, testFileSize, testStatementSize, nil)
 
-	var resSize [][]uint64
-	for sqlRowIter.HasNext() {
-		wp.currentStatementSize = 0
-		for sqlRowIter.HasNext() {
-			require.NoError(t, sqlRowIter.Decode(res))
-			sz := uint64(len(res.data[0]) + len(res.data[1]))
-			wp.AddFileSize(sz)
-			sqlRowIter.Next()
-			resSize = append(resSize, []uint64{wp.currentFileSize, wp.currentStatementSize})
-			if wp.ShouldSwitchStatement() {
-				break
-			}
-		}
-		if wp.ShouldSwitchFile() {
-			break
-		}
+	// Consume part of the 10 rows and verify the iterator state. The size-based
+	// statement/file switching that used to be exercised here now lives in
+	// sqlfile.Writer and is covered by its own tests.
+	for range 4 {
+		require.True(t, sqlRowIter.HasNext())
+		require.NoError(t, sqlRowIter.Decode(res))
+		sqlRowIter.Next()
 	}
 
-	require.Equal(t, expectedSize, resSize)
 	require.True(t, sqlRowIter.HasNext())
-	require.True(t, wp.ShouldSwitchFile())
-	require.True(t, wp.ShouldSwitchStatement())
 	require.NoError(t, rows.Close())
 	require.Error(t, sqlRowIter.Decode(res))
 	sqlRowIter.Next()

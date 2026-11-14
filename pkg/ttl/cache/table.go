@@ -1,0 +1,1156 @@
+// Copyright 2022 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cache
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"math"
+	"time"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/expression"
+	"github.com/pingcap/tidb/pkg/expression/exprstatic"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/charset"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/table/tables"
+	"github.com/pingcap/tidb/pkg/tablecodec"
+	"github.com/pingcap/tidb/pkg/ttl/session"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/codec"
+	"github.com/pingcap/tidb/pkg/util/collate"
+	"github.com/pingcap/tidb/pkg/util/intest"
+	"github.com/pingcap/tidb/pkg/util/logutil"
+	"github.com/tikv/client-go/v2/tikv"
+	"go.uber.org/zap"
+)
+
+func getTableKeyColumns(tbl *model.TableInfo) ([]*model.ColumnInfo, []*types.FieldType, error) {
+	if tbl.PKIsHandle {
+		// An integer clustered primary key is encoded directly in the record key.
+		// It normally has no independent primary IndexInfo, so TTL's existing PK
+		// scan path splits and paginates the table by this handle column.
+		for i, col := range tbl.Columns {
+			if mysql.HasPriKeyFlag(col.GetFlag()) {
+				return []*model.ColumnInfo{tbl.Columns[i]}, []*types.FieldType{&tbl.Columns[i].FieldType}, nil
+			}
+		}
+		return nil, nil, errors.Errorf("Cannot find primary key for table: %s", tbl.Name)
+	}
+
+	if tbl.IsCommonHandle {
+		idxInfo := tables.FindPrimaryIndex(tbl)
+		columns := make([]*model.ColumnInfo, len(idxInfo.Columns))
+		fieldTypes := make([]*types.FieldType, len(idxInfo.Columns))
+		for i, idxCol := range idxInfo.Columns {
+			columns[i] = tbl.Columns[idxCol.Offset]
+			fieldTypes[i] = &tbl.Columns[idxCol.Offset].FieldType
+		}
+		return columns, fieldTypes, nil
+	}
+
+	extraHandleColInfo := model.NewExtraHandleColInfo()
+	return []*model.ColumnInfo{extraHandleColInfo}, []*types.FieldType{&extraHandleColInfo.FieldType}, nil
+}
+
+// ScanRange is the range to scan. The range is: [Start, End)
+type ScanRange struct {
+	Start []types.Datum
+	End   []types.Datum
+}
+
+func newFullRange() ScanRange {
+	return ScanRange{}
+}
+
+func newDatumRange(start types.Datum, end types.Datum) (r ScanRange) {
+	if !start.IsNull() {
+		r.Start = []types.Datum{start}
+	}
+	if !end.IsNull() {
+		r.End = []types.Datum{end}
+	}
+	return r
+}
+
+func nullDatum() types.Datum {
+	d := types.Datum{}
+	d.SetNull()
+	return d
+}
+
+// PhysicalTable is used to provide some information for a physical table in TTL job
+type PhysicalTable struct {
+	// ID is the physical ID of the table
+	ID int64
+	// Schema is the database name of the table
+	Schema ast.CIStr
+	*model.TableInfo
+	// Partition is the partition name
+	Partition ast.CIStr
+	// PartitionDef is the partition definition
+	PartitionDef *model.PartitionDefinition
+	// KeyColumns is the cluster index key columns for the table
+	KeyColumns []*model.ColumnInfo
+	// KeyColumnTypes is the types of the key columns
+	KeyColumnTypes []*types.FieldType
+	// TimeColum is the time column used for TTL
+	TimeColumn *model.ColumnInfo
+}
+
+// NewBasePhysicalTable create a new PhysicalTable with specific timeColumn.
+func NewBasePhysicalTable(schema ast.CIStr,
+	tbl *model.TableInfo,
+	partition ast.CIStr,
+	timeColumn *model.ColumnInfo,
+) (*PhysicalTable, error) {
+	if tbl.State != model.StatePublic {
+		return nil, errors.Errorf("table '%s.%s' is not a public table", schema, tbl.Name)
+	}
+
+	keyColumns, keyColumTypes, err := getTableKeyColumns(tbl)
+	if err != nil {
+		return nil, err
+	}
+
+	var physicalID int64
+	var partitionDef *model.PartitionDefinition
+	if tbl.Partition == nil {
+		if partition.L != "" {
+			return nil, errors.Errorf("table '%s.%s' is not a partitioned table", schema, tbl.Name)
+		}
+		physicalID = tbl.ID
+	} else {
+		if partition.L == "" {
+			return nil, errors.Errorf("partition name is required, table '%s.%s' is a partitioned table", schema, tbl.Name)
+		}
+
+		for i := range tbl.Partition.Definitions {
+			def := &tbl.Partition.Definitions[i]
+			if def.Name.L == partition.L {
+				partitionDef = def
+			}
+		}
+
+		if partitionDef == nil {
+			return nil, errors.Errorf("partition '%s' is not found in ttl table '%s.%s'", partition.O, schema, tbl.Name)
+		}
+
+		physicalID = partitionDef.ID
+	}
+
+	return &PhysicalTable{
+		ID:             physicalID,
+		Schema:         schema,
+		TableInfo:      tbl,
+		Partition:      partition,
+		PartitionDef:   partitionDef,
+		KeyColumns:     keyColumns,
+		KeyColumnTypes: keyColumTypes,
+		TimeColumn:     timeColumn,
+	}, nil
+}
+
+// NewPhysicalTable create a new PhysicalTable
+func NewPhysicalTable(schema ast.CIStr, tbl *model.TableInfo, partition ast.CIStr) (*PhysicalTable, error) {
+	ttlInfo := tbl.TTLInfo
+	if ttlInfo == nil {
+		return nil, errors.Errorf("table '%s.%s' is not a ttl table", schema, tbl.Name)
+	}
+
+	timeColumn := tbl.FindPublicColumnByName(ttlInfo.ColumnName.L)
+	if timeColumn == nil {
+		return nil, errors.Errorf("time column '%s' is not public in ttl table '%s.%s'", ttlInfo.ColumnName, schema, tbl.Name)
+	}
+
+	return NewBasePhysicalTable(schema, tbl, partition, timeColumn)
+}
+
+// ValidateKeyPrefix validates a key prefix
+func (t *PhysicalTable) ValidateKeyPrefix(key []types.Datum) error {
+	if len(key) > len(t.KeyColumns) {
+		return errors.Errorf("invalid key length: %d, expected %d", len(key), len(t.KeyColumns))
+	}
+	return nil
+}
+
+type mockExpireTimeKey struct{}
+
+// SetMockExpireTime can only used in test
+func SetMockExpireTime(ctx context.Context, tm time.Time) context.Context {
+	return context.WithValue(ctx, mockExpireTimeKey{}, tm)
+}
+
+// EvalExpireTime returns the expired time.
+func EvalExpireTime(now time.Time, interval string, unit ast.TimeUnitType) (time.Time, error) {
+	// Firstly, we should use the UTC time zone to compute the expired time to avoid time shift caused by DST.
+	// The start time should be a time with the same datetime string as `now` but it is in the UTC timezone.
+	// For example, if global timezone is `Asia/Shanghai` with a string format `2020-01-01 08:00:00 +0800`.
+	// The startTime should be in timezone `UTC` and have a string format `2020-01-01 08:00:00 +0000` which is not the
+	// same as the original one (`2020-01-01 00:00:00 +0000` in UTC actually).
+	start := time.Date(
+		now.Year(), now.Month(), now.Day(),
+		now.Hour(), now.Minute(), now.Second(),
+		now.Nanosecond(), time.UTC,
+	)
+
+	exprCtx := exprstatic.NewExprContext()
+	// we need to set the location to UTC to make sure the time is in the same timezone as the start time.
+	intest.Assert(exprCtx.GetEvalCtx().Location() == time.UTC)
+	expr, err := expression.ParseSimpleExpr(
+		exprCtx,
+		fmt.Sprintf("FROM_UNIXTIME(0) + INTERVAL %d MICROSECOND - INTERVAL %s %s",
+			start.UnixMicro(), interval, unit.String(),
+		),
+	)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	tm, _, err := expr.EvalTime(exprCtx.GetEvalCtx(), chunk.Row{})
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	end, err := tm.GoTime(time.UTC)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	// Then we should add the duration between the time get from the previous SQL and the start time to the now time.
+	expiredTime := now.
+		Add(end.Sub(start)).
+		// Truncate to second to make sure the precision is always the same with the one stored in a table to avoid some
+		// comparing problems in testing.
+		Truncate(time.Second)
+
+	return expiredTime, nil
+}
+
+// FullName returns the full name of the table
+func (t *PhysicalTable) FullName() string {
+	if t.Partition.L != "" {
+		return fmt.Sprintf("%s.%s.%s", t.Schema.O, t.Name.O, t.Partition.O)
+	}
+	return fmt.Sprintf("%s.%s", t.Schema.O, t.Name.O)
+}
+
+// EvalExpireTime returns the expired time for the current time.
+// It uses the global timezone in session to evaluation the context
+// and the return time is in the same timezone of now argument.
+func (t *PhysicalTable) EvalExpireTime(ctx context.Context, se session.Session,
+	now time.Time) (time.Time, error) {
+	if intest.InTest {
+		if tm, ok := ctx.Value(mockExpireTimeKey{}).(time.Time); ok {
+			return tm, nil
+		}
+	}
+
+	// Use the global time zone to compute expire time.
+	// Different timezones may have different results event with the same "now" time and TTL expression.
+	// Consider a TTL setting with the expiration `INTERVAL 1 MONTH`.
+	// If the current timezone is `Asia/Shanghai` and now is `2021-03-01 00:00:00 +0800`
+	// the expired time should be `2021-02-01 00:00:00 +0800`, corresponding to UTC time `2021-01-31 16:00:00 UTC`.
+	// But if we use the `UTC` time zone, the current time is `2021-02-28 16:00:00 UTC`,
+	// and the expired time should be `2021-01-28 16:00:00 UTC` that is not the same the previous one.
+	globalTz, err := se.GlobalTimeZone(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	start := now.In(globalTz)
+	expire, err := EvalExpireTime(start, t.TTLInfo.IntervalExprStr, ast.TimeUnitType(t.TTLInfo.IntervalTimeUnit))
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return expire.In(now.Location()), nil
+}
+
+// SplitScanRanges split ranges for TTL scan
+func (t *PhysicalTable) SplitScanRanges(ctx context.Context, store kv.Storage, splitCnt int) ([]ScanRange, error) {
+	if len(t.KeyColumns) < 1 || splitCnt <= 1 {
+		return []ScanRange{newFullRange()}, nil
+	}
+
+	tikvStore, ok := store.(tikv.Storage)
+	if !ok {
+		return []ScanRange{newFullRange()}, nil
+	}
+
+	ft := t.KeyColumns[0].FieldType
+	switch ft.GetType() {
+	case mysql.TypeTiny, mysql.TypeShort, mysql.TypeLong, mysql.TypeLonglong, mysql.TypeInt24:
+		if len(t.KeyColumns) > 1 {
+			return t.splitCommonHandleRanges(ctx, tikvStore, splitCnt, true, mysql.HasUnsignedFlag(ft.GetFlag()), nil)
+		}
+		return t.splitIntRanges(ctx, tikvStore, splitCnt)
+	case mysql.TypeBit:
+		return t.splitCommonHandleRanges(ctx, tikvStore, splitCnt, false, false, nil)
+	case mysql.TypeString, mysql.TypeVarString, mysql.TypeVarchar:
+		var decode func([]byte) types.Datum
+		if !mysql.HasBinaryFlag(ft.GetFlag()) {
+			switch ft.GetCharset() {
+			case charset.CharsetASCII, charset.CharsetLatin1:
+				// ASCII and Latin1 are 8-bit charset, we can use GetASCIIPrefixDatumFromBytes to decode it.
+				decode = GetASCIIPrefixDatumFromBytes
+			case charset.CharsetUTF8, charset.CharsetUTF8MB4:
+				switch ft.GetCollate() {
+				case charset.CollationUTF8, charset.CollationUTF8MB4, "utf8mb4_0900_bin":
+					// We can only use GetASCIIPrefixDatumFromBytes to decode UTF8 and UTF8MB4 when they are
+					// "utf8_bin" or "utf8mb4_bin" collation.
+					decode = GetASCIIPrefixDatumFromBytes
+				}
+			}
+			if decode == nil {
+				return []ScanRange{newFullRange()}, nil
+			}
+		}
+		return t.splitCommonHandleRanges(ctx, tikvStore, splitCnt, false, false, decode)
+	}
+	return []ScanRange{newFullRange()}, nil
+}
+
+func unsignedEdge(d types.Datum) types.Datum {
+	if d.IsNull() {
+		return types.NewUintDatum(uint64(math.MaxInt64 + 1))
+	}
+	if d.GetInt64() == 0 {
+		return nullDatum()
+	}
+	return types.NewUintDatum(uint64(d.GetInt64()))
+}
+
+func (t *PhysicalTable) splitIntRanges(ctx context.Context, store tikv.Storage, splitCnt int) ([]ScanRange, error) {
+	recordPrefix := tablecodec.GenTableRecordPrefix(t.ID)
+	startKey, endKey := tablecodec.GetTableHandleKeyRange(t.ID)
+	keyRanges, err := t.splitRawKeyRanges(ctx, store, startKey, endKey, splitCnt)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(keyRanges) <= 1 {
+		return []ScanRange{newFullRange()}, nil
+	}
+
+	ft := t.KeyColumnTypes[0]
+	unsigned := mysql.HasUnsignedFlag(ft.GetFlag())
+	scanRanges := make([]ScanRange, 0, len(keyRanges)+1)
+	curScanStart := nullDatum()
+	for i, keyRange := range keyRanges {
+		if i != 0 && curScanStart.IsNull() {
+			break
+		}
+
+		curScanEnd := nullDatum()
+		if i < len(keyRanges)-1 {
+			if val := GetNextIntHandle(keyRange.EndKey, recordPrefix); val != nil {
+				curScanEnd = types.NewIntDatum(val.IntValue())
+			}
+		}
+
+		if !curScanStart.IsNull() && !curScanEnd.IsNull() && curScanStart.GetInt64() >= curScanEnd.GetInt64() {
+			continue
+		}
+
+		if !unsigned {
+			// primary key is signed or range
+			scanRanges = append(scanRanges, newDatumRange(curScanStart, curScanEnd))
+		} else if !curScanStart.IsNull() && curScanStart.GetInt64() >= 0 {
+			// primary key is unsigned and range is in the right half side
+			scanRanges = append(scanRanges, newDatumRange(unsignedEdge(curScanStart), unsignedEdge(curScanEnd)))
+		} else if !curScanEnd.IsNull() && curScanEnd.GetInt64() <= 0 {
+			// primary key is unsigned and range is in the left half side
+			scanRanges = append(scanRanges, newDatumRange(unsignedEdge(curScanStart), unsignedEdge(curScanEnd)))
+		} else {
+			// primary key is unsigned and the start > math.MaxInt64 && end < math.MaxInt64
+			// we must split it to two ranges
+			scanRanges = append(scanRanges,
+				newDatumRange(unsignedEdge(curScanStart), nullDatum()),
+				newDatumRange(nullDatum(), unsignedEdge(curScanEnd)),
+			)
+		}
+		curScanStart = curScanEnd
+	}
+	return scanRanges, nil
+}
+
+func (t *PhysicalTable) splitCommonHandleRanges(
+	ctx context.Context, store tikv.Storage, splitCnt int, isInt bool, unsigned bool, decode func([]byte) types.Datum,
+) ([]ScanRange, error) {
+	recordPrefix := tablecodec.GenTableRecordPrefix(t.ID)
+	startKey, endKey := recordPrefix, recordPrefix.PrefixNext()
+	keyRanges, err := t.splitRawKeyRanges(ctx, store, startKey, endKey, splitCnt)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(keyRanges) <= 1 {
+		return []ScanRange{newFullRange()}, nil
+	}
+
+	return scanRangesFromRawKeyRanges(keyRanges, func(endKey kv.Key) (types.Datum, bool, error) {
+		if isInt {
+			return GetNextIntDatumFromCommonHandle(endKey, recordPrefix, unsigned), false, nil
+		}
+
+		d := GetNextBytesHandleDatum(endKey, recordPrefix)
+		if decode != nil {
+			d = decode(d.GetBytes())
+		}
+
+		// "" is the smallest value for string/[]byte, skip to add it to ranges.
+		return d, len(d.GetBytes()) == 0, nil
+	})
+}
+
+func (t *PhysicalTable) splitRawKeyRanges(ctx context.Context, store tikv.Storage,
+	startKey, endKey kv.Key, splitCnt int) ([]kv.KeyRange, error) {
+	maxSleep := 20000
+	if intest.InTest {
+		maxSleep = 500 // reduce the max sleep time in test
+	}
+
+	regionCache := store.GetRegionCache()
+	regions, err := regionCache.LocateKeyRange(
+		tikv.NewBackofferWithVars(ctx, maxSleep, nil), startKey, endKey)
+	if err != nil {
+		return nil, err
+	}
+
+	regionsCnt := len(regions)
+	regionsPerRange := regionsCnt / splitCnt
+	oversizeCnt := regionsCnt % splitCnt
+	ranges := make([]kv.KeyRange, 0, min(regionsCnt, splitCnt))
+	for len(regions) > 0 {
+		startRegion := regions[0]
+
+		endRegionIdx := regionsPerRange - 1
+		if oversizeCnt > 0 {
+			endRegionIdx++
+		}
+
+		endRegion := regions[endRegionIdx]
+
+		rangeStartKey := kv.Key(startRegion.StartKey)
+		if rangeStartKey.Cmp(startKey) < 0 {
+			rangeStartKey = startKey
+		}
+
+		rangeEndKey := kv.Key(endRegion.EndKey)
+		if rangeEndKey.Cmp(endKey) > 0 {
+			rangeEndKey = endKey
+		}
+
+		ranges = append(ranges, kv.KeyRange{StartKey: rangeStartKey, EndKey: rangeEndKey})
+		oversizeCnt--
+		regions = regions[endRegionIdx+1:]
+	}
+	logutil.BgLogger().Info("TTL table raw key ranges split",
+		zap.Int("regionsCnt", regionsCnt),
+		zap.Int("shouldSplitCnt", splitCnt),
+		zap.Int("actualSplitCnt", len(ranges)),
+		zap.Int64("tableID", t.ID),
+		zap.String("db", t.Schema.O),
+		zap.String("table", t.Name.O),
+		zap.String("partition", t.Partition.O),
+	)
+	return ranges, nil
+}
+
+var commonHandleBytesByte byte
+
+var commonHandleIntByte byte
+
+var commonHandleUintByte byte
+
+func init() {
+	key, err := codec.EncodeKey(time.UTC, nil, types.NewBytesDatum(nil))
+	terror.MustNil(err)
+	commonHandleBytesByte = key[0]
+
+	key, err = codec.EncodeKey(time.UTC, nil, types.NewIntDatum(0))
+	terror.MustNil(err)
+	commonHandleIntByte = key[0]
+
+	key, err = codec.EncodeKey(time.UTC, nil, types.NewUintDatum(0))
+	terror.MustNil(err)
+	commonHandleUintByte = key[0]
+}
+
+// GetNextIntHandle is used for int handle tables.
+// It returns the min handle whose encoded key is or after argument `key`
+// If it cannot find a valid value, a null datum will be returned.
+func GetNextIntHandle(key kv.Key, recordPrefix []byte) kv.Handle {
+	if key.Cmp(recordPrefix) > 0 && !key.HasPrefix(recordPrefix) {
+		return nil
+	}
+
+	if key.Cmp(recordPrefix) <= 0 {
+		return kv.IntHandle(math.MinInt64)
+	}
+
+	suffix := key[len(recordPrefix):]
+	encodedVal := suffix
+	if len(suffix) < 8 {
+		encodedVal = make([]byte, 8)
+		copy(encodedVal, suffix)
+	}
+
+	findNext := false
+	if len(suffix) > 8 {
+		findNext = true
+		encodedVal = encodedVal[:8]
+	}
+
+	u := codec.DecodeCmpUintToInt(binary.BigEndian.Uint64(encodedVal))
+	if !findNext {
+		return kv.IntHandle(u)
+	}
+
+	if u == math.MaxInt64 {
+		return nil
+	}
+
+	return kv.IntHandle(u + 1)
+}
+
+// GetNextIntDatumFromCommonHandle is used for common handle tables with int value.
+// It returns the min handle whose encoded key is or after argument `key`
+// If it cannot find a valid value, a null datum will be returned.
+func GetNextIntDatumFromCommonHandle(key kv.Key, recordPrefix []byte, unsigned bool) (d types.Datum) {
+	if key.Cmp(recordPrefix) > 0 && !key.HasPrefix(recordPrefix) {
+		d.SetNull()
+		return d
+	}
+
+	typeByte := commonHandleIntByte
+	if unsigned {
+		typeByte = commonHandleUintByte
+	}
+
+	var minDatum types.Datum
+	if unsigned {
+		minDatum.SetUint64(0)
+	} else {
+		minDatum.SetInt64(math.MinInt64)
+	}
+
+	if key.Cmp(recordPrefix) <= 0 {
+		d = minDatum
+		return d
+	}
+
+	encodedVal := key[len(recordPrefix):]
+	if encodedVal[0] < typeByte {
+		d = minDatum
+		return d
+	}
+
+	if encodedVal[0] > typeByte {
+		d.SetNull()
+		return d
+	}
+
+	if len(encodedVal) < 9 {
+		newVal := make([]byte, 9)
+		copy(newVal, encodedVal)
+		encodedVal = newVal
+	}
+
+	_, v, err := codec.DecodeOne(encodedVal)
+	intest.AssertNoError(err)
+	if err != nil {
+		// should never happen
+		terror.Log(errors.Annotatef(err, "TTL decode common handle failed, key: %s", hex.EncodeToString(key)))
+		return nullDatum()
+	}
+
+	if len(encodedVal) > 9 {
+		if (unsigned && v.GetUint64() == math.MaxUint64) || (!unsigned && v.GetInt64() == math.MaxInt64) {
+			d.SetNull()
+			return d
+		}
+
+		if unsigned {
+			v.SetUint64(v.GetUint64() + 1)
+		} else {
+			v.SetInt64(v.GetInt64() + 1)
+		}
+	}
+
+	return v
+}
+
+// GetNextBytesHandleDatum is used for a table with one binary or string column common handle.
+// It returns the minValue whose encoded key is or after argument `key`
+// If it cannot find a valid value, a null datum will be returned.
+func GetNextBytesHandleDatum(key kv.Key, recordPrefix []byte) (d types.Datum) {
+	if key.Cmp(recordPrefix) > 0 && !key.HasPrefix(recordPrefix) {
+		d.SetNull()
+		return d
+	}
+
+	if key.Cmp(recordPrefix) <= 0 {
+		d.SetBytes([]byte{})
+		return d
+	}
+
+	encodedVal := key[len(recordPrefix):]
+	if encodedVal[0] < commonHandleBytesByte {
+		d.SetBytes([]byte{})
+		return d
+	}
+
+	if encodedVal[0] > commonHandleBytesByte {
+		d.SetNull()
+		return d
+	}
+
+	if remain, v, err := codec.DecodeOne(encodedVal); err == nil {
+		if len(remain) > 0 {
+			v.SetBytes(kv.Key(v.GetBytes()).Next())
+		}
+		return v
+	}
+
+	encodedVal = encodedVal[1:]
+	brokenGroupEndIdx := len(encodedVal) - 1
+	brokenGroupEmptyBytes := len(encodedVal) % 9
+	for i := 7; i+1 < len(encodedVal); i += 9 {
+		if emptyBytes := 255 - int(encodedVal[i+1]); emptyBytes != 0 || i+1 == len(encodedVal)-1 {
+			brokenGroupEndIdx = i
+			brokenGroupEmptyBytes = emptyBytes
+			break
+		}
+	}
+
+	for range brokenGroupEmptyBytes {
+		if encodedVal[brokenGroupEndIdx] > 0 {
+			break
+		}
+		brokenGroupEndIdx--
+	}
+
+	if brokenGroupEndIdx < 0 {
+		d.SetBytes(nil)
+		return d
+	}
+
+	val := make([]byte, 0, len(encodedVal))
+	for i := 0; i <= brokenGroupEndIdx; i++ {
+		if i%9 == 8 {
+			continue
+		}
+		val = append(val, encodedVal[i])
+	}
+	d.SetBytes(val)
+	return d
+}
+
+// TTLIndexScanPlan describes the SQL result and pagination order for a TTL index scan.
+type TTLIndexScanPlan struct {
+	Index            *model.IndexInfo
+	ScanColumns      []*model.ColumnInfo
+	ScanColumnTypes  []*types.FieldType
+	OrderColumns     []*model.ColumnInfo
+	KeyColumnOffsets []int
+}
+
+// OrderKey extracts the pagination values from a scan result row.
+func (p *TTLIndexScanPlan) OrderKey(row []types.Datum) []types.Datum {
+	return row[:len(p.OrderColumns)]
+}
+
+// TableKey extracts the table key from a scan result row.
+func (p *TTLIndexScanPlan) TableKey(row []types.Datum) []types.Datum {
+	key := make([]types.Datum, len(p.KeyColumnOffsets))
+	for i, offset := range p.KeyColumnOffsets {
+		key[i] = row[offset]
+	}
+	return key
+}
+
+func (p *TTLIndexScanPlan) containsFullTableKey() bool {
+	for _, offset := range p.KeyColumnOffsets {
+		if offset >= len(p.Index.Columns) {
+			return false
+		}
+	}
+	return true
+}
+
+// FindTTLIndex finds an index that can scan in its physical index order.
+// Returns nil if no suitable index exists.
+func (t *PhysicalTable) FindTTLIndex() *model.IndexInfo {
+	if t.TimeColumn == nil {
+		return nil
+	}
+	var best *TTLIndexScanPlan
+	for _, idx := range t.Indices {
+		plan, err := t.BuildTTLIndexScanPlan(idx)
+		if err == nil && (best == nil || ttlIndexScanPlanLess(plan, best)) {
+			best = plan
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	return best.Index
+}
+
+func ttlIndexScanPlanLess(lhs, rhs *TTLIndexScanPlan) bool {
+	priority := func(plan *TTLIndexScanPlan) int {
+		if len(plan.Index.Columns) == 1 {
+			return 0
+		}
+		if plan.containsFullTableKey() {
+			return 1
+		}
+		return 2
+	}
+	if lhsPriority, rhsPriority := priority(lhs), priority(rhs); lhsPriority != rhsPriority {
+		return lhsPriority < rhsPriority
+	}
+	if len(lhs.OrderColumns) != len(rhs.OrderColumns) {
+		return len(lhs.OrderColumns) < len(rhs.OrderColumns)
+	}
+	return len(lhs.ScanColumns) < len(rhs.ScanColumns)
+}
+
+// BuildTTLIndexScanPlan validates an index and derives its scan and pagination columns.
+//
+// TTL index scan must be able to page by a strict cursor in the same order as the
+// physical index scan. The generated ORDER BY has to be fully satisfied by the
+// index order; otherwise every page may need an extra TopN/Sort and repeatedly
+// re-scan rows that were already seen by previous pages.
+func (t *PhysicalTable) BuildTTLIndexScanPlan(idx *model.IndexInfo) (*TTLIndexScanPlan, error) {
+	if t.TimeColumn == nil || idx == nil {
+		return nil, errors.New("TTL time column and index are required")
+	}
+	if idx.Primary && t.HasClusteredIndex() {
+		// A clustered primary key is the table path itself, not a separate index
+		// keyspace that SplitIndexScanRanges can split. Keep it on the existing PK
+		// scan path, which already splits and paginates by the clustered key order.
+		//
+		// For PKIsHandle tables the integer primary key normally does not appear in
+		// TableInfo.Indices at all. A common-handle primary key does appear there,
+		// so this check explicitly rejects it. A nonclustered primary key has its
+		// own index KV and HasClusteredIndex returns false, allowing it to use the
+		// same index-scan path as an ordinary unique secondary index.
+		return nil, errors.Errorf("clustered primary index %s uses the table scan path", idx.Name)
+	}
+	if idx.State != model.StatePublic || idx.Invisible || idx.Global || idx.MVIndex ||
+		idx.IsColumnarIndex() || idx.ConditionExprString != "" || len(idx.Columns) == 0 {
+		// TTL needs one local public physical-index order that can be scanned
+		// directly. Global/MV/columnar/conditional indexes either use a different
+		// access path, add extra predicate semantics, or do not provide that single
+		// local physical order.
+		return nil, errors.Errorf("index %s is not a supported TTL scan index", idx.Name)
+	}
+	if idx.Columns[0].Name.L != t.TimeColumn.Name.L {
+		return nil, errors.Errorf("TTL column %s is not the first index column", t.TimeColumn.Name)
+	}
+
+	indexColumns := make([]*model.ColumnInfo, len(idx.Columns))
+	for i, idxCol := range idx.Columns {
+		if idxCol.Offset < 0 || idxCol.Offset >= len(t.Columns) || idxCol.Length != types.UnspecifiedLength {
+			// Prefix indexes are ordered by the stored prefix, while TTL cursor
+			// predicates compare full column values. Using such an index could
+			// skip or revisit rows whose full values share the same prefix.
+			return nil, errors.Errorf("index column %s cannot be used as a full TTL pagination column", idxCol.Name)
+		}
+		col := t.Columns[idxCol.Offset]
+		if col == nil || col.Hidden {
+			// Hidden columns cannot be referenced by the generated pagination SQL.
+			return nil, errors.Errorf("index column %s is not a visible table column", idxCol.Name)
+		}
+		indexColumns[i] = col
+	}
+	if idx.Unique {
+		for _, col := range indexColumns[1:] {
+			if !mysql.HasNotNullFlag(col.GetFlag()) {
+				// A unique index with nullable non-TTL columns is not unique for
+				// pagination: SQL allows multiple rows where those columns are
+				// NULL. The TTL column itself is safe because the expiration
+				// predicate excludes NULL TTL values.
+				return nil, errors.Errorf("unique index %s has nullable non-TTL column %s", idx.Name, col.Name)
+			}
+		}
+	}
+
+	keyColumnOffsets := make([]int, len(t.KeyColumns))
+	keyColumnsInIndex := 0
+	for i, keyCol := range t.KeyColumns {
+		keyColumnOffsets[i] = -1
+		for j, idxCol := range indexColumns {
+			if idxCol.ID == keyCol.ID {
+				keyColumnOffsets[i] = j
+				keyColumnsInIndex++
+				break
+			}
+		}
+	}
+	containsFullKey := keyColumnsInIndex == len(t.KeyColumns)
+	containsPartialKey := keyColumnsInIndex > 0 && !containsFullKey
+
+	orderColumns := append([]*model.ColumnInfo(nil), indexColumns...)
+	if !idx.Unique && !containsFullKey {
+		if containsPartialKey || !t.canUseHandleInTTLIndexOrder() {
+			// Non-unique secondary-index rows are ordered by declared index
+			// columns plus an implicit table-key suffix. TTL can page by that
+			// suffix only when it can append the full table key to ORDER BY and
+			// the planner can match it to the physical suffix. If the index has
+			// only part of the table key, the current cursor layout cannot
+			// express the remaining hidden suffix without changing the order.
+			return nil, errors.Errorf("index %s cannot seek by its physical table-key suffix", idx.Name)
+		}
+		orderColumns = append(orderColumns, t.KeyColumns...)
+	}
+	for _, col := range orderColumns {
+		switch col.GetType() {
+		case mysql.TypeSet:
+			// SET is physically ordered by its bitmask, but the planner cannot
+			// currently turn SET cursor comparisons into index ranges. Selecting
+			// such an index would repeatedly scan the preceding index prefix.
+			return nil, errors.Errorf("index %s requires unsupported SET pagination column %s", idx.Name, col.Name)
+		case mysql.TypeFloat, mysql.TypeDouble:
+			// Floating-point SQL literals cannot always reproduce the exact
+			// physical value returned by a scan. They are therefore unsafe as a
+			// strict pagination frontier.
+			return nil, errors.Errorf("index %s requires unsupported floating-point pagination column %s", idx.Name, col.Name)
+		}
+	}
+
+	// Keep both the declared index key and the pagination key as prefixes of
+	// every result row. Append only table-key columns missing from the index.
+	scanColumns := append([]*model.ColumnInfo(nil), indexColumns...)
+	for i, col := range t.KeyColumns {
+		if keyColumnOffsets[i] < 0 {
+			keyColumnOffsets[i] = len(scanColumns)
+			scanColumns = append(scanColumns, col)
+		}
+	}
+
+	scanColumnTypes := make([]*types.FieldType, len(scanColumns))
+	for i, col := range scanColumns {
+		scanColumnTypes[i] = &col.FieldType
+	}
+	return &TTLIndexScanPlan{
+		Index:            idx,
+		ScanColumns:      scanColumns,
+		ScanColumnTypes:  scanColumnTypes,
+		OrderColumns:     orderColumns,
+		KeyColumnOffsets: keyColumnOffsets,
+	}, nil
+}
+
+func (t *PhysicalTable) canUseHandleInTTLIndexOrder() bool {
+	if t.PKIsHandle {
+		// For int-handle tables, the hidden suffix follows signed handle order.
+		// Unsigned integer primary-key values can have a different SQL order, so
+		// do not rely on the hidden suffix for pagination.
+		return len(t.KeyColumns) == 1 && !mysql.HasUnsignedFlag(t.KeyColumns[0].GetFlag())
+	}
+	if !t.IsCommonHandle {
+		// The hidden _tidb_rowid suffix is an internal signed integer, and the
+		// planner can use it to satisfy ORDER BY _tidb_rowid.
+		return true
+	}
+	if t.commonHandleHasPrefixColumn() {
+		// A prefix common-handle column stores only the indexed prefix in the key,
+		// but TTL would need the full handle value for a stable cursor.
+		return false
+	}
+	if t.CommonHandleVersion != 0 || !collate.NewCollationEnabled() {
+		return true
+	}
+	for _, col := range t.KeyColumns {
+		if col.FieldType.EvalType() == types.ETString && !mysql.HasBinaryFlag(col.GetFlag()) {
+			// This matches the planner restriction for v0 common handles with new
+			// collations: non-binary string handle values are stored as sort-key
+			// bytes in the index, not original values, so SQL collation order
+			// cannot be safely matched to the hidden suffix.
+			return false
+		}
+	}
+	return true
+}
+
+func (t *PhysicalTable) commonHandleHasPrefixColumn() bool {
+	if !t.IsCommonHandle {
+		return false
+	}
+	primaryIdx := tables.FindPrimaryIndex(t.TableInfo)
+	if primaryIdx == nil {
+		return true
+	}
+	for _, idxCol := range primaryIdx.Columns {
+		if idxCol.Length == types.UnspecifiedLength {
+			continue
+		}
+		if idxCol.Offset < 0 || idxCol.Offset >= len(t.Columns) {
+			return true
+		}
+		col := t.Columns[idxCol.Offset]
+		if col == nil {
+			return true
+		}
+		if flen := col.GetFlen(); flen == types.UnspecifiedLength || idxCol.Length < flen {
+			return true
+		}
+	}
+	return false
+}
+
+// SplitIndexScanRanges splits index-scan ranges by the selected index's region distribution.
+// Each returned range is a [start, end) interval over the TTL column.
+func (t *PhysicalTable) SplitIndexScanRanges(ctx context.Context, store kv.Storage, idx *model.IndexInfo,
+	expireTime time.Time, loc *time.Location, splitCnt int) ([]ScanRange, error) {
+	if t.TimeColumn == nil || idx == nil || splitCnt <= 1 {
+		return []ScanRange{newFullRange()}, nil
+	}
+
+	tikvStore, ok := store.(tikv.Storage)
+	if !ok {
+		return []ScanRange{newFullRange()}, nil
+	}
+
+	indexPrefix := tablecodec.EncodeIndexSeekKey(t.ID, idx.ID, nil)
+	encodedMinNotNull, err := codec.EncodeKey(loc, nil, types.MinNotNullDatum())
+	if err != nil {
+		return nil, err
+	}
+	startKey := tablecodec.EncodeIndexSeekKey(t.ID, idx.ID, encodedMinNotNull)
+
+	ft := t.TimeColumn.FieldType
+	expireDatum := types.NewTimeDatum(types.NewTime(types.FromGoTime(expireTime), ft.GetType(), ft.GetDecimal()))
+	encodedExpire, err := codec.EncodeKey(loc, nil, expireDatum)
+	if err != nil {
+		return nil, err
+	}
+	endKey := tablecodec.EncodeIndexSeekKey(t.ID, idx.ID, encodedExpire)
+	if endKey.Cmp(startKey) <= 0 {
+		return []ScanRange{newFullRange()}, nil
+	}
+	keyRanges, err := t.splitRawKeyRanges(ctx, tikvStore, startKey, endKey, splitCnt)
+	if err != nil {
+		return nil, err
+	}
+	if len(keyRanges) <= 1 {
+		return []ScanRange{newFullRange()}, nil
+	}
+
+	scanRanges, err := scanRangesFromRawKeyRanges(keyRanges, func(endKey kv.Key) (types.Datum, bool, error) {
+		return timeDatumAtOrBeforeIndexBoundary(endKey, indexPrefix, &t.TimeColumn.FieldType, loc)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(scanRanges) == 0 {
+		return []ScanRange{newFullRange()}, nil
+	}
+	return scanRanges, nil
+}
+
+// timeDatumAtOrBeforeIndexBoundary maps an arbitrary Region boundary to a
+// temporal datum that can be used as a SQL scan boundary.
+//
+// A Region boundary is an arbitrary byte string. It may end in the middle of
+// the leading temporal datum and therefore cannot be decoded with codec.CutOne.
+// Like the primary-key split helpers above, this function maps such bytes to a
+// nearby representable SQL value instead of dropping the split. It uses the
+// greatest temporal value whose complete encoding is no greater than the Region
+// boundary. For example, if a DATETIME(0) boundary is a truncated prefix of the
+// encoding of 2025-01-01 00:00:00, the result is the last valid second whose
+// complete encoding sorts before that prefix.
+//
+// Using an approximate datum is safe because it is only used to divide the
+// complete SQL scan into adjacent [start, end) ranges. It does not need to be an
+// existing row value or exactly match the physical Region boundary. When no
+// non-zero valid temporal value exists at or before the boundary (for example,
+// the boundary contains only MinNotNull or the temporal type flag), skip is true
+// so scanRangesFromRawKeyRanges merges it into the following range. Persisting a
+// zero DATE/DATETIME/TIMESTAMP as a real SQL bound is unsafe because the default
+// SQL mode treats zero temporal values as invalid.
+func timeDatumAtOrBeforeIndexBoundary(
+	boundary, indexPrefix kv.Key,
+	ft *types.FieldType,
+	loc *time.Location,
+) (types.Datum, bool, error) {
+	tp := ft.GetType()
+	fsp := ft.GetDecimal()
+	if fsp == types.UnspecifiedFsp {
+		fsp = types.DefaultFsp
+	}
+	if fsp < types.MinFsp || fsp > types.MaxFsp {
+		return nullDatum(), false, errors.Errorf("invalid temporal FSP: %d", fsp)
+	}
+	if tp != mysql.TypeDate && tp != mysql.TypeDatetime && tp != mysql.TypeTimestamp {
+		return nullDatum(), false, errors.Errorf("unsupported temporal type: %d", tp)
+	}
+
+	stepMicros := int64(1)
+	for i := fsp; i < types.MaxFsp; i++ {
+		stepMicros *= 10
+	}
+	minTime := time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxTime := time.Date(9999, 12, 31, 23, 59, 59, int(1_000_000-stepMicros)*1000, time.UTC)
+	if tp == mysql.TypeDate {
+		stepMicros = int64(24 * time.Hour / time.Microsecond)
+		maxTime = time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)
+	} else if tp == mysql.TypeTimestamp {
+		minTime = time.Date(1970, 1, 1, 0, 0, 1, 0, time.UTC)
+		maxTime = time.Date(2038, 1, 19, 3, 14, 7, int(1_000_000-stepMicros)*1000, time.UTC)
+	}
+	minMicros, maxMicros := minTime.UnixMicro(), maxTime.UnixMicro()
+
+	makeDatum := func(micros int64) types.Datum {
+		goTime := time.UnixMicro(micros).UTC()
+		return types.NewTimeDatum(types.NewTime(types.FromGoTime(goTime), tp, fsp))
+	}
+	encodeDatum := func(d types.Datum) (kv.Key, error) {
+		// makeDatum constructs TIMESTAMP candidates in UTC. Encode them in UTC
+		// as well so the binary search follows the physical index order and is
+		// independent of daylight-saving transitions in loc.
+		encodeLoc := loc
+		if tp == mysql.TypeTimestamp {
+			encodeLoc = time.UTC
+		}
+		encoded, err := codec.EncodeKey(encodeLoc, nil, d)
+		if err != nil {
+			return nil, err
+		}
+		key := make(kv.Key, 0, len(indexPrefix)+len(encoded))
+		key = append(key, indexPrefix...)
+		return append(key, encoded...), nil
+	}
+
+	zeroDatum := types.NewTimeDatum(types.NewTime(types.ZeroCoreTime, tp, fsp))
+	zeroKey, err := encodeDatum(zeroDatum)
+	if err != nil {
+		return nullDatum(), false, err
+	}
+	if boundary.Cmp(zeroKey) <= 0 {
+		return nullDatum(), true, nil
+	}
+
+	// Binary-search all valid values at the column's FSP. Even DATETIME(6)
+	// needs fewer than 60 iterations, and this runs only while creating TTL
+	// subtasks after the Region lookup.
+	low, high := int64(0), (maxMicros-minMicros)/stepMicros
+	best := int64(-1)
+	for low <= high {
+		mid := low + (high-low)/2
+		candidate := makeDatum(minMicros + mid*stepMicros)
+		key, err := encodeDatum(candidate)
+		if err != nil {
+			return nullDatum(), false, err
+		}
+		if key.Cmp(boundary) <= 0 {
+			best = mid
+			low = mid + 1
+		} else {
+			high = mid - 1
+		}
+	}
+	if best < 0 {
+		return nullDatum(), true, nil
+	}
+
+	result := makeDatum(minMicros + best*stepMicros)
+	if tp == mysql.TypeTimestamp && loc != nil && loc != time.UTC {
+		tm := result.GetMysqlTime()
+		if err := tm.ConvertTimeZone(time.UTC, loc); err != nil {
+			return nullDatum(), false, err
+		}
+		result.SetMysqlTime(tm)
+	}
+	return result, false, nil
+}
+
+func scanRangesFromRawKeyRanges(
+	keyRanges []kv.KeyRange,
+	decodeEnd func(kv.Key) (types.Datum, bool, error),
+) ([]ScanRange, error) {
+	scanRanges := make([]ScanRange, 0, len(keyRanges))
+	curScanStart := nullDatum()
+	for i, keyRange := range keyRanges {
+		curScanEnd := nullDatum()
+		if i != len(keyRanges)-1 {
+			var skip bool
+			var err error
+			curScanEnd, skip, err = decodeEnd(keyRange.EndKey)
+			if err != nil {
+				return nil, err
+			}
+			if skip {
+				continue
+			}
+		}
+
+		if !curScanStart.IsNull() && !curScanEnd.IsNull() {
+			// Region boundaries can map to approximate datum boundaries. Skip
+			// non-incremental ranges rather than producing empty scan tasks.
+			cmp, err := curScanStart.Compare(types.StrictContext, &curScanEnd, collate.GetBinaryCollator())
+			intest.AssertNoError(err)
+			if err != nil {
+				return nil, err
+			}
+
+			if cmp >= 0 {
+				continue
+			}
+		}
+
+		scanRanges = append(scanRanges, newDatumRange(curScanStart, curScanEnd))
+		if curScanEnd.IsNull() {
+			break
+		}
+		curScanStart = curScanEnd
+	}
+	return scanRanges, nil
+}
+
+// GetASCIIPrefixDatumFromBytes is used to convert bytes to string datum which only contains ASCII prefix string.
+// The ASCII prefix string only contains visible characters and `\t`, `\n`, `\r`.
+// "abc" -> "abc"
+// "\0abc" -> ""
+// "ab\x01c" -> "ab"
+// "ab\xffc" -> "ab"
+// "ab\rc\xff" -> "ab\rc"
+func GetASCIIPrefixDatumFromBytes(bs []byte) types.Datum {
+	for i, c := range bs {
+		if c >= 0x20 && c <= 0x7E {
+			// visible characters from ` ` to `~`
+			continue
+		}
+
+		if c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+
+		bs = bs[:i]
+		break
+	}
+	return types.NewStringDatum(string(bs))
+}

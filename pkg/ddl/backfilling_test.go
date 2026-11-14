@@ -1,0 +1,928 @@
+// Copyright 2022 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ddl
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math"
+	"testing"
+	"time"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/ddl/copr"
+	"github.com/pingcap/tidb/pkg/ddl/ingest"
+	distsqlctx "github.com/pingcap/tidb/pkg/distsql/context"
+	"github.com/pingcap/tidb/pkg/dxf/framework/taskexecutor/execute"
+	"github.com/pingcap/tidb/pkg/dxf/operator"
+	"github.com/pingcap/tidb/pkg/errctx"
+	"github.com/pingcap/tidb/pkg/expression"
+	"github.com/pingcap/tidb/pkg/expression/exprstatic"
+	"github.com/pingcap/tidb/pkg/ingestor/errdef"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/resourcemanager/pool/workerpool"
+	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/table"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/collate"
+	contextutil "github.com/pingcap/tidb/pkg/util/context"
+	"github.com/pingcap/tidb/pkg/util/dbterror"
+	"github.com/pingcap/tidb/pkg/util/deeptest"
+	"github.com/pingcap/tidb/pkg/util/mock"
+	"github.com/pingcap/tidb/pkg/util/timeutil"
+	"github.com/stretchr/testify/require"
+	pderr "github.com/tikv/pd/client/errs"
+	"go.uber.org/atomic"
+)
+
+func TestDoneTaskKeeper(t *testing.T) {
+	n := newDoneTaskKeeper(kv.Key("a"))
+	n.updateNextKey(0, kv.Key("b"))
+	n.updateNextKey(1, kv.Key("c"))
+	require.True(t, bytes.Equal(n.nextKey, kv.Key("c")))
+	require.Len(t, n.doneTaskNextKey, 0)
+
+	n.updateNextKey(4, kv.Key("f"))
+	require.True(t, bytes.Equal(n.nextKey, kv.Key("c")))
+	require.Len(t, n.doneTaskNextKey, 1)
+	n.updateNextKey(3, kv.Key("e"))
+	n.updateNextKey(5, kv.Key("g"))
+	require.True(t, bytes.Equal(n.nextKey, kv.Key("c")))
+	require.Len(t, n.doneTaskNextKey, 3)
+	n.updateNextKey(2, kv.Key("d"))
+	require.True(t, bytes.Equal(n.nextKey, kv.Key("g")))
+	require.Len(t, n.doneTaskNextKey, 0)
+
+	n.updateNextKey(6, kv.Key("h"))
+	require.True(t, bytes.Equal(n.nextKey, kv.Key("h")))
+}
+
+func TestBackfillRetryableErrors(t *testing.T) {
+	t.Run("index info not found is non-retryable for executor", func(t *testing.T) {
+		err := errors.Annotatef(errIndexInfoNotFound, "index info not found: %d", 1)
+		require.True(t, isIndexInfoNotFoundErr(err))
+		require.False(t, (&backfillDistExecutor{}).IsRetryableError(err))
+	})
+
+	t.Run("too many data files is non-retryable for scheduler", func(t *testing.T) {
+		err := fmt.Errorf(
+			"generate merge-sort plan failed: %w",
+			errdef.ErrTooManyDataFiles.GenWithStackByArgs(1000, 1, 250),
+		)
+		sch := &LitBackfillScheduler{}
+		require.False(t, sch.IsRetryableErr(err))
+		require.True(t, sch.IsRetryableErr(errors.New("temporary scheduler error")))
+	})
+
+	t.Run("local-sort disk probe errors are retryable", func(t *testing.T) {
+		err := errors.New("mock local sort disk probe failed")
+		require.True(t, (&backfillDistExecutor{}).IsRetryableError(err))
+	})
+
+	t.Run("confirmed insufficient local-sort disk is not retryable", func(t *testing.T) {
+		err := dbterror.ErrIngestCheckEnvFailed.FastGenByArgs("mock insufficient local sort disk space")
+		require.False(t, (&backfillDistExecutor{}).IsRetryableError(err))
+	})
+
+	t.Run("PD TSO stream errors are retryable", func(t *testing.T) {
+		errs := []error{
+			pderr.ErrClientCreateTSOStream.FastGenByArgs(pderr.RetryTimeoutErr),
+			pderr.ErrClientTSOStreamClosed.GenWithStackByArgs(),
+		}
+		for _, err := range errs {
+			require.True(t, isRetryableError(err, false))
+			require.True(t, isRetryableError(errors.Annotate(err, "wrapped"), false))
+			require.True(t, (&backfillDistExecutor{}).IsRetryableError(err))
+
+			// The local ingest path checks for duplicate keys before classifying
+			// the reorg error. PD errors must retain their identity across it.
+			convertedErr := ingest.TryConvertToKeyExistsErr(err, &model.IndexInfo{}, &model.TableInfo{})
+			require.ErrorIs(t, convertedErr, err)
+			require.True(t, isRetryableJobError(convertedErr, 0))
+			require.False(t, isRetryableJobError(convertedErr, vardef.GetDDLErrorCountLimit()-1))
+		}
+	})
+
+	t.Run("unrelated PD errors are not made retryable", func(t *testing.T) {
+		err := pderr.ErrClientProtoUnmarshal.FastGenByArgs("invalid response")
+		require.False(t, isRetryableError(err, false))
+	})
+}
+
+func TestBuildIndexConditionCheckerUsesFixedCollation(t *testing.T) {
+	origin := collate.NewCollationEnabled()
+	collate.SetNewCollationEnabledForTest(true)
+	defer collate.SetNewCollationEnabledForTest(origin)
+
+	originBuildSimpleExpr := expression.BuildSimpleExpr
+	defer func() {
+		expression.BuildSimpleExpr = originBuildSimpleExpr
+	}()
+	expression.BuildSimpleExpr = func(ctx expression.BuildContext, _ ast.ExprNode, opts ...expression.BuildOption) (expression.Expression, error) {
+		var options expression.BuildOptions
+		for _, opt := range opts {
+			opt(&options)
+		}
+		if options.InputSchema == nil {
+			return expression.NewOne(), nil
+		}
+		constantTp := types.NewFieldTypeWithCollation(mysql.TypeVarchar, "utf8mb4_general_ci", 16)
+		return expression.NewFunction(
+			ctx,
+			ast.EQ,
+			types.NewFieldType(mysql.TypeTiny),
+			options.InputSchema.Columns[0],
+			&expression.Constant{Value: types.NewDatum("A"), RetType: constantTp},
+		)
+	}
+
+	colTp := types.NewFieldTypeWithCollation(mysql.TypeVarchar, "utf8mb4_general_ci", 16)
+	colInfo := &model.ColumnInfo{
+		ID:        1,
+		Offset:    0,
+		Name:      ast.NewCIStr("c0"),
+		FieldType: *colTp,
+		State:     model.StatePublic,
+	}
+	idxInfo := &model.IndexInfo{
+		ID:                  1,
+		Name:                ast.NewCIStr("idx"),
+		Columns:             []*model.IndexColumn{{Name: colInfo.Name, Offset: colInfo.Offset}},
+		State:               model.StatePublic,
+		ConditionExprString: "c0 = 'A'",
+	}
+	tblInfo := &model.TableInfo{
+		Name:    ast.NewCIStr("t"),
+		Columns: []*model.ColumnInfo{colInfo},
+		Indices: []*model.IndexInfo{idxInfo},
+	}
+
+	sctx := mock.NewContext()
+	exprCtx := sctx.ExprContext.IntoStatic()
+	copCtx, err := copr.NewCopContextSingleIndex(
+		exprCtx.Apply(exprstatic.WithNewCollationEnabled(false)),
+		sctx.GetSessionVars().StmtCtx.PushDownFlags(),
+		tblInfo,
+		idxInfo,
+		"",
+	)
+	require.NoError(t, err)
+	checker, err := buildIndexConditionChecker(copCtx, tblInfo, idxInfo)
+	require.NoError(t, err)
+	matched, err := checker(chunk.MutRowFromValues("a").ToRow())
+	require.NoError(t, err)
+	require.False(t, matched)
+
+	copCtx, err = copr.NewCopContextSingleIndex(
+		exprCtx.Apply(exprstatic.WithNewCollationEnabled(true)),
+		sctx.GetSessionVars().StmtCtx.PushDownFlags(),
+		tblInfo,
+		idxInfo,
+		"",
+	)
+	require.NoError(t, err)
+	checker, err = buildIndexConditionChecker(copCtx, tblInfo, idxInfo)
+	require.NoError(t, err)
+	matched, err = checker(chunk.MutRowFromValues("a").ToRow())
+	require.NoError(t, err)
+	require.True(t, matched)
+}
+
+func TestPickBackfillType(t *testing.T) {
+	ingest.LitDiskRoot = ingest.NewDiskRootImpl(t.TempDir())
+	ingest.LitMemRoot = ingest.NewMemRootImpl(math.MaxInt64)
+	mockJob := &model.Job{
+		ID: 1,
+		ReorgMeta: &model.DDLReorgMeta{
+			ReorgTp: model.ReorgTypeTxn,
+		},
+	}
+	mockJob.ReorgMeta.IsFastReorg = true
+	tp, err := pickBackfillType(mockJob)
+	require.NoError(t, err)
+	require.Equal(t, tp, model.ReorgTypeTxn)
+
+	mockJob.ReorgMeta.ReorgTp = model.ReorgTypeNone
+	ingest.LitInitialized = false
+	tp, err = pickBackfillType(mockJob)
+	require.NoError(t, err)
+	require.Equal(t, tp, model.ReorgTypeTxnMerge)
+
+	mockJob.ReorgMeta.ReorgTp = model.ReorgTypeNone
+	ingest.LitInitialized = true
+	tp, err = pickBackfillType(mockJob)
+	require.NoError(t, err)
+	require.Equal(t, tp, model.ReorgTypeIngest)
+	ingest.LitInitialized = false
+
+	t.Run("cloud storage skips local disk precheck", func(t *testing.T) {
+		oldLitInitialized := ingest.LitInitialized
+		oldLitDiskRoot := ingest.LitDiskRoot
+		oldCloudStorageURI := vardef.CloudStorageURI.Load()
+		t.Cleanup(func() {
+			ingest.LitInitialized = oldLitInitialized
+			ingest.LitDiskRoot = oldLitDiskRoot
+			vardef.CloudStorageURI.Store(oldCloudStorageURI)
+		})
+
+		ingest.LitInitialized = true
+		ingest.LitDiskRoot = ingest.NewDiskRootImpl(t.TempDir())
+		testfailpoint.Enable(t, "github.com/pingcap/tidb/pkg/ddl/ingest/mockIngestCheckEnvFailed", "return(true)")
+		vardef.CloudStorageURI.Store("s3://bucket")
+
+		job := &model.Job{
+			ID: 2,
+			ReorgMeta: &model.DDLReorgMeta{
+				IsFastReorg: true,
+				IsDistReorg: true,
+			},
+		}
+		w := &worker{
+			workCtx: context.Background(),
+			ddlCtx:  &ddlCtx{},
+		}
+
+		err := initForReorgIndexes(w, job, []*model.IndexInfo{{}})
+		require.NoError(t, err)
+		require.True(t, job.ReorgMeta.UseCloudStorage)
+		require.Equal(t, model.ReorgTypeIngest, job.ReorgMeta.ReorgTp)
+	})
+}
+
+func TestInitForReorgIndexesRequiresGlobalSort(t *testing.T) {
+	if !kerneltype.IsNextGen() {
+		t.Skip("global sort is only enforced on the NextGen kernel")
+	}
+
+	oldCloudStorageURI := vardef.CloudStorageURI.Load()
+	oldLitInitialized := ingest.LitInitialized
+	t.Cleanup(func() {
+		vardef.CloudStorageURI.Store(oldCloudStorageURI)
+		ingest.LitInitialized = oldLitInitialized
+	})
+
+	newJob := func(isFastReorg bool) *model.Job {
+		return &model.Job{
+			ID: 1,
+			ReorgMeta: &model.DDLReorgMeta{
+				IsFastReorg: isFastReorg,
+				IsDistReorg: isFastReorg,
+			},
+		}
+	}
+	w := &worker{workCtx: context.Background(), ddlCtx: &ddlCtx{}}
+
+	// Without the lightning/ingest env the backfill falls back to txn-merge,
+	// which does not sort locally, so the job is allowed even without cloud
+	// storage.
+	ingest.LitInitialized = false
+	vardef.CloudStorageURI.Store("")
+	require.NoError(t, initForReorgIndexes(w, newJob(true), []*model.IndexInfo{{}}))
+
+	// local sort is rejected on NextGen when the ingest environment is available.
+	ingest.LitInitialized = true
+	err := initForReorgIndexes(w, newJob(true), []*model.IndexInfo{{}})
+	require.ErrorIs(t, err, dbterror.ErrNotSupportedYet)
+	require.ErrorContains(t, err, "add index or modify column with local sort")
+
+	// jobs without fast reorg don't sort locally, so they are still allowed
+	require.NoError(t, initForReorgIndexes(w, newJob(false), []*model.IndexInfo{{}}))
+
+	// global sort is allowed
+	vardef.CloudStorageURI.Store("s3://bucket")
+	require.NoError(t, initForReorgIndexes(w, newJob(true), []*model.IndexInfo{{}}))
+}
+
+func assertStaticExprContextEqual(t *testing.T, sctx sessionctx.Context, exprCtx *exprstatic.ExprContext, warnHandler contextutil.WarnHandler) {
+	exprCtxManualCheckFields := []struct {
+		field string
+		check func(*exprstatic.ExprContext)
+	}{
+		{
+			field: "evalCtx",
+			check: func(ctx *exprstatic.ExprContext) {
+				require.NotZero(t, ctx.GetEvalCtx().CtxID())
+				require.NotEqual(t, sctx.GetExprCtx().GetEvalCtx().CtxID(), ctx.GetEvalCtx().CtxID())
+			},
+		},
+		{
+			field: "blockEncryptionMode",
+			check: func(context *exprstatic.ExprContext) {
+				m := sctx.GetExprCtx().GetBlockEncryptionMode()
+				if m == "" {
+					// Empty string is not a valid encryption mode, so we expect the exprCtx.GetBlockEncryptionMode()
+					// to return a default value "aes-128-ecb" at this time.
+					// For some old codes, empty string can still work because it is not used in DDL.
+					m = "aes-128-ecb"
+				}
+				require.Equal(t, m, context.GetBlockEncryptionMode())
+			},
+		},
+		{
+			field: "rng",
+			check: func(ctx *exprstatic.ExprContext) {
+				require.NotNil(t, ctx.Rng())
+			},
+		},
+		{
+			field: "planCacheTracker",
+			check: func(ctx *exprstatic.ExprContext) {
+				require.Equal(t, sctx.GetExprCtx().IsUseCache(), ctx.IsUseCache())
+				ctx.SetSkipPlanCache("test reason")
+				require.False(t, ctx.IsUseCache())
+			},
+		},
+	}
+
+	evalCtxManualCheckFields := []struct {
+		field string
+		check func(*exprstatic.EvalContext)
+	}{
+		{
+			field: "warnHandler",
+			check: func(ctx *exprstatic.EvalContext) {
+				require.Same(t, warnHandler, ctx.GetWarnHandler())
+			},
+		},
+		{
+			field: "typeCtx.warnHandler",
+			check: func(ctx *exprstatic.EvalContext) {
+				ec := ctx.ErrCtx()
+				require.Equal(t, errctx.NewContextWithLevels(ec.LevelMap(), ctx), ec)
+			},
+		},
+		{
+			field: "typeCtx.loc",
+			check: func(ctx *exprstatic.EvalContext) {
+				tc := ctx.TypeCtx()
+				require.Same(t, tc.Location(), ctx.Location())
+				require.Equal(t, sctx.GetSessionVars().Location().String(), tc.Location().String())
+				require.Equal(t, sctx.GetSessionVars().StmtCtx.TimeZone().String(), tc.Location().String())
+			},
+		},
+		{
+			field: "errCtx.warnHandler",
+			check: func(ctx *exprstatic.EvalContext) {
+				tc := ctx.TypeCtx()
+				require.Equal(t, types.NewContext(tc.Flags(), tc.Location(), ctx), tc)
+			},
+		},
+		{
+			field: "currentTime",
+			check: func(ctx *exprstatic.EvalContext) {
+				tm1, err := sctx.GetExprCtx().GetEvalCtx().CurrentTime()
+				require.NoError(t, err)
+
+				tm, err := ctx.CurrentTime()
+				require.Equal(t, ctx.Location().String(), tm.Location().String())
+				require.InDelta(t, tm1.Unix(), tm.Unix(), 2)
+				require.NoError(t, err)
+			},
+		},
+	}
+
+	// check ExprContext except EvalContext
+	expected := sctx.GetExprCtx().(*mock.Context).IntoStatic()
+	ignoreFields := make([]string, 0, len(exprCtxManualCheckFields))
+	for _, f := range exprCtxManualCheckFields {
+		f.check(exprCtx)
+		ignoreFields = append(ignoreFields, "$.exprCtxState."+f.field)
+	}
+	ignoreFields = append(ignoreFields, "$.exprCtxState.newCollationEnabled")
+	deeptest.AssertDeepClonedEqual(t, expected, exprCtx, deeptest.WithIgnorePath(ignoreFields))
+
+	// check EvalContext
+	ignoreFields = make([]string, 0, len(evalCtxManualCheckFields))
+	ignoreFields = append(ignoreFields, "$.id")
+	for _, f := range evalCtxManualCheckFields {
+		f.check(exprCtx.GetStaticEvalCtx())
+		ignoreFields = append(ignoreFields, "$.evalCtxState."+f.field)
+	}
+	deeptest.AssertDeepClonedEqual(
+		t,
+		expected.GetStaticEvalCtx(),
+		exprCtx.GetStaticEvalCtx(),
+		deeptest.WithIgnorePath(ignoreFields),
+	)
+}
+
+// newMockReorgSessCtx creates a mock session context for reorg test.
+// In old implementations, DDL is using `mock.Context` to construct the contexts used in DDL reorg.
+// After refactoring, we just need it to do test the new implementation is compatible with the old one.
+func newMockReorgSessCtx(store kv.Storage) sessionctx.Context {
+	c := mock.NewContext()
+	c.Store = store
+	c.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, false)
+	tz := *time.UTC
+	c.ResetSessionAndStmtTimeZone(&tz)
+	return c
+}
+
+// TestReorgExprContext is used in refactor stage to make sure the newReorgExprCtx() is
+// compatible with newMockReorgSessCtx(nil).GetExprCtx() to make it safe to replace `mock.Context` usage.
+// After refactor, the TestReorgExprContext can be removed.
+func TestReorgExprContext(t *testing.T) {
+	origin := collate.NewCollationEnabled()
+	collate.SetNewCollationEnabledForTest(true)
+	defer collate.SetNewCollationEnabledForTest(origin)
+
+	// test default expr context
+	store := &mockStorage{client: &mock.Client{}}
+	sctx := newMockReorgSessCtx(store)
+	defaultCtx := newReorgExprCtx()
+	// should use an empty static warn handler by default
+	evalCtx := defaultCtx.GetStaticEvalCtx()
+	require.Equal(t, contextutil.NewStaticWarnHandler(0), evalCtx.GetWarnHandler())
+	assertStaticExprContextEqual(t, sctx, defaultCtx, evalCtx.GetWarnHandler())
+	defaultTypeCtx := evalCtx.TypeCtx()
+	defaultErrCtx := evalCtx.ErrCtx()
+
+	oldCollation := false
+	newCollation := true
+
+	// test expr context from DDLReorgMeta
+	for _, testCase := range []struct {
+		reorg                 model.DDLReorgMeta
+		expectedUseNewCollate bool
+	}{
+		{
+			reorg: model.DDLReorgMeta{
+				SQLMode:           mysql.ModeStrictTransTables | mysql.ModeAllowInvalidDates,
+				Location:          &model.TimeZoneLocation{Name: "Asia/Tokyo"},
+				ReorgTp:           model.ReorgTypeIngest,
+				ResourceGroupName: "rg1",
+				UseNewCollate:     &oldCollation,
+			},
+			expectedUseNewCollate: false,
+		},
+		{
+			reorg: model.DDLReorgMeta{
+				SQLMode: mysql.ModeAllowInvalidDates,
+				// should load location from system value when reorg.Location is nil
+				Location:          nil,
+				ReorgTp:           model.ReorgTypeTxnMerge,
+				ResourceGroupName: "rg2",
+				UseNewCollate:     &newCollation,
+			},
+			expectedUseNewCollate: true,
+		},
+		{
+			reorg: model.DDLReorgMeta{
+				SQLMode:           mysql.ModeAllowInvalidDates,
+				Location:          nil,
+				ReorgTp:           model.ReorgTypeTxnMerge,
+				ResourceGroupName: "rg3",
+			},
+			expectedUseNewCollate: true,
+		},
+	} {
+		reorg := testCase.reorg
+		sctx = newMockReorgSessCtx(store)
+		require.NoError(t, initSessCtx(sctx, &reorg))
+		ctx, err := newReorgExprCtxWithReorgMeta(&reorg, sctx.GetSessionVars().StmtCtx.WarnHandler)
+		require.NoError(t, err)
+		require.Equal(t, testCase.expectedUseNewCollate, ctx.NewCollationEnabled())
+		assertStaticExprContextEqual(t, sctx, ctx, ctx.GetStaticEvalCtx().GetWarnHandler())
+		evalCtx := ctx.GetEvalCtx()
+		tc, ec := evalCtx.TypeCtx(), evalCtx.ErrCtx()
+		// SQLMode should match DDLReorgMeta
+		require.Equal(t, reorg.SQLMode, evalCtx.SQLMode())
+		// Location should match DDLReorgMeta
+		if reorg.Location != nil {
+			require.Equal(t, reorg.Location.Name, evalCtx.Location().String())
+		} else {
+			loc := timeutil.SystemLocation()
+			require.Same(t, loc, evalCtx.Location())
+		}
+		// Some fields should be different from the default context to make the test robust.
+		require.NotEqual(t, defaultCtx.GetEvalCtx().SQLMode(), evalCtx.SQLMode())
+		require.NotEqual(t, defaultTypeCtx.Flags(), tc.Flags())
+		require.NotEqual(t, defaultErrCtx.LevelMap(), ec.LevelMap())
+	}
+}
+
+func TestReorgTableMutateContext(t *testing.T) {
+	originalRowFmt := vardef.GetDDLReorgRowFormat()
+	defer vardef.SetDDLReorgRowFormat(originalRowFmt)
+
+	exprCtx := exprstatic.NewExprContext()
+
+	assertTblCtxMatchSessionCtx := func(ctx table.MutateContext, sctx sessionctx.Context) {
+		sctxTblCtx := sctx.GetTableCtx()
+		require.Equal(t, uint64(0), ctx.ConnectionID())
+		require.Equal(t, sctxTblCtx.ConnectionID(), ctx.ConnectionID())
+
+		require.False(t, ctx.InRestrictedSQL())
+		require.Equal(t, sctxTblCtx.InRestrictedSQL(), ctx.InRestrictedSQL())
+
+		require.Equal(t, variable.AssertionLevelOff, ctx.TxnAssertionLevel())
+		require.Equal(t, sctxTblCtx.TxnAssertionLevel(), ctx.TxnAssertionLevel())
+
+		require.Equal(t, vardef.GetDDLReorgRowFormat() != vardef.DefTiDBRowFormatV1, ctx.GetRowEncodingConfig().IsRowLevelChecksumEnabled)
+		require.Equal(t, vardef.GetDDLReorgRowFormat() != vardef.DefTiDBRowFormatV1, ctx.GetRowEncodingConfig().RowEncoder.Enable)
+		require.Equal(t, sctxTblCtx.GetRowEncodingConfig(), ctx.GetRowEncodingConfig())
+
+		require.NotNil(t, ctx.GetMutateBuffers())
+		require.Equal(t, sctxTblCtx.GetMutateBuffers(), ctx.GetMutateBuffers())
+
+		require.Equal(t, vardef.DefTiDBShardAllocateStep, ctx.GetRowIDShardGenerator().GetShardStep())
+		sctx.GetSessionVars().TxnCtx.StartTS = 123 // make sure GetRowIDShardGenerator() pass assert
+		require.Equal(t, sctxTblCtx.GetRowIDShardGenerator().GetShardStep(), ctx.GetRowIDShardGenerator().GetShardStep())
+		require.GreaterOrEqual(t, ctx.GetRowIDShardGenerator().GetCurrentShard(1), int64(0))
+
+		alloc1, ok := sctxTblCtx.GetReservedRowIDAlloc()
+		require.True(t, ok)
+		alloc2, ok := ctx.GetReservedRowIDAlloc()
+		require.True(t, ok)
+		require.Equal(t, alloc1, alloc2)
+		require.True(t, alloc2.Exhausted())
+
+		statistics, ok := ctx.GetStatisticsSupport()
+		require.False(t, ok)
+		require.Nil(t, statistics)
+		cached, ok := ctx.GetCachedTableSupport()
+		require.False(t, ok)
+		require.Nil(t, cached)
+		temp, ok := ctx.GetTemporaryTableSupport()
+		require.False(t, ok)
+		require.Nil(t, temp)
+		dml, ok := ctx.GetExchangePartitionDMLSupport()
+		require.False(t, ok)
+		require.Nil(t, dml)
+	}
+
+	// test when the row format is v1
+	vardef.SetDDLReorgRowFormat(vardef.DefTiDBRowFormatV1)
+	sctx := newMockReorgSessCtx(&mockStorage{client: &mock.Client{}})
+	require.NoError(t, initSessCtx(sctx, &model.DDLReorgMeta{}))
+	ctx := newReorgTableMutateContext(exprCtx)
+	require.Same(t, exprCtx, ctx.GetExprCtx())
+	assertTblCtxMatchSessionCtx(ctx, sctx)
+}
+
+type mockStorage struct {
+	kv.Storage
+	client kv.Client
+}
+
+func (s *mockStorage) GetClient() kv.Client {
+	return s.client
+}
+
+func assertDistSQLCtxEqual(t *testing.T, expected *distsqlctx.DistSQLContext, actual *distsqlctx.DistSQLContext) {
+	deeptest.AssertDeepClonedEqual(
+		t, expected, actual,
+		deeptest.WithPointerComparePath([]string{
+			"$.WarnHandler",
+			"$.Client",
+		}),
+		deeptest.WithIgnorePath([]string{
+			"$.SessionMemTracker",
+			"$.Location",
+			"$.ErrCtx.warnHandler",
+		}),
+	)
+
+	// manually check
+	// SessionMemTracker
+	require.Equal(t, expected.SessionMemTracker.Label(), actual.SessionMemTracker.Label())
+	require.Equal(t, expected.SessionMemTracker.GetBytesLimit(), actual.SessionMemTracker.GetBytesLimit())
+	require.Equal(t, expected.SessionMemTracker.BytesConsumed(), actual.SessionMemTracker.BytesConsumed())
+	// Location
+	require.Equal(t, expected.Location.String(), actual.Location.String())
+	// ErrCtx
+	require.Equal(t, errctx.NewContextWithLevels(expected.ErrCtx.LevelMap(), expected.WarnHandler), actual.ErrCtx)
+}
+
+func TestReorgDistSQLCtxNotFillCache(t *testing.T) {
+	// Reorg coprocessor scans are single-pass bulk reads and must not pollute the TiKV
+	// block cache, so NotFillCache is always set on the reorg DistSQLContext.
+	ctx := newDefaultReorgDistSQLCtx(&mock.Client{}, contextutil.NewStaticWarnHandler(0))
+	require.True(t, ctx.NotFillCache)
+
+	withMeta, err := newReorgDistSQLCtxWithReorgMeta(&mock.Client{}, &model.DDLReorgMeta{}, contextutil.NewStaticWarnHandler(0))
+	require.NoError(t, err)
+	require.True(t, withMeta.NotFillCache)
+}
+
+func TestValidateAndFillRanges(t *testing.T) {
+	mkRange := func(start, end string) kv.KeyRange {
+		return kv.KeyRange{StartKey: []byte(start), EndKey: []byte(end)}
+	}
+	ranges := []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "d"),
+		mkRange("d", "e"),
+	}
+	err := validateAndFillRanges(ranges, []byte("b"), []byte("e"))
+	require.NoError(t, err)
+	require.EqualValues(t, []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "d"),
+		mkRange("d", "e"),
+	}, ranges)
+
+	// adjust first and last range.
+	ranges = []kv.KeyRange{
+		mkRange("a", "c"),
+		mkRange("c", "e"),
+		mkRange("e", "g"),
+	}
+	err = validateAndFillRanges(ranges, []byte("b"), []byte("f"))
+	require.NoError(t, err)
+	require.EqualValues(t, []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "e"),
+		mkRange("e", "f"),
+	}, ranges)
+
+	// first range startKey and last range endKey are empty.
+	ranges = []kv.KeyRange{
+		mkRange("", "c"),
+		mkRange("c", "e"),
+		mkRange("e", ""),
+	}
+	err = validateAndFillRanges(ranges, []byte("b"), []byte("f"))
+	require.NoError(t, err)
+	require.EqualValues(t, []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "e"),
+		mkRange("e", "f"),
+	}, ranges)
+	ranges = []kv.KeyRange{
+		mkRange("", "c"),
+		mkRange("c", ""),
+	}
+	err = validateAndFillRanges(ranges, []byte("b"), []byte("f"))
+	require.NoError(t, err)
+	require.EqualValues(t, []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "f"),
+	}, ranges)
+
+	// invalid range.
+	ranges = []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", ""),
+		mkRange("e", "f"),
+	}
+	err = validateAndFillRanges(ranges, []byte("b"), []byte("f"))
+	require.Error(t, err)
+
+	ranges = []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "d"),
+		mkRange("e", "f"),
+	}
+	err = validateAndFillRanges(ranges, []byte("b"), []byte("f"))
+	require.Error(t, err)
+
+	ranges = []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "d"),
+		mkRange("d", "e"),
+	}
+	err = validateAndFillRanges(ranges, []byte("a"), []byte("e"))
+	require.Error(t, err)
+
+	ranges = []kv.KeyRange{
+		mkRange("b", "c"),
+		mkRange("c", "d"),
+		mkRange("d", "e"),
+	}
+	err = validateAndFillRanges(ranges, []byte("b"), []byte("f"))
+	require.NoError(t, err)
+}
+
+func TestTuneTableScanWorkerBatchSize(t *testing.T) {
+	reorgMeta := &model.DDLReorgMeta{}
+	reorgMeta.Concurrency.Store(4)
+	reorgMeta.BatchSize.Store(32)
+	copCtx := &copr.CopContextSingleIndex{
+		CopContextBase: &copr.CopContextBase{
+			FieldTypes: []*types.FieldType{},
+		},
+	}
+	wctx := workerpool.NewContext(context.Background())
+	w := tableScanWorker{
+		copCtx:        copCtx,
+		ctx:           wctx,
+		srcChkPool:    createChunkPool(copCtx, reorgMeta),
+		hintBatchSize: 32,
+		reorgMeta:     reorgMeta,
+	}
+	for range 10 {
+		chk := w.getChunk()
+		require.Equal(t, 32, chk.Capacity())
+		w.srcChkPool.Put(chk)
+	}
+	reorgMeta.SetBatchSize(64)
+	for range 10 {
+		chk := w.getChunk()
+		require.Equal(t, 64, chk.Capacity())
+		w.srcChkPool.Put(chk)
+	}
+	wctx.Cancel()
+}
+
+func TestSplitRangesByKeys(t *testing.T) {
+	k := func(ord int) kv.Key {
+		return kv.Key([]byte{byte(ord)})
+	}
+	tests := []struct {
+		name      string
+		ranges    []kv.KeyRange
+		splitKeys []kv.Key
+		expected  []kv.KeyRange
+	}{
+		{
+			name: "empty split keys",
+			ranges: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+			splitKeys: []kv.Key{},
+			expected: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+		},
+		{
+			name: "single split key in middle",
+			ranges: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+			splitKeys: []kv.Key{k(5)},
+			expected: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(5)},
+				{StartKey: k(5), EndKey: k(10)},
+			},
+		},
+		{
+			name: "multiple split keys in one range",
+			ranges: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(20)},
+			},
+			splitKeys: []kv.Key{k(5), k(10), k(15)},
+			expected: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(5)},
+				{StartKey: k(5), EndKey: k(10)},
+				{StartKey: k(10), EndKey: k(15)},
+				{StartKey: k(15), EndKey: k(20)},
+			},
+		},
+		{
+			name: "split keys across multiple ranges",
+			ranges: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+				{StartKey: k(10), EndKey: k(20)},
+			},
+			splitKeys: []kv.Key{k(5), k(15)},
+			expected: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(5)},
+				{StartKey: k(5), EndKey: k(10)},
+				{StartKey: k(10), EndKey: k(15)},
+				{StartKey: k(15), EndKey: k(20)},
+			},
+		},
+		{
+			name: "split key less than range start",
+			ranges: []kv.KeyRange{
+				{StartKey: k(5), EndKey: k(10)},
+			},
+			splitKeys: []kv.Key{k(3)},
+			expected: []kv.KeyRange{
+				{StartKey: k(5), EndKey: k(10)},
+			},
+		},
+		{
+			name: "split key greater than range end",
+			ranges: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+			splitKeys: []kv.Key{k(15)},
+			expected: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+		},
+		{
+			name: "split key equals range start",
+			ranges: []kv.KeyRange{
+				{StartKey: k(5), EndKey: k(10)},
+			},
+			splitKeys: []kv.Key{k(5)},
+			expected: []kv.KeyRange{
+				{StartKey: k(5), EndKey: k(10)},
+			},
+		},
+		{
+			name: "split key equals range end",
+			ranges: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+			splitKeys: []kv.Key{k(10)},
+			expected: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+		},
+		{
+			name: "split keys overlaps with range start and end",
+			ranges: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(10)},
+			},
+			splitKeys: []kv.Key{k(0), k(5), k(10)},
+			expected: []kv.KeyRange{
+				{StartKey: k(0), EndKey: k(5)},
+				{StartKey: k(5), EndKey: k(10)},
+			},
+		},
+	}
+	for _, tt := range tests {
+		result := splitRangesByKeys(tt.ranges, tt.splitKeys)
+		require.EqualValues(t, len(tt.expected), len(result), "keys mismatch", tt.name)
+	}
+}
+
+func TestMergeTempIndexResultSinkReportsWrittenBytes(t *testing.T) {
+	wctx := workerpool.NewContext(context.Background())
+	defer wctx.Cancel()
+
+	src := operator.NewSimpleDataChannel(make(chan tempIdxResult, 2))
+	src.Channel() <- tempIdxResult{addCount: 2, writtenBytes: 120}
+	src.Channel() <- tempIdxResult{addCount: 3, writtenBytes: 80}
+	close(src.Channel())
+
+	collector := &mergeTempIndexCollector{}
+	sink := newTempIndexResultSink(wctx, nil, collector)
+	sink.SetSource(src)
+	require.NoError(t, sink.Open())
+	require.NoError(t, sink.Close())
+
+	require.Equal(t, 5, collector.addCount)
+	require.Equal(t, int64(200), collector.writtenBytes)
+}
+
+type ingestCountingBackendCtx struct {
+	ingest.BackendCtx
+	ingestCalls atomic.Int32
+}
+
+func (b *ingestCountingBackendCtx) Ingest(context.Context) error {
+	b.ingestCalls.Inc()
+	return nil
+}
+
+func (*ingestCountingBackendCtx) TotalKeyCount() int {
+	return 0
+}
+
+func TestIndexWriteResultSinkCloseAfterCancel(t *testing.T) {
+	// When the context is canceled and the source channel is closed before the
+	// sink selects, both cases are ready and Go picks one at random, so repeat.
+	for range 50 {
+		wctx := workerpool.NewContext(context.Background())
+		bc := &ingestCountingBackendCtx{}
+		sink := newIndexWriteResultSink(wctx, bc, nil, nil, &execute.TestCollector{})
+		src := operator.NewSimpleDataChannel(make(chan IndexWriteResult))
+		sink.SetSource(src)
+		wctx.Cancel()
+		close(src.Channel())
+
+		require.NoError(t, sink.Open())
+		require.ErrorIs(t, sink.Close(), context.Canceled)
+		require.Zero(t, bc.ingestCalls.Load())
+	}
+}
+
+func TestIndexWriteResultSinkFlushesOnSourceFinish(t *testing.T) {
+	wctx := workerpool.NewContext(context.Background())
+	defer wctx.Cancel()
+	bc := &ingestCountingBackendCtx{}
+	sink := newIndexWriteResultSink(wctx, bc, nil, nil, &execute.TestCollector{})
+	src := operator.NewSimpleDataChannel(make(chan IndexWriteResult))
+	sink.SetSource(src)
+	close(src.Channel())
+
+	require.NoError(t, sink.Open())
+	require.NoError(t, sink.Close())
+	require.Equal(t, int32(1), bc.ingestCalls.Load())
+}

@@ -2,7 +2,32 @@
 
 `TiDBIP` is the ip of the TiDB server. `10080` is the default status port, and you can edit it in tidb.toml when starting the TiDB server.
 
-1. Get the current status of TiDB, including the connections, version and git_hash
+## Diagnostic mode availability
+
+When TiDB starts with `--diagnostic-mode` and `status.report-status` is enabled,
+the status listener exposes only the following GET endpoints:
+
+| Endpoint | Purpose and parameters | Example |
+| --- | --- | --- |
+| `/status` | Local readiness, connection count, version and statistics initialization status. No parameters. | `curl http://127.0.0.1:10080/status` |
+| `/metrics` | Local Prometheus metrics. No parameters. | `curl http://127.0.0.1:10080/metrics` |
+| `/debug/pprof/` | Index of available local runtime profiles. | `curl http://127.0.0.1:10080/debug/pprof/` |
+| `/debug/pprof/cmdline` | Process command line. No parameters. | `curl http://127.0.0.1:10080/debug/pprof/cmdline` |
+| `/debug/pprof/profile` | CPU profile; optional `seconds` controls collection duration. | `curl -o cpu.pprof 'http://127.0.0.1:10080/debug/pprof/profile?seconds=5'` |
+| `/debug/pprof/symbol` | Resolve program counters supplied in the query string. GET only. | `curl http://127.0.0.1:10080/debug/pprof/symbol` |
+| `/debug/pprof/trace` | Runtime trace; optional `seconds` controls collection duration. | `curl -o trace.out 'http://127.0.0.1:10080/debug/pprof/trace?seconds=1'` |
+| `/debug/pprof/{profile}` | Named runtime profile, such as `goroutine` or `heap`; optional `debug` selects text output. | `curl 'http://127.0.0.1:10080/debug/pprof/goroutine?debug=1'` |
+
+Other management endpoints described below, including `/info` and `/settings`,
+are unavailable in this mode and return HTTP 404. The diagnostic listener does
+not serve gRPC/MPP services. Requests using unsupported methods are rejected.
+Cluster TLS and certificate verification settings also apply to this listener;
+TLS advertises HTTP/1.1 only. Disabling `status.report-status` disables the
+listener entirely. Normal-mode HTTP API availability is unchanged.
+
+## HTTP endpoints
+
+1. Get the current status of TiDB, including the connections, version, and `git_hash`.
 
     ```shell
     curl http://{TiDBIP}:10080/status
@@ -13,17 +38,24 @@
     {
         "connections": 0,
         "git_hash": "f572e33854e1c0f942f031e9656d0004f99995c6",
-        "version": "5.7.25-TiDB-v2.1.0-rc.3-355-gf572e3385-dirty"
+        "version": "5.7.25-TiDB-v2.1.0-rc.3-355-gf572e3385-dirty",
+        "status":{
+          "init_stats_percentage":100
+        }
     }
     ```
 
-1. Get all metrics of TiDB
+2. Get all metrics of TiDB
 
     ```shell
     curl http://{TiDBIP}:10080/metrics
     ```
 
-1. Get the metadata of all regions
+    In Starter deployment mode, every exported metric includes a `keyspace_id` label, including Go runtime and process metrics. Starter obtains the ID from the initialized storage codec; metric registration does not query PD for the ID. Its value is an empty string until storage initialization provides an ID, or when no keyspace is configured. Existing per-metric keyspace IDs are preserved. Starter metrics sent to Pushgateway include the same label, although pushes before storage initialization use an empty value. Classic, Premium, and Premium Reserved retain their existing metric labels. Standalone BR is outside this Starter-specific change: it retains its existing constant labels, and its Go/process and other collectors are not automatically given `keyspace_id`.
+
+3. Get the metadata of all regions
+
+    If PD cannot find a requested region, TiDB returns an error containing its decimal ID, such as `region not found for regionID 123`.
 
     ```shell
     curl http://{TiDBIP}:10080/regions/meta
@@ -52,7 +84,7 @@
     ]
     ```
 
-1. Get the table/index of hot regions
+4. Get the table/index of hot regions
 
     ```shell
     curl http://{TiDBIP}:10080/regions/hot
@@ -77,7 +109,7 @@
     }
     ```
 
-1. Get the information of a specific region by ID
+5. Get the information of a specific region by ID
 
     ```shell
     curl http://{TiDBIP}:10080/regions/{regionID}
@@ -100,7 +132,7 @@
     }
     ```
 
-1. Get regions Information from db.table
+6. Get regions Information from db.table
 
     ```shell
     curl http://{TiDBIP}:10080/tables/{db}/{table}/regions
@@ -134,7 +166,7 @@
     }
     ```
 
-1. Get schema Information about all db
+7. Get schema Information about all db
 
     ```shell
     curl http://{TiDBIP}:10080/schema
@@ -159,374 +191,1180 @@
     ]
     ```
 
-1. Get schema Information about db
+8. Get schema Information about db
 
     ```shell
     curl http://{TiDBIP}:10080/schema/{db}
     ```
 
-1. Get schema Information about db.table, and you can get schema info by tableID (tableID is the **unique** identifier of table in TiDB)
+    ```shell
+    curl http://{TiDBIP}:10080/schema/{db}?id_name_only=true
+    [
+    {
+     "id": 119,
+     "name": {
+      "O": "t1",
+      "L": "t1"
+     }
+    },
+    {
+     "id": 125,
+     "name": {
+      "O": "t2",
+      "L": "t2"
+     }
+    }
+    ]
+    ```
+
+9. Get schema Information about db.table, and you can get schema info by tableID (tableID is the **unique** identifier of table in TiDB)
 
     ```shell
     curl http://{TiDBIP}:10080/schema/{db}/{table}
 
     curl http://{TiDBIP}:10080/schema?table_id={tableID}
+
+    curl http://{TiDBIP}:10080/schema?table_ids={tableID,...}
     ```
 
-1. Get database information, table information and tidb info schema version by tableID.
+10. Get database information, table information and tidb info schema version by tableID.
+
+     ```shell
+     curl http://{TiDBIP}:10080/db-table/{tableID}
+     ```
+
+11. Get MVCC Information of the key with a specified handle ID
+
+     ```shell
+     curl http://{TiDBIP}:10080/mvcc/key/{db}/{table}/{handle}
+     ```
+
+     ```shell
+     $curl http://127.0.0.1:10080/mvcc/key/test/t/1
+     {
+         "key": "74800000000000006E5F728000000000000001",
+         "region_id": 4,
+         "value": {
+             "info": {
+                 "writes": [
+                     {
+                         "start_ts": 448662063415296001,
+                         "commit_ts": 448662063415296003,
+                         "short_value": "gAABAAAAAQEAAQ=="
+                     }
+                 ]
+             }
+         }
+     }
+     ```
+
+     If the handle is clustered, specify the primary key column values in the query string
+
+     ```shell
+     $curl "http://{TiDBIP}:10080/mvcc/key/{db}/{table}?${c1}={v1}&${c2}=${v2}"
+     ```
+
+     ```shell
+     $curl "http://127.0.0.1:10080/mvcc/key/test/t?a=aaa&b=2020-01-01"
+     {
+         "key": "7480000000000000365F72016161610000000000FA0419A5420000000000",
+         "region_id": 52,
+         "value": {
+             "info": {
+                 "writes": [
+                     {
+                         "type": 1,
+                         "start_ts": 423158426542538752,
+                         "commit_ts": 423158426543587328
+                     },
+                     {
+                         "start_ts": 423158426542538752,
+                         "commit_ts": 423158426543587328,
+                         "short_value": "gAACAAAAAQMDAAQAYWFhZA=="
+                     }
+                 ],
+                 "values": [
+                     {
+                         "start_ts": 423158426542538752,
+                         "value": "gAACAAAAAQMDAAQAYWFhZA=="
+                     }
+                 ]
+             }
+         }
+     }
+     ```
+
+     *Hint: The meaning of the MVCC operation type:*
+
+     ```protobuf
+     enum Op {
+         Put = 0;
+         Del = 1;
+         Lock = 2;
+         Rollback = 3;
+         // insert operation has a constraint that key should not exist before.
+         Insert = 4;
+         PessimisticLock = 5;
+         CheckNotExists = 6;
+     }
+     ```
+
+     *Hint: On a partitioned table, use the `table(partition)` pattern as the table name, `t1(p1)` for example:*
+
+     ```shell
+     $curl http://127.0.0.1:10080/mvcc/key/test/t1(p1)/1
+     ```
+
+     *Hint: The method to convert the Hex format key returned by TiDB API into the format recognized by [tikv-ctl](https://docs.pingcap.com/tidb/stable/tikv-control).*
+
+     Step 1: Get the hex format of the key you need. For example you could find the key by the following TiDB API.
+
+      ```shell
+         $curl http://127.0.0.1:10080/mvcc/key/test/t1/1
+         {
+         "key": "7480000000000008C65F728000000000000001",
+         "region_id": 10,
+         "value": {
+             "info": {
+                 "writes": [
+                     {
+                         "start_ts": 445971968923271174,
+                         "commit_ts": 445971968923271175,
+                         "short_value": "gAACAAAAAgMIAAkAc2hpcmx5YTQi"
+                     },
+                     {
+                         "start_ts": 445971959499980803,
+                         "commit_ts": 445971959499980804,
+                         "short_value": "gAACAAAAAgMIAAkAc2hpcmx5YTQL"
+                     }
+                 ]
+             }
+         }
+         }
+      ```
+
+      Step 2: Convert the key from hex format to escaped format with [tikv-ctl](https://docs.pingcap.com/tidb/stable/tikv-control)
+
+      ```shell
+       ./tikv-ctl --to-escaped '7480000000000008C65F728000000000000001'
+       t\200\000\000\000\000\000\010\306_r\200\000\000\000\000\000\000\001
+      ```
+
+      Step 3: Encode the key to make it memcomparable in tikv with [tikv-ctl](https://docs.pingcap.com/tidb/stable/tikv-control)
+
+      ```shell
+      ./tikv-ctl --encode 't\200\000\000\000\000\000\010\306_r\200\000\000\000\000\000\000\001'
+      7480000000000008FFC65F728000000000FF0000010000000000FA
+      ```
+
+      Step 4: Convert the key from hex format to escaped format again since most `tikv-ctl` commands only accept keys in escaped format while the `--encode` command outputs the key in hex format.
+
+      ```shell
+      ./tikv-ctl --to-escaped '7480000000000008FFC65F728000000000FF0000010000000000FA'
+      t\200\000\000\000\000\000\010\377\306_r\200\000\000\000\000\377\000\000\001\000\000\000\000\000\372
+      ```
+
+      Step 5: Add a prefix "z" to the key. Then the key can be recognized by [tikv-ctl](https://docs.pingcap.com/tidb/stable/tikv-control). For example, use the following command to scan from tikv.
+
+      ```shell
+      ./tikv-ctl  --host "<tikv_ip>:<port>" scan --from 'zt\200\000\000\000\000\000\010\377\306_r\200\000\000\000\000\377\000\000\001\000\000\000\000\000\372' --limit 5 --show-cf write,lock,default 
+         key: zt\200\000\000\000\000\000\010\377\306_r\200\000\000\000\000\377\000\000\001\000\000\000\000\000\372
+          write cf value: start_ts: 445971968923271174 commit_ts: 445971968923271175 short_value: 800002000000020308000900736869726C79613422
+          write cf value: start_ts: 445971959499980803 commit_ts: 445971959499980804 short_value: 800002000000020308000900736869726C7961340B
+
+         key: zt\200\000\000\000\000\000\010\377\306_r\200\000\000\000\000\377\000\000\002\000\000\000\000\000\372
+          write cf value: start_ts: 445971960836390913 commit_ts: 445971960836390914 short_value: 80000200000002030500060073686972340B
+
+         key: zt\200\000\377\377\377\377\377\377\373_r\200\000\000\000\000\377\000\000\003\000\000\000\000\000\372
+          write cf value: r_type: Del start_ts: 444068474890485761 commit_ts: 444068474890485762
+
+         key: zt\200\000\377\377\377\377\377\377\373_r\200\000\000\000\000\377\000\000\005\000\000\000\000\000\372
+          write cf value: r_type: Del start_ts: 444068474929545217 commit_ts: 444068474929545218
+
+         key: zt\200\000\377\377\377\377\377\377\373_r\200\000\000\000\000\377\000\000\007\000\000\000\000\000\372
+          write cf value: r_type: Del start_ts: 444068474981974017 commit_ts: 444068474981974018
+      ```
+
+12. Get MVCC Information of the first key in the table with a specified start ts
+
+     ```shell
+     curl http://{TiDBIP}:10080/mvcc/txn/{startTS}/{db}/{table}
+     ```
+
+     ```shell
+     $curl http://127.0.0.1:10080/mvcc/txn/405179368526053377/test/t1
+     {
+         "info": {
+             "writes": [
+                 {
+                     "commit_ts": 405179368526053380,
+                     "short_value": "CAICAkE=",
+                     "start_ts": 405179368526053377
+                 }
+             ]
+         },
+         "key": "dIAAAAAAAAEzX3KAAAAAAAAAAQ=="
+     }
+     ```
+
+13. Get MVCC Information by a hex value
+
+     ```shell
+     curl http://{TiDBIP}:10080/mvcc/hex/{hexKey}
+     ```
+
+14. Get MVCC Information of a specified index key, argument example: column_name_1=column_value_1&column_name_2=column_value2...
+
+     ```shell
+     curl "http://{TiDBIP}:10080/mvcc/index/{db}/{table}/{index}/{handle}?${c1}={v1}&${c2}=${v2}"
+     ```
+
+     *Hint: For the index column which column type is timezone dependent, e.g. `timestamp`, convert its value to UTC
+timezone.*
+
+     ```shell
+     $curl "http://127.0.0.1:10080/mvcc/index/test/t1/idx/1?a=A"
+     {
+         "info": {
+             "writes": [
+                 {
+                     "commit_ts": 405179523374252037,
+                     "short_value": "MA==",
+                     "start_ts": 405179523374252036
+                 }
+             ]
+         }
+     }
+     ```
+
+     *Hint: On a partitioned table, use the `table(partition)` pattern as the table name, `t1(p1)` for example:*
+
+     ```shell
+     $curl "http://127.0.0.1:10080/mvcc/index/test/t1(p1)/idx/1?a=A"
+     ```
+
+    If the handle is clustered, also specify the primary key column values in the query string
 
     ```shell
-    curl http://{TiDBIP}:10080/db-table/{tableID}
+    $curl "http://{TiDBIP}:10080/mvcc/index/{db}/{table}/{index}?${c1}={v1}&${c2}=${v2}"
     ```
 
-1. Get MVCC Information of the key with a specified handle ID
-
     ```shell
-    curl http://{TiDBIP}:10080/mvcc/key/{db}/{table}/{handle}
-    ```
-
-    ```shell
-    $curl http://127.0.0.1:10080/mvcc/key/test/t1/1
+    $curl "http://127.0.0.1:10080/mvcc/index/test/t/idx?a=1.1&b=111&c=1"
     {
-        "info": {
-            "writes": [
-                {
-                    "commit_ts": 405179368526053380,
-                    "short_value": "CAICAkE=",
-                    "start_ts": 405179368526053377
-                }
-            ]
-        }
-    }
-    ```
-
-    If the handle is clustered, specify the primary key column values in the query string
-
-    ```shell
-    $curl http://{TiDBIP}:10080/mvcc/key/{db}/{table}?${c1}={v1}&${c2}=${v2}
-    ```
-
-    ```shell
-    $curl http://127.0.0.1:10080/mvcc/key/test/t\?a\=aaa\&b\=2020-01-01
-    {
-        "key": "7480000000000000365F72016161610000000000FA0419A5420000000000",
-        "region_id": 52,
+        "key": "74800000000000003B5F69800000000000000203800000000000000105BFF199999999999A013131310000000000FA",
+        "region_id": 59,
         "value": {
             "info": {
                 "writes": [
                     {
-                        "start_ts": 423158426542538752,
-                        "commit_ts": 423158426543587328,
-                        "short_value": "gAACAAAAAQMDAAQAYWFhZA=="
+                        "start_ts": 424752858505150464,
+                        "commit_ts": 424752858506461184,
+                        "short_value": "AH0B"
                     }
                 ],
                 "values": [
                     {
-                        "start_ts": 423158426542538752,
-                        "value": "gAACAAAAAQMDAAQAYWFhZA=="
+                         "start_ts": 424752858505150464,
+                         "value": "AH0B"
                     }
                 ]
             }
         }
     }
-    ```
 
-1. Get MVCC Information of the first key in the table with a specified start ts
+15. Scatter regions of the specified table, add a `scatter-range` scheduler for the PD and the range is same as the table range.
+
+     ```shell
+     curl http://{TiDBIP}:10080/tables/{db}/{table}/scatter
+     ```
+
+     *Hint: On a partitioned table, use the `table(partition)` pattern as the table name, `test(p1)` for example.*
+
+     **Note**: The `scatter-range` scheduler may conflict with the global scheduler, do not use it for long periods on the larger table.
+
+16. Stop scatter the regions, disable the `scatter-range` scheduler for the specified table.
+
+     ```shell
+     curl http://{TiDBIP}:10080/tables/{db}/{table}/stop-scatter
+     ```
+
+     *Hint: On a partitioned table, use the `table(partition)` pattern as the table name, `test(p1)` for example.*
+
+17. Get TiDB server settings
+
+     ```shell
+     curl http://{TiDBIP}:10080/settings
+     ```
+
+18. Get TiDB server information.
+
+     ```shell
+     curl http://{TiDBIP}:10080/info
+     ```
+
+     ```shell
+     $curl http://127.0.0.1:10080/info
+     {
+         "ddl_id": "f7e73ed5-63b4-4cb4-ba7c-42b32dc74e77",
+         "git_hash": "f572e33854e1c0f942f031e9656d0004f99995c6",
+         "ip": "",
+         "is_owner": true,
+         "lease": "45s",
+         "listening_port": 4000,
+         "status_port": 10080,
+         "version": "5.7.25-TiDB-v2.1.0-rc.3-355-gf572e3385-dirty"
+     }
+     ```
+
+19. Get TiDB cluster all servers information.
+
+     ```shell
+     curl http://{TiDBIP}:10080/info/all
+     ```
+
+     ```shell
+     $curl http://127.0.0.1:10080/info/all
+     {
+         "servers_num": 2,
+         "owner_id": "29a65ec0-d931-4f9e-a212-338eaeffab96",
+         "is_all_server_version_consistent": true,
+         "all_servers_info": {
+             "29a65ec0-d931-4f9e-a212-338eaeffab96": {
+                 "version": "5.7.25-TiDB-v4.0.0-alpha-669-g8f2a09a52-dirty",
+                 "git_hash": "8f2a09a52fdcaf9d9bfd775d2c6023f363dc121e",
+                 "ddl_id": "29a65ec0-d931-4f9e-a212-338eaeffab96",
+                 "ip": "",
+                 "listening_port": 4000,
+                 "status_port": 10080,
+                 "lease": "45s",
+                 "binlog_status": "Off"
+             },
+             "cd13c9eb-c3ee-4887-af9b-e64f3162d92c": {
+                 "version": "5.7.25-TiDB-v4.0.0-alpha-669-g8f2a09a52-dirty",
+                 "git_hash": "8f2a09a52fdcaf9d9bfd775d2c6023f363dc121e",
+                 "ddl_id": "cd13c9eb-c3ee-4887-af9b-e64f3162d92c",
+                 "ip": "",
+                 "listening_port": 4001,
+                 "status_port": 10081,
+                 "lease": "45s",
+                 "binlog_status": "Off"
+             }
+         }
+     }
+     ```
+
+20. Enable/Disable TiDB server general log
+
+     ```shell
+     curl -X POST -d "tidb_general_log=1" http://{TiDBIP}:10080/settings
+     curl -X POST -d "tidb_general_log=0" http://{TiDBIP}:10080/settings
+     ```
+
+21. Change TiDB server log level
+
+     ```shell
+     curl -X POST -d "log_level=debug" http://{TiDBIP}:10080/settings
+     curl -X POST -d "log_level=info" http://{TiDBIP}:10080/settings
+     ```
+
+22. Change TiDB DDL slow log threshold
+
+     The unit is millisecond.
+
+     ```shell
+     curl -X POST -d "ddl_slow_threshold=300" http://{TiDBIP}:10080/settings
+     ```
+
+23. Get the column value by an encoded row and some information that can be obtained from a column of the table schema information. 
+
+     Argument example: rowBin=base64_encoded_row_value
+
+     ```shell
+     curl http://{TiDBIP}:10080/tables/{colID}/{colFlag}/{colLen}?rowBin={val}
+     ```
+
+     *Hint: For the column which field type is timezone dependent, e.g. `timestamp`, convert its value to UTC timezone.*
+
+24. Resign the ddl owner, let tidb start a new ddl owner election.
+
+     ```shell
+     curl -X POST http://{TiDBIP}:10080/ddl/owner/resign
+     ```
+
+    **Note**: If you request a TiDB that is not ddl owner, the response will be `This node is not a ddl owner, can't be resigned.`
+
+25. Get the TiDB DDL job history information.
+
+     ```shell
+     curl http://{TiDBIP}:10080/ddl/history
+     ```
+
+     **Note**: When the DDL history is very very long, system table may containing too many jobs. This interface will get a maximum of 2048 history ddl jobs by default. If you want get more jobs, consider adding `start_job_id` and `limit`.
+
+26. Get count {number} TiDB DDL job history information.
+
+     ```shell
+     curl http://{TiDBIP}:10080/ddl/history?limit={number}
+     ```
+
+27. Get count {number} TiDB DDL job history information, start with job {id}
+
+     ```shell
+     curl "http://{TIDBIP}:10080/ddl/history?start_job_id={id}&limit={number}"
+     ```
+
+28. Download TiDB debug info
+
+     ```shell
+     curl http://{TiDBIP}:10080/debug/zip?seconds=60 --output debug.zip
+     ```
+
+     zip file will include:
+
+     - Go heap pprof(after GC)
+     - Go cpu pprof(10s)
+     - Go mutex pprof
+     - Full goroutine
+     - TiDB config and version
+
+     Param:
+
+     - seconds: profile time(s), default is 10s. 
+
+29. Get statistics data of specified table.
+
+     ```shell
+     curl http://{TiDBIP}:10080/stats/dump/{db}/{table}
+     ```
+
+30. Download a plan replayer file.
+
+     ```shell
+     curl http://{TiDBIP}:10080/plan_replayer/dump/{filename} --output plan_replayer.zip
+     ```
+
+     Method: `GET`. `{filename}` is the file token that `PLAN REPLAYER DUMP` returns, or a `token` value in `mysql.plan_replayer_status`.
+
+     The response is the ZIP file. If this TiDB instance does not have the file, it requests the file from the other TiDB instances. If no instance has the file, the API returns HTTP 404.
+
+     TiDB returns the file as it is stored and does not add statistics to it. A `capture_replayer_*` file from an older TiDB version can have no statistics, if `tidb_enable_historical_stats_for_capture` was `ON` when TiDB captured it. TiDB writes a warning to its log for each request for a `capture_replayer_*` file.
+
+31. Resume the binlog writing when Pump is recovered.
+
+     ```shell
+     curl http://{TiDBIP}:10080/binlog/recover
+     ```
+
+     Return value:
+
+     - timeout, return status code: 400, message: `timeout`
+     - If it returns normally, status code: 200, message example:
+
+         ```text
+         {
+           "Skipped": false,
+           "SkippedCommitterCounter": 0
+         }
+         ```
+
+         `Skipped`: false indicates that the current binlog is not in the skipped state, otherwise, it is in the skipped state
+         `SkippedCommitterCounter`: Represents how many transactions are currently being committed in the skipped state. By default, the API will return after waiting until all skipped-binlog transactions are committed. If this value is greater than 0, it means that you need to wait until them are committed .
+
+     Param:
+
+     - op=nowait: return after binlog status is recoverd, do not wait until the skipped-binlog transactions are committed.
+     - op=reset: reset `SkippedCommitterCounter` to 0 to avoid the problem that `SkippedCommitterCounter` is not cleared due to some unusual cases.
+     - op=status: Get the current status of binlog recovery.
+
+32. Enable/disable async commit feature
+
+     ```shell
+     curl -X POST -d "tidb_enable_async_commit=1" http://{TiDBIP}:10080/settings
+     curl -X POST -d "tidb_enable_async_commit=0" http://{TiDBIP}:10080/settings
+     ```
+
+33. Enable/disable one-phase commit feature
+
+     ```shell
+     curl -X POST -d "tidb_enable_1pc=1" http://{TiDBIP}:10080/settings
+     curl -X POST -d "tidb_enable_1pc=0" http://{TiDBIP}:10080/settings
+     ```
+
+34. Enable/disable the mutation checker
+
+     ```shell
+     curl -X POST -d "tidb_enable_mutation_checker=1" http://{TiDBIP}:10080/settings
+     curl -X POST -d "tidb_enable_mutation_checker=0" http://{TiDBIP}:10080/settings
+     ```
+
+35. Get/Set the size of the Ballast Object
+
+     ```shell
+     # get current size of the ballast object
+     curl -v http://{TiDBIP}:10080/debug/ballast-object-sz
+     # reset the size of the ballast object (2GB in this example)
+     curl -v -X POST -d "2147483648" http://{TiDBIP}:10080/debug/ballast-object-sz
+     ```
+
+36. Set deadlock history table capacity
+
+     ```shell
+     curl -X POST -d "deadlock_history_capacity={number}" http://{TiDBIP}:10080/settings
+     ```
+
+37. Set whether deadlock history (`DEADLOCKS`) collect retryable deadlocks
+
+     ```shell
+     curl -X POST -d "deadlock_history_collect_retryable={bool_val}" http://{TiDBIP}:10080/settings
+     ```
+
+38. Set transaction_id to digest mapping minimum duration threshold, only transactions which last longer than this threshold will be collected into `TRX_SUMMARY`.
+
+     ```shell
+     curl -X POST -d "transaction_id_digest_min_duration={number}" http://{TiDBIP}:10080/settings
+     ```
+
+     Unit of duration here is ms.
+
+39. Set transaction summary table (`TRX_SUMMARY`) capacity
+
+     ```shell
+     curl -X POST -d "transaction_summary_capacity={number}" http://{TiDBIP}:10080/settings
+     ```
+
+40. The commands are used to handle smooth upgrade mode(refer to the [TiDB Smooth Upgrade](https://github.com/pingcap/docs/blob/4aa0b1d5078617cc06bd1957c5c93e86efb4668d/smooth-upgrade-tidb.md) for details) operations. We can send these upgrade operations to the cluster. The operations here include `start`, `finish` and `show`.
 
     ```shell
-    curl http://{TiDBIP}:10080/mvcc/txn/{startTS}/{db}/{table}
+    curl -X POST http://{TiDBIP}:10080/upgrade/{op}
     ```
 
     ```shell
-    $curl http://127.0.0.1:10080/mvcc/txn/405179368526053377/test/t1
-    {
-        "info": {
-            "writes": [
-                {
-                    "commit_ts": 405179368526053380,
-                    "short_value": "CAICAkE=",
-                    "start_ts": 405179368526053377
-                }
-            ]
-        },
-        "key": "dIAAAAAAAAEzX3KAAAAAAAAAAQ=="
-    }
+    $curl -X POST http://{TiDBIP}:10080/upgrade/start
+    "success!"
     ```
 
-1. Get MVCC Information by a hex value
+41. Set split & scatter regions concurrency before ingest, and ingest request concurrency. Value ranges:
+    - `max-batch-split-ranges`: `[1, 9223372036854775807]`, default `2048`
+    - `max-split-ranges-per-sec`: `[0, 9223372036854775807]`, default `0` (no limit)
+    - `max-ingest-per-sec`: `[0, 9223372036854775807]`, default `0` (no limit)
+    - `max-ingest-inflight`: `[0, 9223372036854775807]`, default `0` (no limit)
 
     ```shell
-    curl http://{TiDBIP}:10080/mvcc/hex/{hexKey}
+    curl http://{TiDBIP}:10080/ingest/max-batch-split-ranges
+    curl http://{TiDBIP}:10080/ingest/max-split-ranges-per-sec
+    curl http://{TiDBIP}:10080/ingest/max-ingest-per-sec
+    curl http://{TiDBIP}:10080/ingest/max-ingest-inflight
     ```
-
-1. Get MVCC Information of a specified index key, argument example: column_name_1=column_value_1&column_name_2=column_value2...
 
     ```shell
-    curl http://{TiDBIP}:10080/mvcc/index/{db}/{table}/{index}/{handle}?${c1}={v1}&${c2}=${v2}
+    curl http://{TiDBIP}:10080/ingest/max-batch-split-ranges -X POST -d "{\"value\": 1024}"
+    curl http://{TiDBIP}:10080/ingest/max-split-ranges-per-sec -X POST -d "{\"value\": 16}"
+    curl http://{TiDBIP}:10080/ingest/max-ingest-per-sec -X POST -d "{\"value\": 0.5}"
+    curl http://{TiDBIP}:10080/ingest/max-ingest-inflight -X POST -d "{\"value\": 2}"
     ```
 
-    *Hint: For the index column which column type is timezone dependent, e.g. `timestamp`, convert its value to UTC
-timezone.*
+42. Get TiDB transaction GC states:
 
-    ```shell
-    $curl http://127.0.0.1:10080/mvcc/index/test/t1/idx/1\?a\=A
-    {
-        "info": {
-            "writes": [
-                {
-                    "commit_ts": 405179523374252037,
-                    "short_value": "MA==",
-                    "start_ts": 405179523374252036
-                }
-            ]
-        }
-    }
-    ```
+     ```shell
+     curl http://{TiDBIP}:10080/txn-gc-states
+     ```
 
-    *Hint: On a partitioned table, use the `table(partition)` pattern as the table name, `test(p1)` for example:*
+43. Get the live TiFlash replica summary for this TiDB.
 
-    ```shell
-    $curl http://127.0.0.1:10080/mvcc/index/test(p1)/t1/idx/1\?a\=A
-    ```
+     Method: `GET` only. Counts **logical** tables that currently have `TiFlashReplica` metadata on this TiDB's InfoSchema. Dropped or truncated leftovers are not included.
 
-   If the handle is clustered, also specify the primary key column values in the query string
+     Optional query `reload` (default `false` when omitted): `false` uses the in-memory InfoSchema (cheap default). `true` will sync the schema first to reduce lease-lag under-counts TiFlash replica on non-DDL-owner nodes; invalid values return HTTP 400. Reload can be slow on a large schema. This is a **best-effort** snapshot for operators. Even with `reload=true`, a concurrent `SET TIFLASH REPLICA` after the read can invalidate the `table_count` and `can_disable`.
 
-   ```shell
-   $curl http://{TiDBIP}:10080/mvcc/index/{db}/{table}/{index}?${c1}={v1}&${c2}=${v2}
-   ```
+     Next-gen: the count is for the keyspace bound to this TiDB. Query a user-keyspace instance to inspect that logical cluster; a SYSTEM instance only reports SYSTEM.
 
-   ```shell
-   $curl http://127.0.0.1:10080/mvcc/index/test/t/idx\?a\=1.1\&b\=111\&c\=1
+     ```shell
+     curl http://{TiDBIP}:10080/tiflash/replica
+     curl 'http://{TiDBIP}:10080/tiflash/replica?reload=true'
+     ```
+
+     Example response:
+
+     ```json
+     {
+      "keyspace": "ks1",
+      "keyspace_id": 123,
+      "tidb_columnar_storage_enabled": "ON",
+      "columnar_store_type": "columnar",
+      "can_disable": false,
+      "table_count": 2,
+      "reloaded": false
+     }
+     ```
+
+     `can_disable` is true only when `table_count` is 0. `tidb_columnar_storage_enabled` is always present as `ON` or `OFF` on HTTP 200; if the sysvar cannot be read, the API returns HTTP 5xx instead of omitting the field. `columnar_store_type` is this TiDB's `cse.columnar-store-type` (`tiflash`, `columnar`, or `both`). `reloaded` reports whether this request synced schema first. If schema reload fails, the API also returns HTTP 5xx instead of an empty success body. Old kernels do not serve this endpoint.
+
+## Standby activation
+
+`POST /tidb-pool/activate` activates a TiDB process running in standby mode. Send the request to its status port. The response waits until the server is ready to accept connections.
+
+```shell
+curl -X POST "http://{TiDBIP}:10080/tidb-pool/activate" \
+  -H 'Content-Type: application/json' \
+  -d '{"keyspace_name":"ks"}'
+```
+
+`keyspace_name` is required. Starter obtains the metric `keyspace_id` from the initialized storage codec, so the activation request does not need to supply it. Activation fields such as `metadata`, `export_id`, `max_idle_seconds`, `run_auto_analyze`, and `tidb_enable_ddl` are also supported.
+
+## Test-only APIs (enableTestAPI failpoint)
+
+These APIs are only registered when the `enableTestAPI` failpoint is enabled.
+
+### Enable
+
+Build `tidb-server` with the failpoint enabled, then run with:
+
+```shell
+GO_FAILPOINTS="github.com/pingcap/tidb/pkg/server/enableTestAPI=return" ./bin/tidb-server
+```
+
+### Delete row key or index key
+
+You can use those APIs to mock dangling row or index keys case for test.
+
+Row key:
+```shell
+curl -X POST "http://{TiDBIP}:10080/test/delete/rowkey/{db}/{table}?handle={intHandle}"
+# For clustered common handle tables:
+curl -X POST "http://{TiDBIP}:10080/test/delete/rowkey/{db}/{table}?{pkCol}={pkVal}[&{pkCol2}={pkVal2}...]"
+```
+
+Index key:
+```shell
+curl -X POST "http://{TiDBIP}:10080/test/delete/indexkey/{db}/{table}/{index}?handle={intHandle}&{idxCol}={idxVal}[&{idxCol2}={idxVal2}...]"
+# For clustered common handle tables:
+curl -X POST "http://{TiDBIP}:10080/test/delete/indexkey/{db}/{table}/{index}?{idxCol}={idxVal}[&{idxCol2}={idxVal2}...]"
+```
+
+## APIs unique to TiDB X
+
+### Get global system variables
+
+`GET /variables/global` returns global system variables for operator inspection. It is available only in NextGen (TiDB X), on the status port of both SYSTEM-keyspace and tenant-keyspace TiDB instances. It reports the current keyspace of the TiDB process handling the request, not an aggregation across keyspaces.
+
+Method: `GET` only. Parameters: none.
+
+```shell
+curl http://{TiDBIP}:10080/variables/global
+```
+
+The response is a JSON object mapping variable names to string values. Example response excerpt:
+
+```json
+{
+ "autocommit": "ON",
+ "max_connections": "0",
+ "tidb_cloud_storage_uri": "s3://bucket/path?access-key=xxxxxx&secret-access-key=xxxxxx",
+ "tidb_exp_embed_openai_api_key": "******",
+ "validate_password.length": "8"
+}
+```
+
+Variable scope and no-op selection follow `SHOW GLOBAL VARIABLES`, including read-only and instance-scoped variables, but excluding session-only variables and disabled no-op variables. This operator-facing API does not apply Security Enhanced Mode (SEM v1 or v2) visibility filtering: variables hidden by SEM are included, with sensitive values masked as described below.
+
+Values are read through the existing global-variable getters. For every included variable marked `SysVar.IsSensitive`, a non-empty value is replaced with the literal `******`; an empty value remains an empty string. This includes:
+
+- Embedding API keys: `tidb_exp_embed_jina_ai_api_key`, `tidb_exp_embed_openai_api_key`, `tidb_exp_embed_cohere_api_key`, `tidb_exp_embed_huggingface_api_key`, `tidb_exp_embed_nvidia_nim_api_key`, and `tidb_exp_embed_gemini_api_key`.
+- LDAP bind passwords: `authentication_ldap_sasl_bind_root_pwd` and `authentication_ldap_simple_bind_root_pwd`.
+- The entire non-empty values of `tidb_config`, `tidb_trace_event`, `init_connect`, `init_slave` (when no-op variables are enabled), and `validate_password.dictionary`.
+
+`tidb_cloud_storage_uri` uses its existing getter's `ast.RedactURL` behavior instead of whole-value masking: an empty URI remains empty, while configured URIs retain the bucket, path, and non-secret options. Recognized sensitive query parameters are replaced with `xxxxxx`: `access-key`, `secret-access-key`, and `session-token` for S3/KS3/OSS; `account-key`, `encryption-key`, `sas-token`, and `endpoint` for Azure/Azblob. The entire Azure endpoint is masked because its URL can contain a SAS token used directly by the storage client. This follows the existing SQL getter's redaction rules, not a general-purpose sanitizer for arbitrary URL content.
+
+There is no option to return raw sensitive values, and `tidb_redact_log` does not affect this masking. Ordinary password-policy settings, such as `validate_password.length`, remain visible. Sensitivity is opt-in metadata: authors of any variable containing secrets, whether built-in or extension-registered, must set `SysVar.IsSensitive`; unannotated variables are not guaranteed to be masked.
+
+The request context has a 10-second timeout, but this is not a hard bound on response time: the GC-variable getters read `mysql.tidb` through `GetTiDBTableValue`, which currently uses `context.TODO()` and does not inherit the request deadline or client-disconnect cancellation. When all five `mysql.tidb`-backed GC variables are visible, each request performs five restricted SQL reads of `mysql.tidb`, or six when GC concurrency is not automatic, in addition to remote I/O from other getters such as `tidb_external_ts`. These reads may require TiKV/PD round trips; the response is not cached, so repeated scrapes repeat this work.
+
+Responses include `Cache-Control: no-store`. If reading a variable fails, the API returns HTTP 500 with a generic error instead of a partial result. The server log records the underlying error and, for a getter failure, the variable name. The endpoint inherits the status port's trusted access controls and does not authenticate SQL users; restrict status-port access to trusted operators.
+
+### Run ADMIN CHECK for an index
+```shell
+# curl -XPOST "http://{TiDBIP}:10080/ddl/check/{db}/{table}/{index}"
+{
+ "check_sql": "admin check index `test`.`t` `primary`",
+ "db": "test",
+ "index": "primary",
+ "result": "success",
+ "table": "t"
+}
+```
+
+## APIs unique to TiDB X SYSTEM keyspace
+
+These APIs are registered only on TiDB instances running in the TiDB X SYSTEM keyspace. All examples in this section assume `{TiDBIP}:10080` belongs to a TiDB process in that SYSTEM keyspace.
+
+The `/dxf/...` APIs are for DXF (Distributed eXecution Framework) operator observability and emergency runtime tuning. In TiDB X, DXF runs as a shared SYSTEM-keyspace service for resource-intensive work such as IMPORT INTO and distributed add index, so some APIs are called on a SYSTEM-keyspace TiDB process but target a user keyspace parameter.
+
+### List DXF nodes
+
+This API lists the TiDB nodes registered with DXF. The response is ordered by `host` and omits the internal `keyspace_id` field.
+
+Usage:
+
+```shell
+curl http://{TiDBIP}:10080/dxf/nodes
+```
+
+Parameters: none.
+
+Response fields:
+
+- `host`: The TiDB execution ID in `IP:PORT` form.
+- `role`: The node's configured TiDB service scope. `dxf_service` is the normal value for TiDB X DXF nodes; `background`, an empty string, or another configured scope can also appear.
+- `cpu_count`: The number of CPU slots available to DXF on the node.
+
+Example response:
+
+```json
+[
+ {
+  "host": "192.168.1.10:5000",
+  "role": "dxf_service",
+  "cpu_count": 8
+ },
+ {
+  "host": "192.168.1.11:5000",
+  "role": "background",
+  "cpu_count": 16
+ }
+]
+```
+
+If no DXF nodes are registered, the response is `[]`.
+
+### Get the DXF schedule status
+
+This API returns the scheduler view used by cluster controllers to decide how many DXF worker nodes are needed. It includes the number of scheduled tasks, current and required TiDB/TiKV worker counts, busy DXF nodes, and temporary scheduler flags such as `pause_scale_in`.
+
+Usage:
+
+```shell
+curl http://{TiDBIP}:10080/dxf/schedule/status
+```
+
+Parameters: none.
+
+Example response:
+
+```json
+{
+ "version": 1,
+ "task_queue": {
+  "scheduled_count": 2
+ },
+ "tidb_worker": {
+  "cpu_count": 10,
+  "required_count": 2,
+  "current_count": 3,
+  "busy_nodes": [
    {
-       "key": "74800000000000003B5F69800000000000000203800000000000000105BFF199999999999A013131310000000000FA",
-       "region_id": 59,
-       "value": {
-           "info": {
-               "writes": [
-                   {
-                       "start_ts": 424752858505150464,
-                       "commit_ts": 424752858506461184,
-                       "short_value": "AH0B"
-                   }
-               ],
-               "values": [
-                   {
-                        "start_ts": 424752858505150464,
-                        "value": "AH0B"
-                   }
-               ]
-           }
-       }
+    "id": "192.168.1.10:5000",
+    "is_owner": true
    }
+  ]
+ },
+ "tikv_worker": {
+  "required_count": 2
+ },
+ "flags": {
+  "pause_scale_in": {
+   "enabled": true,
+   "ttl": 3600000000000,
+   "expire_time": "2025-08-22T16:58:23.092864+08:00"
+  }
+ }
+}
+```
 
-1. Scatter regions of the specified table, add a `scatter-range` scheduler for the PD and the range is same as the table range.
+### Pause or resume DXF worker scale-in
 
-    ```shell
-    curl http://{TiDBIP}:10080/tables/{db}/{table}/scatter
-    ```
-    *Hint: On a partitioned table, use the `table(partition)` pattern as the table name, `test(p1)` for example.*
+This API writes a temporary DXF schedule flag. Use it when scale-in conflicts with DXF subtask scheduling, for example when subtasks keep being moved away from nodes selected for scale-in and task completion becomes slower. `pause_scale_in` asks the cluster controller to stop scaling in DXF workers for a limited time. `resume_scale_in` clears that request.
 
-    **Note**: The `scatter-range` scheduler may conflict with the global scheduler, do not use it for long periods on the larger table.
+Usage:
 
-1. Stop scatter the regions, disable the `scatter-range` scheduler for the specified table.
+```shell
+curl -X POST "http://{TiDBIP}:10080/dxf/schedule?action=pause_scale_in"
+curl -X POST "http://{TiDBIP}:10080/dxf/schedule?action=pause_scale_in&ttl=5h"
+curl -X POST "http://{TiDBIP}:10080/dxf/schedule?action=resume_scale_in"
+```
 
-    ```shell
-    curl http://{TiDBIP}:10080/tables/{db}/{table}/stop-scatter
-    ```
-    *Hint: On a partitioned table, use the `table(partition)` pattern as the table name, `test(p1)` for example.*
+Parameters:
 
-1. Get TiDB server settings
+- `action`: Required. Valid values are `pause_scale_in` and `resume_scale_in`.
+- `ttl`: Optional for `pause_scale_in`. Uses Go duration syntax such as `10m`, `1h`, or `2h45m`. The default is `1h`. Ignored by `resume_scale_in`.
 
-    ```shell
-    curl http://{TiDBIP}:10080/settings
-    ```
+Example response for `pause_scale_in`:
 
-1. Get TiDB server information.
+```json
+{
+ "enabled": true,
+ "ttl": 18000000000000,
+ "expire_time": "2025-08-22T21:13:01.276282+08:00"
+}
+```
 
-    ```shell
-    curl http://{TiDBIP}:10080/info
-    ```
+Example response for `resume_scale_in`:
 
-    ```shell
-    $curl http://127.0.0.1:10080/info
+```json
+{
+ "expire_time": "0001-01-01T00:00:00Z"
+}
+```
+
+### Get or update DXF schedule tuning factors
+
+This API gets or updates the resource tuning factors for a target keyspace. The scheduler uses these factors when calculating resource-related parameters for new DXF tasks such as IMPORT INTO and distributed add index tasks. Updating `amplify_factor` can make the scheduler reserve more resources for newly planned work in that keyspace.
+
+Usage:
+
+```shell
+curl "http://{TiDBIP}:10080/dxf/schedule/tune?keyspace={keyspace}"
+curl -X POST "http://{TiDBIP}:10080/dxf/schedule/tune?keyspace={keyspace}&amplify_factor={number}&ttl={duration}"
+```
+
+Parameters:
+
+- `keyspace`: Required for both `GET` and `POST`. The target keyspace whose DXF resource calculation should be read or tuned.
+- `amplify_factor`: Required for `POST`. A floating-point number in the range `[1.0, 10.0]`.
+- `ttl`: Optional for `POST`. Uses Go duration syntax such as `10m`, `1h`, or `2h45m`. The default is `1h`. After the TTL expires, `GET` returns the default tuning factor.
+
+Example `GET` response:
+
+```json
+{
+ "amplify_factor": 1
+}
+```
+
+Example `POST` response:
+
+```json
+{
+ "ttl": 7200000000000,
+ "expire_time": "2025-09-15T22:36:24.591155+08:00",
+ "amplify_factor": 2
+}
+```
+
+### Get active DXF task counts
+
+This API returns the number of active DXF tasks in `mysql.tidb_global_task`, grouped by keyspace. It is useful before maintenance or upgrades because it shows tasks that have not yet finished or moved to history. This differs from `/dxf/schedule/status`, which only counts tasks currently considered schedulable by the scheduler.
+
+Usage:
+
+```shell
+curl http://{TiDBIP}:10080/dxf/task/active
+```
+
+Parameters: none.
+
+Example response:
+
+```json
+{
+ "total": 3,
+ "per_keyspace": {
+  "SYSTEM": 1,
+  "keyspace1": 2
+ }
+}
+```
+
+### List DXF history tasks
+
+This API lists rows from `mysql.tidb_global_task_history` in descending task ID order. Use it to inspect completed, reverted, or failed DXF tasks across keyspaces. The API uses keyset pagination: pass the previous response's `NextPageToken` as the next request's `page_token`.
+
+Usage:
+
+```shell
+curl "http://{TiDBIP}:10080/dxf/task/history"
+curl "http://{TiDBIP}:10080/dxf/task/history?keyspace={keyspace}&page_size=50"
+curl "http://{TiDBIP}:10080/dxf/task/history?keyspace={keyspace}&page_size=50&page_token={NextPageToken}"
+```
+
+Parameters:
+
+- `keyspace`: Optional. If set, only returns history tasks from that keyspace.
+- `page_size`: Optional. Default is `20`. Valid range is `[1, 200]`.
+- `page_token`: Optional. Must be a positive task ID returned as `NextPageToken` by the previous page.
+
+Example response:
+
+```json
+{
+ "Items": [
+  {
+   "ID": 30001,
+   "Key": "keyspace1/ddl/backfill/9",
+   "Type": "backfill",
+   "State": "reverted",
+   "Step": 1,
+   "Priority": 512,
+   "RequiredSlots": 1,
+   "TargetScope": "dxf_service",
+   "CreateTime": "2026-04-13T11:30:10+08:00",
+   "MaxNodeCount": 1,
+   "ExtraParams": {},
+   "Keyspace": "keyspace1",
+   "ErrorCode": "kv:1062",
+   "ErrorCategory": "data-error",
+   "StartTime": "2026-04-13T11:30:13+08:00",
+   "StateUpdateTime": "2026-04-13T11:30:17+08:00",
+   "EndTime": "2026-04-13T11:30:16+08:00"
+  }
+ ],
+ "HasMore": false,
+ "NextPageToken": 0,
+ "ApproxTotalCount": 1
+}
+```
+
+`ErrorCode` contains the effective RFC error code when the stored task error provides one, and is empty for a plain error. `ErrorCategory` is `failed`, `cancelled`, or `data-error` for a task with an error, and is empty when the task has no error. The response does not include the task error message.
+
+### Get IMPORT INTO history job details
+
+This API returns detailed history for one completed IMPORT INTO job in a target keyspace. It reads DXF history tables and returns task status, resource settings, file and KV sizes, speeds, row counts, and per-step durations. It returns `404 Not Found` if the matching history task is not found.
+
+Usage:
+
+```shell
+curl http://{TiDBIP}:10080/dxf/import-into/history/job/{keyspace}/{job_id}
+```
+
+Parameters:
+
+- `keyspace`: Required path parameter. The keyspace where the IMPORT INTO job ran.
+- `job_id`: Required path parameter. The positive integer IMPORT INTO job ID.
+
+Example response:
+
+```json
+{
+ "job_id": 2,
+ "keyspace": "SYSTEM",
+ "task_id": 2,
+ "state": "succeed",
+ "concurrency": 1,
+ "max_node_count": 1,
+ "distsql_scan_concurrency": 15,
+ "index_count": 4,
+ "column_count": 12,
+ "file_size": "241.4MiB",
+ "data_kv_size": "249.4MiB",
+ "index_kv_size": "40.05MiB",
+ "per_core_speed": "24.97GiB/core/hour",
+ "overall_speed": "24.97GiB/hour",
+ "row_count": 250000,
+ "row_length": 1013,
+ "duration": {
+  "total": "34s",
+  "encode": "2s",
+  "merge_sort": "",
+  "ingest": "25s",
+  "collect_conflicts": "",
+  "resolve_conflicts": "",
+  "post_process": "4s"
+ }
+}
+```
+
+### Get or update the DXF max concurrent task limit
+
+This API gets or updates the process-local maximum number of DXF tasks that can be scheduled concurrently. The value is kept in memory only, is not persisted to TiKV, and is reset when the TiDB process restarts. When updating the value, send the request to the current DXF owner.
+
+Get the current value:
+
+```shell
+curl http://{TiDBIP}:10080/dxf/schedule/max_concurrent_task
+```
+
+Example response:
+
+```json
+{
+ "max_concurrent_task": 16,
+ "persistence": "memory_only"
+}
+```
+
+Update the value:
+
+```shell
+curl -X POST "http://{TiDBIP}:10080/dxf/schedule/max_concurrent_task?value={number}"
+```
+
+`value` must be an integer in the range `[16, 1000]`. The response uses the same format as the `GET` request:
+
+```json
+{
+ "max_concurrent_task": 128,
+ "persistence": "memory_only"
+}
+```
+
+### Get or update the DXF task cleanup batch size
+
+This API gets or updates the maximum number of finished DXF tasks returned by each cleanup query, independently of the scheduler concurrency limit. It is available only on a TiDB server that uses the `SYSTEM` keyspace. The value applies only to the TiDB process that handles the request, is kept in memory only, and is reset when that process restarts. Send requests to the current DXF owner to inspect or update the effective value.
+
+Get the current value, which defaults to `20`:
+
+```shell
+curl http://{TiDBIP}:10080/dxf/schedule/task_cleanup_batch_size
+```
+
+Example response:
+
+```json
+{
+ "task_cleanup_batch_size": 20,
+ "persistence": "memory_only"
+}
+```
+
+Update the value:
+
+```shell
+curl -X POST "http://{TiDBIP}:10080/dxf/schedule/task_cleanup_batch_size?value={number}"
+```
+
+The `value` parameter is required and must be an integer in the range `[1, 1000]`. The response uses the same format as the `GET` request:
+
+```json
+{
+ "task_cleanup_batch_size": 128,
+ "persistence": "memory_only"
+}
+```
+
+### Update a DXF task's max runtime slots
+
+This API updates the `MaxRuntimeSlots` extra parameter for one DXF task. Use it as an emergency task-level throttle, for example when a task step causes TiDB memory pressure or repeated restarts. The new value takes effect when the task executor reads the updated task metadata, commonly after the related TiDB node restarts or the task step is retried.
+
+Usage:
+
+```shell
+curl -X POST "http://{TiDBIP}:10080/dxf/task/{taskID}/max_runtime_slots?value={number}"
+curl -X POST "http://{TiDBIP}:10080/dxf/task/{taskID}/max_runtime_slots?value={number}&target_step={step}&target_step={step}"
+```
+
+Parameters:
+
+- `taskID`: Required path parameter. The positive integer DXF task ID.
+- `value`: Required. A positive integer lower than the task's `required_slots`.
+- `target_step`: Optional and repeatable. A numeric business step for the task type. If omitted, the limit applies to all business steps of the task.
+
+For IMPORT INTO tasks, common `target_step` values are:
+
+| Value | Step |
+| --- | --- |
+| `1` | `import` |
+| `2` | `post-process` |
+| `3` | `encode` |
+| `4` | `merge-sort` |
+| `5` | `ingest` |
+| `6` | `collect-conflicts` |
+| `7` | `conflict-resolution` |
+
+For distributed add index backfill tasks, common `target_step` values are:
+
+| Value | Step |
+| --- | --- |
+| `1` | `read-index` |
+| `2` | `merge-sort` |
+| `3` | `ingest` |
+| `4` | `merge-temp-index` |
+
+Example response:
+
+```json
+{
+ "task_id": 2,
+ "task_key": "SYSTEM/ImportInto/2",
+ "required_slots": 7,
+ "max_runtime_slots": 5,
+ "target_steps": [
+  "post-process",
+  "encode"
+ ]
+}
+```
+
+### Region cache status and refresh
+
+These APIs let an operator inspect and refresh TiDB's local region cache for one TiKV store after leader eviction, while the old TiKV is still online. They are registered on the status port for both classic and TiDB-X. `GET` reads local cache state and may drop unresolved failures whose original key range is fully covered by cached regions that have already left the store. `POST` starts a background refresh for every in-process store/keyspace and returns a snapshot taken when each task starts or is reused; it does not wait for probes to finish. Concurrent `POST`s for the same store share one in-flight job. Each background job uses its own store lifecycle context and independent 2-minute deadline. Callers should issue one `POST`, then poll `GET` until every relevant store reports `ready=true`.
+
+`ready` is true only when no matching cache entries remain, no unresolved refresh failures remain, and no refresh is in progress. `GET` and `POST` return status counters without refresh error details; callers must inspect `ready` to determine completion. Cache entries that expire or are deleted during a failed probe are not treated as successfully refreshed. Region-cache TTL expiry is also not refresh success: if the operator times out, stop waiting for `ready`, wait the original region-cache TTL, then restart. Do not treat a later `ready=true` caused only by expiry as a completed refresh.
+
+Matching entries are cached working-leader routes to the target store. `ready=true` does not indicate that all traffic to the store has drained: follower or mixed reads and forwarding-proxy requests can still reach it. Restarting the store can therefore still cause request retries or timeouts. Readiness also does not establish global leader eviction or new-leader reachability.
+
+`observed_at` is a Unix timestamp. For multiple in-process stores it is the oldest store observation, not the last store in the loop. Each `stores[]` entry has its own `observed_at` when `detail=1`.
+
+For GET and POST startup snapshots, `in_progress` is true when any participating store/keyspace has a running refresh. The POST startup snapshot reports `in_progress=true` for tasks it starts or reuses, even if they finish before the response is sent. GET returns the current progress and completion state. A reset failure returns an error instead of a startup snapshot for that store.
+
+Leftover failures from that fallback stay until the original range is fully covered off-store, or until the next rolling posts `reset=1`. `reset=1` drops unresolved failures and the idle task, then runs a new refresh. If a refresh is already running for that store, reset does not cancel it and the POST returns `store cache refresh is in progress` so the caller can retry. It is not a success signal. Do not pass `reset=1` while polling the same rolling.
+
+`GET` does not reload missing or expired regions. The background refresh recovers missing range coverage in batches of at most 128 regions from PD, waiting 100 ms between consecutive batches of a range, and continues until the range is covered or the job context ends. Cancellation interrupts this wait. A long split chain therefore remains one refresh task; it does not require repeated `POST`s. If a job times out or fails, a later `POST` without `reset` starts or reuses a retry for the unresolved entries.
+
+Usage:
+
+```shell
+curl "http://{TiDBIP}:10080/regions/cache/status?store_id={id}"
+curl -X POST "http://{TiDBIP}:10080/regions/cache/refresh?store_id={id}"
+curl -X POST "http://{TiDBIP}:10080/regions/cache/refresh?store_id={id}&reset=1"
+```
+
+Parameters:
+
+- `store_id`: required positive integer. Missing, zero, or non-integer values return HTTP 400.
+- `reset`: optional on `POST` only. `1` or `true` clears leftover failures from a previous rolling or TTL fallback, then refreshes. If a refresh is in progress, the store is left running and the response is not ready. Omit it during an in-progress rolling.
+- `detail`: optional on either route. `1` or `true` includes per-store entries in `stores`; otherwise `stores` is omitted.
+
+The status route accepts only `GET`. The refresh route accepts only `POST`. Other methods return HTTP 405.
+
+Example `GET` response with `detail=1`:
+
+```json
+{
+  "failed": 0,
+  "remaining": 9,
+  "ready": false,
+  "observed_at": 1720000000,
+  "stores": [
     {
-        "ddl_id": "f7e73ed5-63b4-4cb4-ba7c-42b32dc74e77",
-        "git_hash": "f572e33854e1c0f942f031e9656d0004f99995c6",
-        "ip": "",
-        "is_owner": true,
-        "lease": "45s",
-        "listening_port": 4000,
-        "status_port": 10080,
-        "version": "5.7.25-TiDB-v2.1.0-rc.3-355-gf572e3385-dirty"
+      "cluster_id": 123,
+      "failed": 0,
+      "remaining": 9,
+      "ready": false,
+      "observed_at": 1720000000
     }
-    ```
+  ]
+}
+```
 
-1. Get TiDB cluster all servers information.
+`stores` is one entry per in-process TiKV store (each keyspace / PD cluster). Top-level counters are the sum of those entries and are not labeled with a single keyspace.
 
-    ```shell
-    curl http://{TiDBIP}:10080/info/all
-    ```
+Example `POST` response with `detail=1`:
 
-    ```shell
-    $curl http://127.0.0.1:10080/info/all
+```json
+{
+  "failed": 0,
+  "remaining": 9,
+  "ready": false,
+  "in_progress": true,
+  "observed_at": 1720000000,
+  "stores": [
     {
-        "servers_num": 2,
-        "owner_id": "29a65ec0-d931-4f9e-a212-338eaeffab96",
-        "is_all_server_version_consistent": true,
-        "all_servers_info": {
-            "29a65ec0-d931-4f9e-a212-338eaeffab96": {
-                "version": "5.7.25-TiDB-v4.0.0-alpha-669-g8f2a09a52-dirty",
-                "git_hash": "8f2a09a52fdcaf9d9bfd775d2c6023f363dc121e",
-                "ddl_id": "29a65ec0-d931-4f9e-a212-338eaeffab96",
-                "ip": "",
-                "listening_port": 4000,
-                "status_port": 10080,
-                "lease": "45s",
-                "binlog_status": "Off"
-            },
-            "cd13c9eb-c3ee-4887-af9b-e64f3162d92c": {
-                "version": "5.7.25-TiDB-v4.0.0-alpha-669-g8f2a09a52-dirty",
-                "git_hash": "8f2a09a52fdcaf9d9bfd775d2c6023f363dc121e",
-                "ddl_id": "cd13c9eb-c3ee-4887-af9b-e64f3162d92c",
-                "ip": "",
-                "listening_port": 4001,
-                "status_port": 10081,
-                "lease": "45s",
-                "binlog_status": "Off"
-            }
-        }
+      "cluster_id": 123,
+      "failed": 0,
+      "remaining": 9,
+      "ready": false,
+      "in_progress": true,
+      "observed_at": 1720000000
     }
-    ```
-
-1. Enable/Disable TiDB server general log
-
-    ```shell
-    curl -X POST -d "tidb_general_log=1" http://{TiDBIP}:10080/settings
-    curl -X POST -d "tidb_general_log=0" http://{TiDBIP}:10080/settings
-    ```
-
-1. Change TiDB server log level
-
-    ```shell
-    curl -X POST -d "log_level=debug" http://{TiDBIP}:10080/settings
-    curl -X POST -d "log_level=info" http://{TiDBIP}:10080/settings
-    ```
-
-1. Change TiDB DDL slow log threshold
-
-    The unit is millisecond.
-
-    ```shell
-    curl -X POST -d "ddl_slow_threshold=300" http://{TiDBIP}:10080/settings
-    ```
-
-1. Get the column value by an encoded row and some information that can be obtained from a column of the table schema information. 
-
-    Argument example: rowBin=base64_encoded_row_value
-
-    ```shell
-    curl http://{TiDBIP}:10080/tables/{colID}/{colFlag}/{colLen}?rowBin={val}
-    ```
-
-    *Hint: For the column which field type is timezone dependent, e.g. `timestamp`, convert its value to UTC timezone.*
-
-1. Resign the ddl owner, let tidb start a new ddl owner election.
-
-    ```shell
-    curl -X POST http://{TiDBIP}:10080/ddl/owner/resign
-    ```
-
-1. Get all TiDB DDL job history information.
-
-    ```shell
-    curl http://{TiDBIP}:10080/ddl/history
-    ```
-
-1. Get count {number} TiDB DDL job history information.
-
-    ```shell
-    curl http://{TiDBIP}:10080/ddl/history?limit={number}
-    ```
-
-    **Note**: If you request a tidb that is not ddl owner, the response will be `This node is not a ddl owner, can't be resigned.` 
-
-1. Download TiDB debug info
-
-    ```shell
-    curl http://{TiDBIP}:10080/debug/zip?seconds=60 --output debug.zip
-    ```
-    
-    zip file will include:
-    
-    - Go heap pprof(after GC)
-    - Go cpu pprof(10s)
-    - Go mutex pprof
-    - Full goroutine
-    - TiDB config and version
-
-    Param:
-    
-    - seconds: profile time(s), default is 10s. 
-
-1. Get statistics data of specified table.
-
-    ```shell
-    curl http://{TiDBIP}:10080/stats/dump/{db}/{table}
-    ```
-
-1. Get statistics data of specific table and timestamp.
-
-    ```shell
-    curl http://{TiDBIP}:10080/stats/dump/{db}/{table}/{yyyyMMddHHmmss}
-    ```
-    ```shell
-    curl http://{TiDBIP}:10080/stats/dump/{db}/{table}/{yyyy-MM-dd HH:mm:ss}
-    ```
-
-1. Resume the binlog writing when Pump is recovered.
-
-    ```shell
-    curl http://{TiDBIP}:10080/binlog/recover
-    ```
-
-    Return value:
-
-    * timeout, return status code: 400, message: `timeout`
-    * If it returns normally, status code: 200, message example:
-        ```text
-        {
-          "Skipped": false,
-          "SkippedCommitterCounter": 0
-        }
-        ```
-        `Skipped`: false indicates that the current binlog is not in the skipped state, otherwise, it is in the skipped state
-        `SkippedCommitterCounter`: Represents how many transactions are currently being committed in the skipped state. By default, the API will return after waiting until all skipped-binlog transactions are committed. If this value is greater than 0, it means that you need to wait until them are committed .
-
-    Param:
-
-    * op=nowait: return after binlog status is recoverd, do not wait until the skipped-binlog transactions are committed.
-    * op=reset: reset `SkippedCommitterCounter` to 0 to avoid the problem that `SkippedCommitterCounter` is not cleared due to some unusual cases.
-    * op=status: Get the current status of binlog recovery.
-
-1. Enable/disable async commit feature
-
-    ```shell
-    curl -X POST -d "tidb_enable_async_commit=1" http://{TiDBIP}:10080/settings
-    curl -X POST -d "tidb_enable_async_commit=0" http://{TiDBIP}:10080/settings
-    ```
-
-1. Enable/disable one-phase commit feature
-
-    ```shell
-    curl -X POST -d "tidb_enable_1pc=1" http://{TiDBIP}:10080/settings
-    curl -X POST -d "tidb_enable_1pc=0" http://{TiDBIP}:10080/settings
-    ```
-
-1. Get/Set the size of the Ballast Object
-
-    ```shell
-    # get current size of the ballast object
-    curl -v http://{TiDBIP}:10080/debug/ballast-object-sz
-    # reset the size of the ballast object (2GB in this example)
-    curl -v -X POST -d "2147483648" http://{TiDBIP}:10080/debug/ballast-object-sz
-    ```
+  ]
+}
+```

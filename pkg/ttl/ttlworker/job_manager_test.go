@@ -1,0 +1,1198 @@
+// Copyright 2022 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ttlworker
+
+import (
+	"context"
+	"encoding/json"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
+	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/domain/serverinfo"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/session/syssession"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
+	timerapi "github.com/pingcap/tidb/pkg/timer/api"
+	"github.com/pingcap/tidb/pkg/ttl/cache"
+	"github.com/pingcap/tidb/pkg/ttl/session"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/testutils"
+	"github.com/tikv/client-go/v2/tikv"
+	"github.com/tikv/client-go/v2/tikvrpc"
+)
+
+type fakeExternalWorkloadManager struct {
+	role             config.ExternalWorkloadRole
+	recycledCreateTS uint64
+}
+
+func (m *fakeExternalWorkloadManager) Close() error { return nil }
+func (m *fakeExternalWorkloadManager) Role() config.ExternalWorkloadRole {
+	return m.role
+}
+func (*fakeExternalWorkloadManager) Meta() *keyspacepb.KeyspaceMeta { return nil }
+func (*fakeExternalWorkloadManager) InitializeGCV2(context.Context, time.Duration) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) AbortGCV2(context.Context) error { return nil }
+func (*fakeExternalWorkloadManager) RegisterGCV2(context.Context, uint64, time.Duration) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RecycleGCV2(context.Context, uint64) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) UpdateGCLifeTime(context.Context, time.Duration) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RegisterTTLTableInfo(context.Context, int64, bool) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) DeleteTTLTableInfo(context.Context, int64) error {
+	return nil
+}
+func (m *fakeExternalWorkloadManager) RecycleTTLTask(_ context.Context, completedJobCreateTime uint64) error {
+	m.recycledCreateTS = completedJobCreateTime
+	return nil
+}
+func (*fakeExternalWorkloadManager) UpdateTTLJobEnable(context.Context, bool) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RegisterAutoAnalyze(context.Context, uint64) error {
+	return nil
+}
+func (*fakeExternalWorkloadManager) RecycleAutoAnalyze(context.Context, uint64) error {
+	return nil
+}
+
+func newTTLTableStatusRows(status ...*cache.TableStatus) []chunk.Row {
+	c := chunk.NewChunkWithCapacity([]*types.FieldType{
+		types.NewFieldType(mysql.TypeLonglong), // table_id
+		types.NewFieldType(mysql.TypeLonglong), // parent_table_id
+		types.NewFieldType(mysql.TypeString),   // table_statistics
+		types.NewFieldType(mysql.TypeString),   // last_job_id
+		types.NewFieldType(mysql.TypeDatetime), // last_job_start_time
+		types.NewFieldType(mysql.TypeDatetime), // last_job_finish_time
+		types.NewFieldType(mysql.TypeDatetime), // last_job_ttl_expire
+		types.NewFieldType(mysql.TypeString),   // last_job_summary
+		types.NewFieldType(mysql.TypeString),   // current_job_id
+		types.NewFieldType(mysql.TypeString),   // current_job_owner_id
+		types.NewFieldType(mysql.TypeString),   // current_job_owner_addr
+		types.NewFieldType(mysql.TypeDatetime), // current_job_hb_time
+		types.NewFieldType(mysql.TypeDatetime), // current_job_start_time
+		types.NewFieldType(mysql.TypeDatetime), // current_job_ttl_expire
+		types.NewFieldType(mysql.TypeString),   // current_job_state
+		types.NewFieldType(mysql.TypeString),   // current_job_status
+		types.NewFieldType(mysql.TypeDatetime), // current_job_status_update_time
+	}, len(status))
+	var rows []chunk.Row
+
+	for _, s := range status {
+		tableID := types.NewDatum(s.TableID)
+		c.AppendDatum(0, &tableID)
+		parentTableID := types.NewDatum(s.ParentTableID)
+		c.AppendDatum(1, &parentTableID)
+		if s.TableStatistics == "" {
+			c.AppendNull(2)
+		} else {
+			tableStatistics := types.NewDatum(s.TableStatistics)
+			c.AppendDatum(2, &tableStatistics)
+		}
+
+		if s.LastJobID == "" {
+			c.AppendNull(3)
+		} else {
+			lastJobID := types.NewDatum(s.LastJobID)
+			c.AppendDatum(3, &lastJobID)
+		}
+
+		lastJobStartTime := types.NewDatum(types.NewTime(types.FromGoTime(s.LastJobStartTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(4, &lastJobStartTime)
+		lastJobFinishTime := types.NewDatum(types.NewTime(types.FromGoTime(s.LastJobFinishTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(5, &lastJobFinishTime)
+		lastJobTTLExpire := types.NewDatum(types.NewTime(types.FromGoTime(s.LastJobTTLExpire), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(6, &lastJobTTLExpire)
+
+		if s.LastJobSummary == "" {
+			c.AppendNull(7)
+		} else {
+			lastJobSummary := types.NewDatum(s.LastJobSummary)
+			c.AppendDatum(7, &lastJobSummary)
+		}
+		if s.CurrentJobID == "" {
+			c.AppendNull(8)
+		} else {
+			currentJobID := types.NewDatum(s.CurrentJobID)
+			c.AppendDatum(8, &currentJobID)
+		}
+		if s.CurrentJobOwnerID == "" {
+			c.AppendNull(9)
+		} else {
+			currentJobOwnerID := types.NewDatum(s.CurrentJobOwnerID)
+			c.AppendDatum(9, &currentJobOwnerID)
+		}
+		if s.CurrentJobOwnerAddr == "" {
+			c.AppendNull(10)
+		} else {
+			currentJobOwnerAddr := types.NewDatum(s.CurrentJobOwnerAddr)
+			c.AppendDatum(10, &currentJobOwnerAddr)
+		}
+
+		currentJobOwnerHBTime := types.NewDatum(types.NewTime(types.FromGoTime(s.CurrentJobOwnerHBTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(11, &currentJobOwnerHBTime)
+		currentJobStartTime := types.NewDatum(types.NewTime(types.FromGoTime(s.CurrentJobStartTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(12, &currentJobStartTime)
+		currentJobTTLExpire := types.NewDatum(types.NewTime(types.FromGoTime(s.CurrentJobTTLExpire), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(13, &currentJobTTLExpire)
+
+		if s.CurrentJobState == "" {
+			c.AppendNull(14)
+		} else {
+			currentJobState := types.NewDatum(s.CurrentJobState)
+			c.AppendDatum(14, &currentJobState)
+		}
+		if s.CurrentJobStatus == "" {
+			c.AppendNull(15)
+		} else {
+			currentJobStatus := types.NewDatum(s.CurrentJobStatus)
+			c.AppendDatum(15, &currentJobStatus)
+		}
+
+		currentJobStatusUpdateTime := types.NewDatum(types.NewTime(types.FromGoTime(s.CurrentJobStatusUpdateTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(16, &currentJobStatusUpdateTime)
+	}
+
+	iter := chunk.NewIterator4Chunk(c)
+	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func newTTLTaskRows(t *testing.T, tasks ...*cache.TTLTask) []chunk.Row {
+	c := chunk.NewChunkWithCapacity([]*types.FieldType{
+		types.NewFieldType(mysql.TypeString),   // job_id
+		types.NewFieldType(mysql.TypeLonglong), // table_id
+		types.NewFieldType(mysql.TypeLonglong), // scan_id
+		types.NewFieldType(mysql.TypeBlob),     // scan_range_start
+		types.NewFieldType(mysql.TypeBlob),     // scan_range_end
+		types.NewFieldType(mysql.TypeDatetime), // expire_time
+		types.NewFieldType(mysql.TypeString),   // owner_id
+		types.NewFieldType(mysql.TypeString),   // owner_addr
+		types.NewFieldType(mysql.TypeDatetime), // owner_hb_time
+		types.NewFieldType(mysql.TypeString),   // status
+		types.NewFieldType(mysql.TypeDatetime), // status_update_time
+		types.NewFieldType(mysql.TypeString),   // state
+		types.NewFieldType(mysql.TypeDatetime), // created_time
+		types.NewFieldType(mysql.TypeLonglong), // scan_index_id
+	}, len(tasks))
+	var rows []chunk.Row
+
+	for _, task := range tasks {
+		jobID := types.NewDatum(task.JobID)
+		c.AppendDatum(0, &jobID)
+		tableID := types.NewDatum(task.TableID)
+		c.AppendDatum(1, &tableID)
+		scanID := types.NewDatum(task.ScanID)
+		c.AppendDatum(2, &scanID)
+
+		if len(task.ScanRangeStart) == 0 {
+			c.AppendNull(3)
+		} else {
+			require.FailNow(t, "non-empty ScanRangeStart is not supported by this helper")
+		}
+		if len(task.ScanRangeEnd) == 0 {
+			c.AppendNull(4)
+		} else {
+			require.FailNow(t, "non-empty ScanRangeEnd is not supported by this helper")
+		}
+
+		expireTime := types.NewDatum(types.NewTime(types.FromGoTime(task.ExpireTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(5, &expireTime)
+
+		if task.OwnerID == "" {
+			c.AppendNull(6)
+		} else {
+			ownerID := types.NewDatum(task.OwnerID)
+			c.AppendDatum(6, &ownerID)
+		}
+		if task.OwnerAddr == "" {
+			c.AppendNull(7)
+		} else {
+			ownerAddr := types.NewDatum(task.OwnerAddr)
+			c.AppendDatum(7, &ownerAddr)
+		}
+		if task.OwnerHBTime.IsZero() {
+			c.AppendNull(8)
+		} else {
+			ownerHBTime := types.NewDatum(types.NewTime(types.FromGoTime(task.OwnerHBTime), mysql.TypeDatetime, types.MaxFsp))
+			c.AppendDatum(8, &ownerHBTime)
+		}
+
+		status := types.NewDatum(string(task.Status))
+		c.AppendDatum(9, &status)
+		statusUpdateTime := types.NewDatum(types.NewTime(types.FromGoTime(task.StatusUpdateTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(10, &statusUpdateTime)
+
+		if task.State == nil {
+			c.AppendNull(11)
+		} else {
+			stateJSON, err := json.Marshal(task.State)
+			require.NoError(t, err)
+			stateDatum := types.NewDatum(string(stateJSON))
+			c.AppendDatum(11, &stateDatum)
+		}
+
+		createdTime := types.NewDatum(types.NewTime(types.FromGoTime(task.CreatedTime), mysql.TypeDatetime, types.MaxFsp))
+		c.AppendDatum(12, &createdTime)
+		if task.ScanIndexID == nil {
+			c.AppendNull(13)
+		} else {
+			scanIndexID := types.NewDatum(*task.ScanIndexID)
+			c.AppendDatum(13, &scanIndexID)
+		}
+	}
+
+	iter := chunk.NewIterator4Chunk(c)
+	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+var updateStatusSQL = "SELECT LOW_PRIORITY table_id,parent_table_id,table_statistics,last_job_id,last_job_start_time,last_job_finish_time,last_job_ttl_expire,last_job_summary,current_job_id,current_job_owner_id,current_job_owner_addr,current_job_owner_hb_time,current_job_start_time,current_job_ttl_expire,current_job_state,current_job_status,current_job_status_update_time FROM mysql.tidb_ttl_table_status"
+
+// TTLJob exports the ttlJob for test
+type TTLJob = ttlJob
+
+// WithSessionForTest is used for test
+func WithSessionForTest(pool syssession.Pool, fn func(session.Session) error) error {
+	return withSession(pool, fn)
+}
+
+// LockJob is an exported version of lockNewJob for test
+func (m *JobManager) LockJob(ctx context.Context, se session.Session, table *cache.PhysicalTable, now time.Time, createJobID string, checkInterval bool) (*TTLJob, error) {
+	if createJobID == "" {
+		return m.lockHBTimeoutJob(ctx, se, table.ID, table.TableInfo.ID, now)
+	}
+	return m.lockNewJob(ctx, se, table, now, createJobID, checkInterval, true)
+}
+
+// RunningJobs returns the running jobs inside ttl job manager
+func (m *JobManager) RunningJobs() []*TTLJob {
+	return m.runningJobs
+}
+
+// InfoSchemaCache is an exported getter of infoSchemaCache for test
+func (m *JobManager) InfoSchemaCache() *cache.InfoSchemaCache {
+	return m.infoSchemaCache
+}
+
+// TableStatusCache is an exported getter of TableStatusCache for test.
+func (m *JobManager) TableStatusCache() *cache.TableStatusCache {
+	return m.tableStatusCache
+}
+
+// RescheduleJobs is an exported version of rescheduleJobs for test
+func (m *JobManager) RescheduleJobs(se session.Session, now time.Time) {
+	m.rescheduleJobs(se, now)
+}
+
+func (m *JobManager) SubmitJob(se session.Session, tableID, physicalID int64, requestID string) error {
+	ch := make(chan error, 1)
+	m.handleSubmitJobRequest(se, &SubmitTTLManagerJobRequest{
+		TableID:    tableID,
+		PhysicalID: physicalID,
+		RequestID:  requestID,
+		RespCh:     ch,
+	})
+	return <-ch
+}
+
+// TaskManager is an exported getter of task manager for test
+func (m *JobManager) TaskManager() *taskManager {
+	return m.taskManager
+}
+
+// UpdateHeartBeat is an exported version of updateHeartBeat for test
+func (m *JobManager) UpdateHeartBeat(ctx context.Context, se session.Session, now time.Time) {
+	m.updateHeartBeat(ctx, se, now)
+}
+
+func (m *JobManager) UpdateHeartBeatForJob(ctx context.Context, se session.Session, now time.Time, job *ttlJob) error {
+	return m.updateHeartBeatForJob(ctx, se, now, job)
+}
+
+// SetLastReportDelayMetricsTime sets the lastReportDelayMetricsTime for test
+func (m *JobManager) SetLastReportDelayMetricsTime(t time.Time) {
+	m.lastReportDelayMetricsTime = t
+}
+
+// GetLastReportDelayMetricsTime returns the lastReportDelayMetricsTime for test
+func (m *JobManager) GetLastReportDelayMetricsTime() time.Time {
+	return m.lastReportDelayMetricsTime
+}
+
+// ReportMetrics is an exported version of reportMetrics
+func (m *JobManager) ReportMetrics(se session.Session) {
+	m.reportMetrics(se)
+}
+
+// ID returns the id of JobManager
+func (m *JobManager) ID() string {
+	return m.id
+}
+
+// CheckNotOwnJob is an exported version of checkNotOwnJob
+func (m *JobManager) CheckNotOwnJob() {
+	m.checkNotOwnJob()
+}
+
+// CheckFinishedJob is an exported version of checkFinishedJob
+func (m *JobManager) CheckFinishedJob(se session.Session) {
+	m.checkFinishedJob(se)
+}
+
+func (j *ttlJob) Finish(se session.Session, now time.Time, summary *TTLSummary) error {
+	return j.finish(se, now, summary)
+}
+
+func (j *ttlJob) ID() string {
+	return j.id
+}
+
+func TestCheckFinishedJobRecyclesExternalTTLTask(t *testing.T) {
+	t.Run("configures external workload manager", func(t *testing.T) {
+		externalMgr := &fakeExternalWorkloadManager{}
+		m := NewJobManager("test-id", nil, nil, nil, nil, WithExternalWorkloadManager(externalMgr))
+		require.Same(t, externalMgr, m.extWorkload)
+	})
+
+	t.Run("all local jobs finish", func(t *testing.T) {
+		createTime := time.Unix(1234, 0)
+		externalMgr := &fakeExternalWorkloadManager{role: config.RoleTTLTaskWorker}
+		m := NewJobManager("test-id", nil, nil, nil, nil, WithExternalWorkloadManager(externalMgr))
+		m.runningJobs = []*ttlJob{
+			{
+				id:         "job1",
+				ownerID:    "test-id",
+				createTime: createTime,
+				tableID:    1,
+				status:     cache.JobStatusRunning,
+			},
+		}
+
+		se := newMockSession(t)
+		sqlCounter := 0
+		se.executeSQL = func(_ context.Context, sql string, args ...any) ([]chunk.Row, error) {
+			sqlCounter++
+			if sqlCounter == 1 {
+				expectedSQL, expectedArgs := cache.SelectFromTTLTaskWithJobID("job1")
+				require.Equal(t, expectedSQL, sql)
+				require.Equal(t, expectedArgs, args)
+			}
+			return nil, nil
+		}
+
+		m.CheckFinishedJob(se)
+		require.Empty(t, m.runningJobs)
+		require.Equal(t, uint64(createTime.Unix()), externalMgr.recycledCreateTS)
+		require.Equal(t, 4, sqlCounter)
+	})
+
+	t.Run("do not recycle when an older local job is still running", func(t *testing.T) {
+		runningCreateTime := time.Unix(1234, 0)
+		finishedCreateTime := time.Unix(2234, 0)
+		externalMgr := &fakeExternalWorkloadManager{role: config.RoleTTLTaskWorker}
+		m := NewJobManager("test-id", nil, nil, nil, nil, WithExternalWorkloadManager(externalMgr))
+		m.runningJobs = []*ttlJob{
+			{
+				id:         "job-running",
+				ownerID:    "test-id",
+				createTime: runningCreateTime,
+				tableID:    1,
+				status:     cache.JobStatusRunning,
+			},
+			{
+				id:         "job-finished",
+				ownerID:    "test-id",
+				createTime: finishedCreateTime,
+				tableID:    2,
+				status:     cache.JobStatusRunning,
+			},
+		}
+
+		runningTasks := newTTLTaskRows(t, &cache.TTLTask{
+			JobID:            "job-running",
+			TableID:          1,
+			ScanID:           1,
+			ExpireTime:       runningCreateTime,
+			Status:           cache.TaskStatusRunning,
+			StatusUpdateTime: runningCreateTime,
+			CreatedTime:      runningCreateTime,
+		})
+		finishedTasks := newTTLTaskRows(t, &cache.TTLTask{
+			JobID:            "job-finished",
+			TableID:          2,
+			ScanID:           1,
+			ExpireTime:       finishedCreateTime,
+			Status:           cache.TaskStatusFinished,
+			StatusUpdateTime: finishedCreateTime,
+			CreatedTime:      finishedCreateTime,
+		})
+
+		se := newMockSession(t)
+		se.executeSQL = func(_ context.Context, sql string, args ...any) ([]chunk.Row, error) {
+			expectedSQL, _ := cache.SelectFromTTLTaskWithJobID("job-finished")
+			if sql != expectedSQL {
+				return nil, nil
+			}
+			switch args[0] {
+			case "job-running":
+				return runningTasks, nil
+			case "job-finished":
+				return finishedTasks, nil
+			default:
+				return nil, nil
+			}
+		}
+
+		m.CheckFinishedJob(se)
+		require.Len(t, m.runningJobs, 1)
+		require.Equal(t, "job-running", m.runningJobs[0].id)
+		require.Equal(t, uint64(0), externalMgr.recycledCreateTS)
+	})
+}
+
+func TestCheckFinishedJobDoesNotRecycleExternalTTLTaskFromMaster(t *testing.T) {
+	externalMgr := &fakeExternalWorkloadManager{role: config.RoleMaster}
+	m := NewJobManager("test-id", nil, nil, nil, nil, WithExternalWorkloadManager(externalMgr))
+	m.runningJobs = []*ttlJob{
+		{
+			id:         "job1",
+			ownerID:    "test-id",
+			createTime: time.Unix(1234, 0),
+			tableID:    1,
+			status:     cache.JobStatusRunning,
+		},
+	}
+	se := newMockSession(t)
+
+	m.CheckFinishedJob(se)
+	require.Empty(t, m.runningJobs)
+	require.Zero(t, externalMgr.recycledCreateTS)
+}
+
+func TestReadyForLockHBTimeoutJobTables(t *testing.T) {
+	tbl := newMockTTLTbl(t, "t1")
+	m := NewJobManager("test-id", nil, nil, nil, nil)
+	m.sessPool = newMockSessionPool(t, tbl)
+	se := newMockSession(t, tbl)
+
+	tblWithDailyInterval := newMockTTLTbl(t, "t2")
+	tblWithDailyInterval.TTLInfo.JobInterval = "1d"
+
+	cases := []struct {
+		name             string
+		infoSchemaTables []*cache.PhysicalTable
+		tableStatus      []*cache.TableStatus
+		shouldSchedule   bool
+	}{
+		// for a newly inserted table, it'll always not be scheduled because no job running
+		{"newly created", []*cache.PhysicalTable{tbl}, []*cache.TableStatus{{TableID: tbl.ID, ParentTableID: tbl.ID}}, false},
+		// table only in the table status cache will not be scheduled
+		{"proper subset", []*cache.PhysicalTable{}, []*cache.TableStatus{{TableID: tbl.ID, ParentTableID: tbl.ID}}, false},
+		// table whose current job owner id is not empty, and heart beat time is long enough will not be scheduled
+		{"current job not empty", []*cache.PhysicalTable{tbl}, []*cache.TableStatus{{TableID: tbl.ID, ParentTableID: tbl.ID, CurrentJobID: "job1", CurrentJobOwnerID: "test-another-id", CurrentJobOwnerHBTime: se.Now()}}, false},
+		// table whose current job owner id is not empty, but heart beat time is expired will be scheduled
+		{"hb time expired", []*cache.PhysicalTable{tbl}, []*cache.TableStatus{{TableID: tbl.ID, ParentTableID: tbl.ID, CurrentJobID: "job1", CurrentJobOwnerID: "test-another-id", CurrentJobOwnerHBTime: se.Now().Add(-time.Hour)}}, true},
+		// if the last start time is too near, it will not be scheduled because no job running
+		{"last start time too near", []*cache.PhysicalTable{tbl}, []*cache.TableStatus{{TableID: tbl.ID, ParentTableID: tbl.ID, LastJobStartTime: se.Now()}}, false},
+		// if the last start time is expired, it will not be scheduled because no job running
+		{"last start time expired", []*cache.PhysicalTable{tbl}, []*cache.TableStatus{{TableID: tbl.ID, ParentTableID: tbl.ID, LastJobStartTime: se.Now().Add(-time.Hour * 2)}}, false},
+		// if the interval is 24h, and the last start time is near, it will not be scheduled because no job running
+		{"last start time too near for 24h", []*cache.PhysicalTable{tblWithDailyInterval}, []*cache.TableStatus{{TableID: tblWithDailyInterval.ID, ParentTableID: tblWithDailyInterval.ID, LastJobStartTime: se.Now().Add(-time.Hour * 2)}}, false},
+		// if the interval is 24h, and the last start time is far enough, it will not be scheduled because no job running
+		{"last start time far enough for 24h", []*cache.PhysicalTable{tblWithDailyInterval}, []*cache.TableStatus{{TableID: tblWithDailyInterval.ID, ParentTableID: tblWithDailyInterval.ID, LastJobStartTime: se.Now().Add(-time.Hour * 25)}}, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m.infoSchemaCache.Tables = make(map[int64]*cache.PhysicalTable)
+			for _, ist := range c.infoSchemaTables {
+				m.infoSchemaCache.Tables[ist.ID] = ist
+			}
+			m.tableStatusCache.Tables = make(map[int64]*cache.TableStatus)
+			for _, st := range c.tableStatus {
+				m.tableStatusCache.Tables[st.TableID] = st
+			}
+
+			tables := m.readyForLockHBTimeoutJobTables(se.Now())
+			if c.shouldSchedule {
+				assert.Len(t, tables, 1)
+				assert.Equal(t, tbl.ID, tables[0].TableID)
+				assert.Equal(t, tbl.ID, tables[0].ParentTableID)
+			} else {
+				assert.Len(t, tables, 0)
+			}
+		})
+	}
+}
+
+func TestOnTimerTick(t *testing.T) {
+	var leader atomic.Bool
+	m := NewJobManager("test-id", newMockSessionPool(t), nil, nil, func() bool {
+		return leader.Load()
+	})
+
+	tbl := newMockTTLTbl(t, "t1")
+	se := newMockSession(t)
+	se.sessionInfoSchema = newMockInfoSchemaWithVer(100, tbl.TableInfo)
+
+	timerStore := timerapi.NewMemoryTimerStore()
+	defer timerStore.Close()
+
+	a := &mockJobAdapter{}
+	a.On("CanSubmitJob").Return(false).Maybe()
+
+	rt := newTTLTimerRuntime(timerStore, a)
+	require.Nil(t, rt.rt)
+	defer rt.Pause()
+
+	now := time.UnixMilli(3600 * 24)
+	syncer := NewTTLTimerSyncer(m.sessPool, timerapi.NewDefaultTimerClient(timerStore))
+	defer m.sessPool.(*mockSessionPool).AssertNoSessionInUse()
+	syncer.nowFunc = func() time.Time {
+		return now
+	}
+
+	// pause after init
+	m.onTimerTick(se, rt, syncer, now)
+	require.Nil(t, rt.rt)
+	require.Equal(t, 0, len(syncer.key2Timers))
+	syncTime, syncVer := syncer.GetLastSyncInfo()
+	require.Zero(t, syncVer)
+	require.True(t, syncTime.IsZero())
+
+	// resume first time
+	leader.Store(true)
+	m.onTimerTick(se, rt, syncer, now)
+	innerRT := rt.rt
+	require.NotNil(t, innerRT)
+	require.True(t, innerRT.Running())
+	require.Equal(t, 1, len(syncer.key2Timers))
+	syncTime, syncVer = syncer.GetLastSyncInfo()
+	require.Equal(t, int64(100), syncVer)
+	require.Equal(t, now, syncTime)
+
+	// resume after a very short duration
+	now = now.Add(time.Microsecond * 999)
+	se.sessionInfoSchema = newMockInfoSchemaWithVer(101, tbl.TableInfo)
+	m.onTimerTick(se, rt, syncer, now)
+	require.Same(t, innerRT, rt.rt)
+	require.True(t, innerRT.Running())
+	require.Equal(t, 1, len(syncer.key2Timers))
+	syncTime, syncVer = syncer.GetLastSyncInfo()
+	require.Equal(t, int64(100), syncVer)
+	require.Equal(t, now.Add(-999*time.Microsecond), syncTime)
+
+	// resume after a middle duration
+	now = now.Add(2 * time.Millisecond)
+	m.onTimerTick(se, rt, syncer, now)
+	require.Same(t, innerRT, rt.rt)
+	require.True(t, innerRT.Running())
+	require.Equal(t, 1, len(syncer.key2Timers))
+	syncTime, syncVer = syncer.GetLastSyncInfo()
+	require.Equal(t, int64(101), syncVer)
+	require.Equal(t, now, syncTime)
+
+	// resume after a middle duration but infoschema not change
+	now = now.Add(6 * time.Second)
+	m.onTimerTick(se, rt, syncer, now)
+	require.Same(t, innerRT, rt.rt)
+	require.True(t, innerRT.Running())
+	require.Equal(t, 1, len(syncer.key2Timers))
+	syncTime, syncVer = syncer.GetLastSyncInfo()
+	require.Equal(t, int64(101), syncVer)
+	require.Equal(t, now.Add(-6*time.Second), syncTime)
+
+	// resume after a long duration
+	now = now.Add(3 * time.Minute)
+	m.onTimerTick(se, rt, syncer, now)
+	require.Same(t, innerRT, rt.rt)
+	require.True(t, innerRT.Running())
+	require.Equal(t, 1, len(syncer.key2Timers))
+	syncTime, syncVer = syncer.GetLastSyncInfo()
+	require.Equal(t, int64(101), syncVer)
+	require.Equal(t, now, syncTime)
+
+	// pause
+	leader.Store(false)
+	m.onTimerTick(se, rt, syncer, now)
+	require.Nil(t, rt.rt)
+	require.False(t, innerRT.Running())
+	syncTime, syncVer = syncer.GetLastSyncInfo()
+	require.Zero(t, syncVer)
+	require.True(t, syncTime.IsZero())
+}
+
+func TestLockTable(t *testing.T) {
+	now, err := time.Parse(timeFormat, "2022-12-05 17:13:05")
+	assert.NoError(t, err)
+	newJobExpireTime := now.Add(-time.Minute)
+	oldJobExpireTime := now.Add(-time.Hour)
+	oldJobStartTime := now.Add(-30 * time.Minute)
+
+	testPhysicalTable := &cache.PhysicalTable{ID: 1, Schema: ast.NewCIStr("test"), TableInfo: &model.TableInfo{ID: 1, Name: ast.NewCIStr("t1"), TTLInfo: &model.TTLInfo{ColumnName: ast.NewCIStr("test"), IntervalExprStr: "1", IntervalTimeUnit: int(ast.TimeUnitMinute), JobInterval: "1h"}}}
+
+	type executeInfo struct {
+		sql  string
+		args []any
+	}
+	getExecuteInfo := func(sql string, args []any) executeInfo {
+		return executeInfo{
+			sql,
+			args,
+		}
+	}
+	getExecuteInfoForUpdate := func(sql string, args []any) executeInfo {
+		return executeInfo{
+			sql + " FOR UPDATE NOWAIT",
+			args,
+		}
+	}
+	getExecuteInfoWithErr := func(sql string, args []any, err error) executeInfo {
+		require.NoError(t, err)
+		return executeInfo{
+			sql,
+			args,
+		}
+	}
+
+	type sqlExecute struct {
+		executeInfo
+
+		rows []chunk.Row
+		err  error
+	}
+	cases := []struct {
+		name          string
+		table         *cache.PhysicalTable
+		sqls          []sqlExecute
+		isCreate      bool
+		checkInterval bool
+		hasError      bool
+	}{
+		{"normal lock table for create", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+			{
+				getExecuteInfo(setTableStatusOwnerSQL("new-job-id", 1, now, now, newJobExpireTime, "test-id")),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(createJobHistorySQL("new-job-id", testPhysicalTable, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfoWithErr(cache.InsertIntoTTLTask(time.UTC, "new-job-id", 1, 0, nil, nil, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(updateStatusSQL, nil),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+		}, true, false, false},
+		{"normal lock table for create and check interval", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+			{
+				getExecuteInfo(setTableStatusOwnerSQL("new-job-id", 1, now, now, newJobExpireTime, "test-id")),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(createJobHistorySQL("new-job-id", testPhysicalTable, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfoWithErr(cache.InsertIntoTTLTask(time.UTC, "new-job-id", 1, 0, nil, nil, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(updateStatusSQL, nil),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+		}, true, true, false},
+		{"normal lock table for exist job", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+		}, false, false, true},
+		{"select nothing for create", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(insertNewTableIntoStatusSQL(1, 1)),
+				nil, nil,
+			},
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+			{
+				getExecuteInfo(setTableStatusOwnerSQL("new-job-id", 1, now, now, newJobExpireTime, "test-id")),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(createJobHistorySQL("new-job-id", testPhysicalTable, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfoWithErr(cache.InsertIntoTTLTask(time.UTC, "new-job-id", 1, 0, nil, nil, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(updateStatusSQL, nil),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+		}, true, false, false},
+		{"select nothing for create and check interval", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(insertNewTableIntoStatusSQL(1, 1)),
+				nil, nil,
+			},
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+			{
+				getExecuteInfo(setTableStatusOwnerSQL("new-job-id", 1, now, now, newJobExpireTime, "test-id")),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(createJobHistorySQL("new-job-id", testPhysicalTable, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfoWithErr(cache.InsertIntoTTLTask(time.UTC, "new-job-id", 1, 0, nil, nil, newJobExpireTime, now)),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(updateStatusSQL, nil),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+		}, true, true, false},
+		{"select nothing for exist job", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				nil, nil,
+			},
+		}, false, false, true},
+		{"running job but create", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1, CurrentJobTTLExpire: oldJobExpireTime, CurrentJobID: "job1", CurrentJobOwnerID: "owner1", CurrentJobOwnerHBTime: now, CurrentJobStartTime: oldJobStartTime}),
+				nil,
+			},
+		}, true, false, true},
+		{"running job but create and check interval", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1, CurrentJobTTLExpire: oldJobExpireTime, CurrentJobID: "job1", CurrentJobOwnerID: "owner1", CurrentJobOwnerHBTime: now, CurrentJobStartTime: oldJobStartTime}),
+				nil,
+			},
+		}, true, true, true},
+		{"running job but lock for exist job", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1, CurrentJobTTLExpire: oldJobExpireTime, CurrentJobID: "job1", CurrentJobOwnerID: "owner1", CurrentJobOwnerHBTime: now, CurrentJobStartTime: oldJobStartTime}),
+				nil,
+			},
+		}, false, false, true},
+		{"heartbeat timeout job but create", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1, CurrentJobTTLExpire: oldJobExpireTime, CurrentJobID: "job1", CurrentJobOwnerID: "owner1", CurrentJobOwnerHBTime: now.Add(-20 * time.Minute), CurrentJobStartTime: oldJobStartTime}),
+				nil,
+			},
+		}, true, false, true},
+		{"heartbeat timeout job but create with check interval", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1, CurrentJobTTLExpire: oldJobExpireTime, CurrentJobID: "job1", CurrentJobOwnerID: "owner1", CurrentJobOwnerHBTime: now.Add(-20 * time.Minute), CurrentJobStartTime: oldJobStartTime}),
+				nil,
+			},
+		}, true, true, true},
+		{"heartbeat timeout job for lock", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1, CurrentJobTTLExpire: oldJobExpireTime, CurrentJobID: "job1", CurrentJobOwnerID: "owner1", CurrentJobOwnerHBTime: now.Add(-20 * time.Minute), CurrentJobStartTime: oldJobStartTime}),
+				nil,
+			},
+			{
+				getExecuteInfo(setTableStatusOwnerSQL("job1", 1, oldJobStartTime, now, oldJobExpireTime, "test-id")),
+				nil, nil,
+			},
+			{
+				getExecuteInfo(updateStatusSQL, nil),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+		}, false, false, false},
+		{"return error", testPhysicalTable, []sqlExecute{
+			{
+				getExecuteInfoForUpdate(cache.SelectFromTTLTableStatusWithID(1)),
+				newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil,
+			},
+			{
+				getExecuteInfo(setTableStatusOwnerSQL("new-job-id", 1, now, now, newJobExpireTime, "test-id")),
+				nil, errors.New("test error message"),
+			},
+		}, true, false, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := NewJobManager("test-id", newMockSessionPool(t), nil, nil, nil)
+			m.infoSchemaCache.Tables[c.table.ID] = c.table
+			sqlCounter := 0
+			se := newMockSession(t)
+			se.executeSQL = func(ctx context.Context, sql string, args ...any) (rows []chunk.Row, err error) {
+				assert.Less(t, sqlCounter, len(c.sqls))
+				assert.Equal(t, c.sqls[sqlCounter].sql, sql)
+				assert.Equal(t, c.sqls[sqlCounter].args, args)
+
+				rows = c.sqls[sqlCounter].rows
+				err = c.sqls[sqlCounter].err
+				sqlCounter += 1
+				return
+			}
+
+			m.ctx = cache.SetMockExpireTime(context.Background(), newJobExpireTime)
+			var job *ttlJob
+			if c.isCreate {
+				job, err = m.lockNewJob(context.Background(), se, c.table, now, "new-job-id", c.checkInterval, true)
+			} else {
+				job, err = m.lockHBTimeoutJob(context.Background(), se, c.table.ID, c.table.TableInfo.ID, now)
+			}
+			require.Equal(t, len(c.sqls), sqlCounter)
+			if c.hasError {
+				assert.NotNil(t, err)
+				assert.Nil(t, job)
+			} else {
+				assert.Nil(t, err)
+				assert.NotNil(t, job)
+				assert.Equal(t, "test-id", job.ownerID)
+				assert.Equal(t, cache.JobStatusRunning, job.status)
+				assert.NotEmpty(t, job.tableID)
+				assert.Equal(t, c.table.ID, job.tableID)
+				if c.isCreate {
+					assert.Equal(t, "new-job-id", job.id)
+					assert.Equal(t, now, job.createTime)
+					assert.Equal(t, newJobExpireTime, job.ttlExpireTime)
+				} else {
+					assert.Equal(t, "job1", job.id)
+					assert.Equal(t, oldJobStartTime, job.createTime)
+					assert.Equal(t, oldJobExpireTime, job.ttlExpireTime)
+				}
+				require.Equal(t, 1, len(m.runningJobs))
+				require.Same(t, job, m.runningJobs[0])
+			}
+		})
+	}
+}
+
+func TestLockNewJobIndexScanFallbacks(t *testing.T) {
+	oldEnableIndexScan := vardef.TTLEnableIndexScan.Load()
+	vardef.TTLEnableIndexScan.Store(true)
+	defer vardef.TTLEnableIndexScan.Store(oldEnableIndexScan)
+
+	ttlTbl := newMockTTLTbl(t, "t1")
+	ttlTbl.ID = 1
+	ttlTbl.TableInfo.ID = 1
+	ttlTbl.Indices = []*model.IndexInfo{
+		{
+			ID:      10,
+			Name:    ast.NewCIStr("idx_time"),
+			Columns: []*model.IndexColumn{{Name: ttlTbl.TimeColumn.Name, Offset: ttlTbl.TimeColumn.Offset, Length: types.UnspecifiedLength}},
+			State:   model.StatePublic,
+			Unique:  true,
+		},
+	}
+
+	now := time.Date(2022, 12, 6, 1, 13, 5, 0, time.UTC)
+	expireTime := time.Date(2022, 12, 5, 16, 13, 5, 0, time.UTC)
+	m := NewJobManager("test-id", newMockSessionPool(t), nil, nil, nil)
+	m.infoSchemaCache.Tables[ttlTbl.ID] = ttlTbl
+	m.ctx = cache.SetMockExpireTime(context.Background(), expireTime)
+
+	se := newMockSession(t)
+	statusSQL, _ := cache.SelectFromTTLTableStatusWithID(1)
+	insertTaskSQL, _, err := cache.InsertIntoTTLTask(time.UTC, "new-job-id", 1, 0, nil, nil, expireTime, now)
+	require.NoError(t, err)
+	var taskArgs [][]any
+	se.executeSQL = func(_ context.Context, sql string, args ...any) ([]chunk.Row, error) {
+		switch sql {
+		case statusSQL + " FOR UPDATE NOWAIT":
+			return newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil
+		case setTableStatusOwnerTemplate:
+			return nil, nil
+		case createJobHistoryRowTemplate:
+			return nil, nil
+		case updateStatusSQL:
+			return newTTLTableStatusRows(&cache.TableStatus{TableID: 1}), nil
+		}
+		require.Equal(t, insertTaskSQL, sql)
+		taskArgs = append(taskArgs, append([]any(nil), args...))
+		return nil, nil
+	}
+
+	lockJob := func(allowIndexScan bool) []any {
+		taskArgs = nil
+		job, err := m.lockNewJob(context.Background(), se, ttlTbl, now, "new-job-id", false, allowIndexScan)
+		require.NoError(t, err)
+		require.NotNil(t, job)
+		require.Len(t, taskArgs, 1)
+		require.Empty(t, taskArgs[0][3])
+		require.Empty(t, taskArgs[0][4])
+		return taskArgs[0]
+	}
+
+	require.Equal(t, int64(10), lockJob(true)[7])
+	require.Nil(t, lockJob(false)[7])
+
+	// An index Region lookup failure is recoverable because the old PK scan
+	// task format covers the same rows. Use a RegionCache backed by an empty
+	// mock cluster to make LocateKeyRange exhaust its retries.
+	mockClient, _, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	regionCache := tikv.NewRegionCache(pdClient)
+	defer regionCache.Close()
+	defer pdClient.Close()
+	defer func() { require.NoError(t, mockClient.Close()) }()
+	m.store = &mockTiKVStore{regionCache: regionCache}
+	// The unique TTL index does not need the hidden handle for pagination. The
+	// empty key column list also makes the PK fallback use one full range without
+	// consulting the intentionally broken RegionCache again.
+	ttlTbl.KeyColumns = nil
+	ttlTbl.KeyColumnTypes = nil
+	require.Nil(t, lockJob(true)[7])
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	taskArgs = nil
+	job, err := m.lockNewJob(canceledCtx, se, ttlTbl, now, "new-job-id", false, true)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, job)
+	require.Empty(t, taskArgs)
+}
+
+func TestHandleSubmitJobRequestIndexScanVersionGate(t *testing.T) {
+	oldEnableIndexScan := vardef.TTLEnableIndexScan.Load()
+	defer vardef.TTLEnableIndexScan.Store(oldEnableIndexScan)
+
+	localVersion := serverinfo.VersionInfo{Version: "8.0.11-TiDB-v9.0.0", GitHash: "1111111"}
+	tests := []struct {
+		name            string
+		enableIndexScan bool
+		remoteVersion   serverinfo.VersionInfo
+		expectedScanID  any
+		expectedChecks  int
+		expectedError   bool
+	}{
+		{
+			name:            "same build enables index scan",
+			enableIndexScan: true,
+			remoteVersion:   localVersion,
+			expectedScanID:  int64(10),
+			expectedChecks:  2,
+		},
+		{
+			name:            "different build blocks until versions converge",
+			enableIndexScan: true,
+			remoteVersion: serverinfo.VersionInfo{
+				Version: localVersion.Version,
+				GitHash: "2222222",
+			},
+			expectedChecks: 2,
+			expectedError:  true,
+		},
+		{
+			name:            "disabled index scan uses PK scan during mixed build",
+			enableIndexScan: false,
+			remoteVersion: serverinfo.VersionInfo{
+				Version: localVersion.Version,
+				GitHash: "2222222",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vardef.TTLEnableIndexScan.Store(tt.enableIndexScan)
+			ttlTbl := newMockTTLTbl(t, "t1")
+			ttlTbl.Indices = []*model.IndexInfo{
+				{
+					ID:      10,
+					Name:    ast.NewCIStr("idx_time"),
+					Columns: []*model.IndexColumn{{Name: ttlTbl.TimeColumn.Name, Offset: ttlTbl.TimeColumn.Offset, Length: types.UnspecifiedLength}},
+					State:   model.StatePublic,
+					Unique:  true,
+				},
+			}
+
+			now := time.Date(2022, 12, 6, 1, 13, 5, 0, time.UTC)
+			expireTime := time.Date(2022, 12, 5, 16, 13, 5, 0, time.UTC)
+			m := NewJobManager("test-id", newMockSessionPool(t), nil, nil, func() bool { return true })
+			m.infoSchemaCache.Tables[ttlTbl.ID] = ttlTbl
+			m.ctx = cache.SetMockExpireTime(context.Background(), expireTime)
+			versionChecks := 0
+			remoteVersion := tt.remoteVersion
+			m.ctx = context.WithValue(m.ctx, getServerInfoForTestContextKey{}, func() (*serverinfo.ServerInfo, error) {
+				versionChecks++
+				return &serverinfo.ServerInfo{StaticInfo: serverinfo.StaticInfo{VersionInfo: localVersion}}, nil
+			})
+			m.ctx = context.WithValue(m.ctx, getAllServerInfoForTestContextKey{}, func(context.Context) (map[string]*serverinfo.ServerInfo, error) {
+				versionChecks++
+				return map[string]*serverinfo.ServerInfo{
+					"remote": {StaticInfo: serverinfo.StaticInfo{VersionInfo: remoteVersion}},
+				}, nil
+			})
+
+			se := newMockSession(t, ttlTbl)
+			statusSQL, _ := cache.SelectFromTTLTableStatusWithID(ttlTbl.ID)
+			insertTaskSQL, _, err := cache.InsertIntoTTLTask(time.UTC, "new-job-id", ttlTbl.ID, 0, nil, nil, expireTime, now)
+			require.NoError(t, err)
+			var taskArgs [][]any
+			se.executeSQL = func(_ context.Context, sql string, args ...any) ([]chunk.Row, error) {
+				switch sql {
+				case statusSQL + " FOR UPDATE NOWAIT":
+					return newTTLTableStatusRows(&cache.TableStatus{TableID: ttlTbl.ID}), nil
+				case setTableStatusOwnerTemplate, createJobHistoryRowTemplate:
+					return nil, nil
+				case updateStatusSQL:
+					return newTTLTableStatusRows(&cache.TableStatus{TableID: ttlTbl.ID}), nil
+				}
+				require.Equal(t, insertTaskSQL, sql)
+				taskArgs = append(taskArgs, append([]any(nil), args...))
+				return nil, nil
+			}
+
+			submitJob := func() error {
+				respCh := make(chan error, 1)
+				m.handleSubmitJobRequest(se, &SubmitTTLManagerJobRequest{
+					TableID: ttlTbl.TableInfo.ID, PhysicalID: ttlTbl.ID, RequestID: "new-job-id", RespCh: respCh,
+				})
+				return <-respCh
+			}
+
+			err = submitJob()
+			if tt.expectedError {
+				require.ErrorContains(t, err, "server build versions are inconsistent")
+				require.Equal(t, tt.expectedChecks, versionChecks)
+				require.Empty(t, taskArgs)
+
+				// The timer runtime retries a failed submission. Once the rolling
+				// upgrade converges and the mismatch cache expires, the next attempt
+				// creates the index scan task normally.
+				remoteVersion = localVersion
+				require.ErrorContains(t, submitJob(), "server build versions are inconsistent")
+				require.Equal(t, tt.expectedChecks, versionChecks)
+				require.Empty(t, taskArgs)
+
+				m.jobVersionChecker.lastCheckTime = time.Now().Add(-serverVersionMismatchCacheInterval)
+				require.NoError(t, submitJob())
+				require.Equal(t, tt.expectedChecks+2, versionChecks)
+				require.Len(t, taskArgs, 1)
+				require.Equal(t, int64(10), taskArgs[0][7])
+				return
+			}
+
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedChecks, versionChecks)
+			require.Len(t, taskArgs, 1)
+			require.Equal(t, tt.expectedScanID, taskArgs[0][7])
+		})
+	}
+}
+
+func TestLocalJobs(t *testing.T) {
+	tbl1 := newMockTTLTbl(t, "t1")
+	tbl1.ID = 1
+	tbl2 := newMockTTLTbl(t, "t2")
+	tbl2.ID = 2
+	m := NewJobManager("test-id", nil, nil, nil, nil)
+	m.sessPool = newMockSessionPool(t, tbl1, tbl2)
+
+	m.runningJobs = []*ttlJob{{tableID: tbl1.ID, id: "1"}, {tableID: tbl2.ID, id: "2"}}
+	m.tableStatusCache.Tables = map[int64]*cache.TableStatus{
+		tbl1.ID: {
+			CurrentJobOwnerID: m.id,
+		},
+		tbl2.ID: {
+			CurrentJobOwnerID: "another-id",
+		},
+	}
+	assert.Len(t, m.localJobs(), 1)
+	assert.Equal(t, m.localJobs()[0].id, "1")
+}
+
+func TestSplitCnt(t *testing.T) {
+	mockClient, _, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	require.Equal(t, 64, getScanSplitCnt(nil))
+	require.Equal(t, 64, getScanSplitCnt(&mockKVStore{}))
+
+	s := &mockTiKVStore{regionCache: tikv.NewRegionCache(pdClient)}
+	for i := uint64(1); i <= 128; i++ {
+		s.GetRegionCache().SetRegionCacheStore(i, "", "", tikvrpc.TiKV, 1, nil)
+		if i <= 64 {
+			require.Equal(t, 64, getScanSplitCnt(s))
+		} else {
+			require.Equal(t, int(i), getScanSplitCnt(s))
+		}
+	}
+}
+
+// SetTimeFormat sets the time format used by the test.
+// Some tests require a greater precision than the default time format. We don't change it globally to avoid potential compatibility issues.
+// Therefore, the format for most tests are also not changed, to make sure the tests can represent the real-world scenarios.
+func SetTimeFormat(format string) {
+	timeFormat = format
+}

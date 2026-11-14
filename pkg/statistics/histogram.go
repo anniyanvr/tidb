@@ -1,0 +1,2697 @@
+// Copyright 2017 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package statistics
+
+import (
+	"bytes"
+	"cmp"
+	"fmt"
+	"math"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+	"unsafe"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/parser/charset"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/planner/planctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	statslogutil "github.com/pingcap/tidb/pkg/statistics/handle/logutil"
+	"github.com/pingcap/tidb/pkg/tablecodec"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/codec"
+	"github.com/pingcap/tidb/pkg/util/collate"
+	"github.com/pingcap/tidb/pkg/util/generic"
+	"github.com/pingcap/tidb/pkg/util/hack"
+	"github.com/pingcap/tidb/pkg/util/intest"
+	"github.com/pingcap/tidb/pkg/util/mathutil"
+	"github.com/pingcap/tidb/pkg/util/ranger"
+	"github.com/pingcap/tidb/pkg/util/sqlkiller"
+	"github.com/pingcap/tipb/go-tipb"
+	"github.com/twmb/murmur3"
+	"go.uber.org/zap"
+)
+
+const (
+	outOfRangeBetweenRate float64 = 100
+)
+
+var (
+	// Global static chunk for pseudo histograms to avoid chunk allocation
+	globalPseudoChunkOnce sync.Once
+	globalPseudoChunk     *chunk.Chunk
+)
+
+// Histogram represents statistics for a column or index.
+type Histogram struct {
+	Tp *types.FieldType
+
+	// Histogram elements.
+	//
+	// A bucket bound is the smallest and greatest values stored in the bucket. The lower and upper bound
+	// are stored in one column.
+	//
+	// A bucket count is the number of items stored in all previous buckets and the current bucket.
+	// Bucket counts are always in increasing order.
+	//
+	// A bucket repeat is the number of repeats of the bucket value, it can be used to find popular values.
+	Bounds  *chunk.Chunk
+	Buckets []Bucket
+
+	// Used for estimating fraction of the interval [lower, upper] that lies within the [lower, value].
+	// For some types like `Int`, we do not build it because we can get them directly from `Bounds`.
+	Scalars   []scalar
+	ID        int64 // Column ID.
+	NDV       int64 // Number of distinct values. Note that It contains the NDV of the TopN which is excluded from histogram.
+	NullCount int64 // Number of null values.
+	// LastUpdateVersion is the version that this histogram updated last time.
+	LastUpdateVersion uint64
+
+	// TotColSize is the total column size for the histogram.
+	// For unfixed-len types, it includes LEN and BYTE.
+	TotColSize int64
+
+	// Correlation is the statistical correlation between physical row ordering and logical ordering of
+	// the column values. This ranges from -1 to +1, and it is only valid for Column histogram, not for
+	// Index histogram.
+	Correlation float64
+}
+
+// EmptyHistogramSize is the size of empty histogram, about 112 = 8*6 for int64 & float64, 24*2 for arrays, 8*2 for references.
+const EmptyHistogramSize = int64(unsafe.Sizeof(Histogram{}))
+
+// Bucket store the bucket count and repeat.
+type Bucket struct {
+	// Count is the number of items till this bucket.
+	Count int64
+	// Repeat is the number of times the upper-bound value of the bucket appears in the data.
+	// For example, in the range [x, y], Repeat indicates how many times y appears.
+	// It is used to estimate the row count of values equal to the upper bound of the bucket, similar to TopN.
+	Repeat int64
+	// NDV is the number of distinct values in the bucket.
+	NDV int64
+}
+
+// EmptyBucketSize is the size of empty bucket, 3*8=24 now.
+const EmptyBucketSize = int64(unsafe.Sizeof(Bucket{}))
+
+type scalar struct {
+	lower        float64
+	upper        float64
+	commonPfxLen int // commonPfxLen is the common prefix length of the lower bound and upper bound when the value type is KindString or KindBytes.
+}
+
+// EmptyScalarSize is the size of empty scalar.
+const EmptyScalarSize = int64(unsafe.Sizeof(scalar{}))
+
+// initGlobalPseudoChunk initializes the global static chunk for pseudo histograms
+func initGlobalPseudoChunk() {
+	// Create a minimal empty chunk that can be shared across all pseudo histograms
+	// Use a basic field type that won't cause issues when shared
+	globalPseudoChunk = chunk.NewEmptyChunk([]*types.FieldType{types.NewFieldType(mysql.TypeBlob)})
+}
+
+// getGlobalPseudoChunk returns the shared static chunk for pseudo histograms
+// WARNING: The returned chunk MUST NOT be modified. It is shared across all pseudo histograms.
+// Pseudo histograms should never have buckets added or bounds modified.
+func getGlobalPseudoChunk() *chunk.Chunk {
+	globalPseudoChunkOnce.Do(initGlobalPseudoChunk)
+	return globalPseudoChunk
+}
+
+// prepareFieldTypeForHistogram prepares the field type for histogram usage.
+// For string types, it clones the field type and sets the collation to binary
+// to avoid decoding issues with the histogram's key representation.
+func prepareFieldTypeForHistogram(tp *types.FieldType) *types.FieldType {
+	if tp.EvalType() == types.ETString {
+		// The histogram will store the string value's 'sort key' representation of its collation.
+		// If we directly set the field type's collation to its original one, we would decode the Key representation using its collation.
+		// This would cause panic. So we apply a little trick here to avoid decoding it by explicitly changing the collation to 'CollationBin'.
+		tp = tp.Clone()
+		tp.SetCollate(charset.CollationBin)
+	}
+	return tp
+}
+
+// NewPseudoHistogram creates a pseudo histogram that reuses global static components
+// This avoids chunk allocation while preserving field type semantics.
+func NewPseudoHistogram(id int64, tp *types.FieldType) *Histogram {
+	tp = prepareFieldTypeForHistogram(tp)
+	return &Histogram{
+		ID:                id,
+		NDV:               0,
+		NullCount:         0,
+		LastUpdateVersion: 0,
+		Tp:                tp,
+		Bounds:            getGlobalPseudoChunk(),
+		Buckets:           make([]Bucket, 0),
+		TotColSize:        0,
+		Correlation:       0,
+	}
+}
+
+// NewHistogram creates a new histogram.
+func NewHistogram(id, ndv, nullCount int64, version uint64, tp *types.FieldType, bucketSize int, totColSize int64) *Histogram {
+	tp = prepareFieldTypeForHistogram(tp)
+	return &Histogram{
+		ID:                id,
+		NDV:               ndv,
+		NullCount:         nullCount,
+		LastUpdateVersion: version,
+		Tp:                tp,
+		Bounds:            chunk.NewChunkFromPoolWithCapacity([]*types.FieldType{tp}, 2*bucketSize),
+		Buckets:           make([]Bucket, 0, bucketSize),
+		TotColSize:        totColSize,
+	}
+}
+
+// GetLower gets the lower bound of bucket `idx`.
+func (hg *Histogram) GetLower(idx int) *types.Datum {
+	d := hg.Bounds.GetRow(2*idx).GetDatum(0, hg.Tp)
+	return &d
+}
+
+// LowerToDatum gets the lower bound of bucket `idx` to datum.
+func (hg *Histogram) LowerToDatum(idx int, d *types.Datum) {
+	hg.Bounds.GetRow(2*idx).DatumWithBuffer(0, hg.Tp, d)
+}
+
+// GetUpper gets the upper bound of bucket `idx`.
+func (hg *Histogram) GetUpper(idx int) *types.Datum {
+	d := hg.Bounds.GetRow(2*idx+1).GetDatum(0, hg.Tp)
+	return &d
+}
+
+// UpperToDatum gets the upper bound of bucket `idx` to datum.
+func (hg *Histogram) UpperToDatum(idx int, d *types.Datum) {
+	hg.Bounds.GetRow(2*idx+1).DatumWithBuffer(0, hg.Tp, d)
+}
+
+// MemoryUsage returns the total memory usage of this Histogram.
+func (hg *Histogram) MemoryUsage() (sum int64) {
+	if hg == nil {
+		return
+	}
+	if len(hg.Buckets) == 0 && len(hg.Scalars) == 0 && hg.Bounds.Capacity() == 0 {
+		return
+	}
+	sum = EmptyHistogramSize + hg.Bounds.MemoryUsage() + int64(cap(hg.Buckets))*EmptyBucketSize + int64(cap(hg.Scalars))*EmptyScalarSize
+	return sum
+}
+
+// AppendBucket appends a bucket into `hg`.
+func (hg *Histogram) AppendBucket(lower *types.Datum, upper *types.Datum, count, repeat int64) {
+	hg.AppendBucketWithNDV(lower, upper, count, repeat, 0)
+}
+
+// AppendBucketWithNDV appends a bucket into `hg` and set value for field `NDV`.
+func (hg *Histogram) AppendBucketWithNDV(lower *types.Datum, upper *types.Datum, count, repeat, ndv int64) {
+	hg.Buckets = append(hg.Buckets, Bucket{Count: count, Repeat: repeat, NDV: ndv})
+	hg.Bounds.AppendDatum(0, lower)
+	hg.Bounds.AppendDatum(0, upper)
+}
+
+func (hg *Histogram) updateLastBucket(upper *types.Datum, count, repeat int64, needBucketNDV bool) {
+	l := hg.Len()
+	hg.Bounds.TruncateTo(2*l - 1)
+	hg.Bounds.AppendDatum(0, upper)
+	// The sampling case doesn't hold NDV since the low sampling rate. So check the NDV here.
+	bucket := &hg.Buckets[l-1]
+	if needBucketNDV && bucket.NDV > 0 {
+		bucket.NDV++
+	}
+	bucket.Count = count
+	bucket.Repeat = repeat
+}
+
+// DecodeTo decodes the histogram bucket values into `tp`.
+func (hg *Histogram) DecodeTo(tp *types.FieldType, timeZone *time.Location) error {
+	oldIter := chunk.NewIterator4Chunk(hg.Bounds)
+	hg.Bounds = chunk.NewChunkWithCapacity([]*types.FieldType{tp}, oldIter.Len())
+	hg.Tp = tp
+	for row := oldIter.Begin(); row != oldIter.End(); row = oldIter.Next() {
+		datum, err := tablecodec.DecodeColumnValue(row.GetBytes(0), tp, timeZone)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		hg.Bounds.AppendDatum(0, &datum)
+	}
+	return nil
+}
+
+// ConvertTo converts the histogram bucket values into `tp`.
+func (hg *Histogram) ConvertTo(tctx types.Context, tp *types.FieldType) (*Histogram, error) {
+	hist := NewHistogram(hg.ID, hg.NDV, hg.NullCount, hg.LastUpdateVersion, tp, hg.Len(), hg.TotColSize)
+	hist.Correlation = hg.Correlation
+	iter := chunk.NewIterator4Chunk(hg.Bounds)
+	for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+		d := row.GetDatum(0, hg.Tp)
+		d, err := d.ConvertTo(tctx, tp)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		hist.Bounds.AppendDatum(0, &d)
+	}
+	hist.Buckets = hg.Buckets
+	return hist, nil
+}
+
+// Len is the number of buckets in the histogram.
+func (hg *Histogram) Len() int {
+	return len(hg.Buckets)
+}
+
+// DestroyAndPutToPool resets the FMSketch and puts it to the pool.
+func (hg *Histogram) DestroyAndPutToPool() {
+	if hg == nil {
+		return
+	}
+	hg.Bounds.Destroy(len(hg.Buckets), []*types.FieldType{hg.Tp})
+}
+
+// HistogramEqual tests if two histograms are equal.
+func HistogramEqual(a, b *Histogram, ignoreID bool) bool {
+	if ignoreID {
+		old := b.ID
+		b.ID = a.ID
+		defer func() { b.ID = old }()
+	}
+	return bytes.Equal([]byte(a.ToString(0)), []byte(b.ToString(0)))
+}
+
+// constants for stats version. These const can be used for solving compatibility issue.
+const (
+	// Version0 is the state that no statistics is actually collected, only the meta info.(the total count and the average col size)
+	Version0 = 0
+	// Version1 maintains the statistics in the following way.
+	// Column stats: CM Sketch is built in TiKV using full data. Histogram is built from samples. TopN is extracted from CM Sketch.
+	//    TopN + CM Sketch represent all data. Histogram also represents all data.
+	// Index stats: CM Sketch and Histogram is built in TiKV using full data. TopN is extracted from histogram. Then values covered by TopN is removed from CM Sketch.
+	//    TopN + CM Sketch represent all data. Histogram also represents all data.
+	// Int PK column stats is always Version1 because it only has histogram built from full data.
+	// Fast analyze is always Version1 currently.
+	Version1 = 1
+	// Version2 maintains the statistics in the following way.
+	// Column stats: CM Sketch is not used. TopN and Histogram are built from samples. TopN + Histogram represent all data.(The values covered by TopN is removed from Histogram.)
+	// Index stats: CM SKetch is not used. TopN and Histograms are built from samples. TopN + Histogram represent all data.(The values covered by TopN is removed from Histogram.)
+	// Both Column and Index's NDVs are collected by full scan.
+	Version2 = 2
+)
+
+// IsAnalyzed checks whether statistics are analyzed based on stats version.
+func IsAnalyzed(statsVer int64) bool {
+	return statsVer != Version0
+}
+
+// IsColumnAnalyzedOrSynthesized checks whether column statistics are available based on raw storage values.
+// This includes both analyzed stats (statsVer != Version0) and synthesized stats from default values
+// (which have statsVer == Version0 but ndv > 0 or nullCount > 0).
+// This function is used to determine the 'analyzed' flag when inserting column stats into ColAndIdxExistenceMap.
+// NOTE: Synthesized stats are only applicable to column stats, not index stats.
+// They are only created when adding a column with a default value. See: InsertColStats2KV
+func IsColumnAnalyzedOrSynthesized(statsVer int64, ndv int64, nullCount int64) bool {
+	return IsAnalyzed(statsVer) || ndv > 0 || nullCount > 0
+}
+
+// ValueToString converts a possible encoded value to a formatted string. If the value is encoded, then
+// idxCols equals to number of origin values, else idxCols is 0.
+func ValueToString(vars *variable.SessionVars, value *types.Datum, idxCols int, idxColumnTypes []byte) (string, error) {
+	if idxCols == 0 {
+		return value.ToString()
+	}
+	var loc *time.Location
+	if vars != nil {
+		loc = vars.Location()
+	}
+	// Ignore the error and treat remaining part that cannot decode successfully as bytes.
+	decodedVals, remained, err := codec.DecodeRange(value.GetBytes(), idxCols, idxColumnTypes, loc)
+	// Ignore err explicit to pass errcheck.
+	_ = err
+	if len(remained) > 0 {
+		decodedVals = append(decodedVals, types.NewBytesDatum(remained))
+	}
+	str, err := types.DatumsToString(decodedVals, true)
+	return str, err
+}
+
+// BucketToString change the given bucket to string format.
+func (hg *Histogram) BucketToString(bktID, idxCols int) string {
+	upperVal, err := ValueToString(nil, hg.GetUpper(bktID), idxCols, nil)
+	terror.Log(errors.Trace(err))
+	lowerVal, err := ValueToString(nil, hg.GetLower(bktID), idxCols, nil)
+	terror.Log(errors.Trace(err))
+	return fmt.Sprintf("num: %d lower_bound: %s upper_bound: %s repeats: %d ndv: %d", hg.BucketCount(bktID), lowerVal, upperVal, hg.Buckets[bktID].Repeat, hg.Buckets[bktID].NDV)
+}
+
+// RemoveVals remove the given values from the histogram.
+// This function contains an **ASSUMPTION**: valCntPairs is sorted in ascending order.
+func (hg *Histogram) RemoveVals(valCntPairs []TopNMeta) {
+	totalSubCnt := int64(0)
+	var cmpResult int
+	for bktIdx, pairIdx := 0, 0; bktIdx < hg.Len(); bktIdx++ {
+		for pairIdx < len(valCntPairs) {
+			// If the current val smaller than current bucket's lower bound, skip it.
+			cmpResult = bytes.Compare(hg.Bounds.Column(0).GetRaw(bktIdx*2), valCntPairs[pairIdx].Encoded)
+			if cmpResult > 0 {
+				pairIdx++
+				continue
+			}
+			// If the current val bigger than current bucket's upper bound, break.
+			cmpResult = bytes.Compare(hg.Bounds.Column(0).GetRaw(bktIdx*2+1), valCntPairs[pairIdx].Encoded)
+			if cmpResult < 0 {
+				break
+			}
+			totalSubCnt += int64(valCntPairs[pairIdx].Count)
+			if hg.Buckets[bktIdx].NDV > 0 {
+				hg.Buckets[bktIdx].NDV--
+			}
+			pairIdx++
+			if cmpResult == 0 {
+				hg.Buckets[bktIdx].Repeat = 0
+				break
+			}
+		}
+		hg.Buckets[bktIdx].Count -= totalSubCnt
+		if hg.Buckets[bktIdx].Count < 0 {
+			hg.Buckets[bktIdx].Count = 0
+		}
+	}
+}
+
+// StandardizeForV2AnalyzeIndex fixes some "irregular" places in the Histogram, which come from current implementation of
+// analyze index task in v2.
+// For now, it does two things: 1. Remove empty buckets. 2. Reset Bucket.NDV to 0.
+func (hg *Histogram) StandardizeForV2AnalyzeIndex() {
+	if hg == nil || len(hg.Buckets) == 0 {
+		return
+	}
+	// Note that hg.Buckets is []Bucket instead of []*Bucket, so we avoid extra memory allocation for the struct Bucket
+	// in the process below.
+
+	// remainedBktIdxs are the positions of the eventually remained buckets in the original hg.Buckets slice.
+	remainedBktIdxs := make([]int, 0, len(hg.Buckets))
+	// We use two pointers here.
+	// checkingIdx is the "fast" one, and it iterates the hg.Buckets and check if they are empty one by one.
+	// When we find a non-empty bucket, we move it to the position where nextRemainedBktIdx, which is the "slow"
+	// pointer, points to.
+	nextRemainedBktIdx := 0
+	for checkingIdx := range hg.Buckets {
+		if hg.BucketCount(checkingIdx) <= 0 && hg.Buckets[checkingIdx].Repeat <= 0 {
+			continue
+		}
+		remainedBktIdxs = append(remainedBktIdxs, checkingIdx)
+		if nextRemainedBktIdx != checkingIdx {
+			hg.Buckets[nextRemainedBktIdx] = hg.Buckets[checkingIdx]
+		}
+		hg.Buckets[nextRemainedBktIdx].NDV = 0
+		nextRemainedBktIdx++
+	}
+	hg.Buckets = hg.Buckets[:nextRemainedBktIdx]
+
+	// Get the new Bounds from the original Bounds according to the indexes we collect.
+	c := chunk.NewChunkWithCapacity([]*types.FieldType{hg.Tp}, len(remainedBktIdxs))
+	for _, i := range remainedBktIdxs {
+		c.AppendDatum(0, hg.GetLower(i))
+		c.AppendDatum(0, hg.GetUpper(i))
+	}
+	hg.Bounds = c
+}
+
+// ToString gets the string representation for the histogram.
+func (hg *Histogram) ToString(idxCols int) string {
+	strs := make([]string, 0, hg.Len()+1)
+	if idxCols > 0 {
+		strs = append(strs, fmt.Sprintf("index:%d ndv:%d", hg.ID, hg.NDV))
+	} else {
+		strs = append(strs, fmt.Sprintf("column:%d ndv:%d totColSize:%d", hg.ID, hg.NDV, hg.TotColSize))
+	}
+	for i := range hg.Len() {
+		strs = append(strs, hg.BucketToString(i, idxCols))
+	}
+	return strings.Join(strs, "\n")
+}
+
+// EqualRowCount estimates the row count where the column equals to value.
+// matched: return true if this returned row count is from Bucket.Repeat or bucket NDV, which is more accurate than if not.
+// The input sctx is just for debug trace, you can pass nil safely if that's not needed.
+func (hg *Histogram) EqualRowCount(sctx planctx.PlanContext, value types.Datum, hasBucketNDV bool) (count float64, matched bool) {
+	_, bucketIdx, inBucket, match := hg.LocateBucket(sctx, value)
+	if !inBucket {
+		return 0, false
+	}
+	if match {
+		return float64(hg.Buckets[bucketIdx].Repeat), true
+	}
+	if hasBucketNDV && hg.Buckets[bucketIdx].NDV > 1 {
+		return float64(hg.BucketCount(bucketIdx)-hg.Buckets[bucketIdx].Repeat) / float64(hg.Buckets[bucketIdx].NDV-1), true
+	}
+	return hg.NotNullCount() / float64(hg.NDV), false
+}
+
+// GreaterRowCount estimates the row count where the column greater than value.
+// It's deprecated. Only used for test.
+func (hg *Histogram) GreaterRowCount(value types.Datum) float64 {
+	histRowCount, _ := hg.EqualRowCount(nil, value, false)
+	gtCount := hg.NotNullCount() - hg.LessRowCount(nil, value) - histRowCount
+	return math.Max(0, gtCount)
+}
+
+// LocateBucket locates where a value falls in the range of the Histogram.
+// The input sctx is just for debug trace, you can pass nil safely if that's not needed.
+//
+// Return value:
+// exceed: if the value is larger than the upper bound of the last Bucket of the Histogram.
+// bucketIdx: assuming exceed if false, which Bucket does this value fall in (note: the range before a Bucket is also
+// considered belong to this Bucket).
+// inBucket: assuming exceed if false, whether this value falls in this Bucket, instead of falls between
+// this Bucket and the previous Bucket.
+// matchLastValue: assuming inBucket is true, if this value is the last value in this Bucket, which has a counter (Bucket.Repeat).
+//
+// Examples:
+// val0 |<-[bkt0]->| |<-[bkt1]->val1(last value)| val2 |<--val3--[bkt2]->| |<-[bkt3]->| val4
+// locateBucket(val0): false, 0, false, false
+// locateBucket(val1): false, 1, true, true
+// locateBucket(val2): false, 2, false, false
+// locateBucket(val3): false, 2, true, false
+// locateBucket(val4): true, 3, false, false
+func (hg *Histogram) LocateBucket(_ planctx.PlanContext, value types.Datum) (exceed bool, bucketIdx int, inBucket, matchLastValue bool) {
+	// Empty histogram
+	if hg == nil || hg.Bounds.NumRows() == 0 {
+		return true, 0, false, false
+	}
+	index, match := hg.Bounds.LowerBound(0, &value)
+	// The value is larger than the max value in the histogram (exceed is true)
+	if index >= hg.Bounds.NumRows() {
+		return true, hg.Len() - 1, false, false
+	}
+	bucketIdx = index / 2
+	// The value is before this bucket
+	if index%2 == 0 && !match {
+		return false, bucketIdx, false, false
+	}
+	// The value matches the last value in this bucket
+	// case 1: The LowerBound()'s return value tells us the value matches an upper bound of a bucket
+	// case 2: We compare and find that the value is equal to the upper bound of this bucket. This might happen when
+	//           the bucket's lower bound is equal to its upper bound.
+	if (index%2 == 1 && match) || chunk.Compare(hg.Bounds.GetRow(bucketIdx*2+1), 0, &value) == 0 {
+		return false, bucketIdx, true, true
+	}
+	// The value is in the bucket and isn't the last value in this bucket
+	return false, bucketIdx, true, false
+}
+
+// LessRowCountWithBktIdx estimates the row count where the column less than value.
+// The input sctx is just for debug trace, you can pass nil safely if that's not needed.
+func (hg *Histogram) LessRowCountWithBktIdx(sctx planctx.PlanContext, value types.Datum) (result float64, bucketIdx int) {
+	// All the values are null.
+	if hg.Bounds.NumRows() == 0 {
+		return 0, 0
+	}
+	exceed, bucketIdx, inBucket, match := hg.LocateBucket(sctx, value)
+	if exceed {
+		return hg.NotNullCount(), hg.Len() - 1
+	}
+	preCount := float64(0)
+	if bucketIdx > 0 {
+		preCount = float64(hg.Buckets[bucketIdx-1].Count)
+	}
+	if !inBucket {
+		return preCount, bucketIdx
+	}
+	curCount, curRepeat := float64(hg.Buckets[bucketIdx].Count), float64(hg.Buckets[bucketIdx].Repeat)
+	if match {
+		return curCount - curRepeat, bucketIdx
+	}
+	return preCount + hg.calcFraction(bucketIdx, &value)*(curCount-curRepeat-preCount), bucketIdx
+}
+
+// LessRowCount estimates the row count where the column less than value.
+// The input sctx is just for debug trace, you can pass nil safely if that's not needed.
+func (hg *Histogram) LessRowCount(sctx planctx.PlanContext, value types.Datum) float64 {
+	result, _ := hg.LessRowCountWithBktIdx(sctx, value)
+	return result
+}
+
+// BetweenRowCount estimates the row count where column greater or equal to a and less than b.
+// The input sctx is required for stats version 2. For version 1, it is just for debug trace, you can pass nil safely.
+func (hg *Histogram) BetweenRowCount(sctx planctx.PlanContext, a, b types.Datum) RowEstimate {
+	lessCountA, bktIndexA := hg.LessRowCountWithBktIdx(sctx, a)
+	lessCountB, bktIndexB := hg.LessRowCountWithBktIdx(sctx, b)
+	rangeEst := DefaultRowEst(lessCountB - lessCountA)
+	lowEqual, _ := hg.EqualRowCount(sctx, a, false)
+	ndvAvg := hg.NotNullCount() / float64(hg.NDV)
+	// If values fall in the same bucket, we may underestimate the fractional result. So estimate the low value (a) as an equals, and
+	// estimate the high value as the default (because the input high value may be "larger" than the true high value). The range should
+	// not be less than both the low+high - or the lesser of the estimate for the individual range of a or b is used as a bound.
+	if rangeEst.Est < max(lowEqual, ndvAvg) && hg.NDV > 0 {
+		result := min(lessCountB, hg.NotNullCount()-lessCountA)
+		rangeEst = DefaultRowEst(min(result, lowEqual+ndvAvg))
+	}
+	// LessCounts are equal only if no valid buckets or both values are out of range
+	isInValidBucket := lessCountA != lessCountB
+	// If values in the same bucket, use skewRatio to adjust the range estimate to account for potential skew.
+	if isInValidBucket && bktIndexA == bktIndexB {
+		// sctx may be nil for stats version 1
+		if sctx != nil {
+			skewRatio := sctx.GetSessionVars().RiskRangeSkewRatio
+			sctx.GetSessionVars().RecordRelevantOptVar(vardef.TiDBOptRiskRangeSkewRatio)
+			// Worst case skew is if the range includes all the rows in the bucket
+			skewEstimate := hg.Buckets[bktIndexA].Count
+			if bktIndexA > 0 {
+				skewEstimate -= hg.Buckets[bktIndexA-1].Count
+			}
+			// If range does not include last value of its bucket, remove the repeat count from the skew estimate.
+			if lessCountB <= float64(hg.Buckets[bktIndexA].Count-hg.Buckets[bktIndexA].Repeat) {
+				skewEstimate -= hg.Buckets[bktIndexA].Repeat
+			}
+			if skewRatio > 0 {
+				// Cap the max estimate to 2X the estimate, but not beyond the bucket's maximum possible row count.
+				// TODO: RiskRangeSkewRatio is predominantly used for outOfRangeRowCount, and
+				//       it's usage is diluted here. Consider how to address this if
+				//       issues are reported here regarding under-estimation for in-bucket ranges.
+				rangeEst = CalculateSkewRatioCounts(rangeEst.Est, min(rangeEst.Est*2, float64(skewEstimate)), skewRatio)
+			}
+			// Report the full max estimate for risk estimation usage in compareCandidates (skylinePruning).
+			rangeEst.MaxEst = max(rangeEst.MaxEst, float64(skewEstimate))
+		}
+	}
+	return rangeEst
+}
+
+// CalculateSkewRatioCounts calculates the default, min, and max skew estimates given a skew ratio.
+func CalculateSkewRatioCounts(estimate, skewEstimate, skewRatio float64) RowEstimate {
+	skewDiff := skewEstimate - estimate
+	// Add a "ratio" of the skewEstimate to adjust the default row estimate.
+	skewAmt := max(0, skewDiff*skewRatio)
+	maxSkewAmt := min(skewDiff, 2*skewAmt)
+	return RowEstimate{estimate + skewAmt, estimate, estimate + maxSkewAmt}
+}
+
+// RowEstimate stores the min, default, and max row count estimates.
+type RowEstimate struct {
+	Est    float64
+	MinEst float64
+	MaxEst float64
+}
+
+// DefaultRowEst returns a RowEstimate with same value for all three fields
+func DefaultRowEst(est float64) RowEstimate {
+	return RowEstimate{est, est, est}
+}
+
+// Add adds two RowEstimates together, storing result in the first RowEstimate.
+func (r *RowEstimate) Add(r1 RowEstimate) {
+	r.Est += r1.Est
+	r.MinEst += r1.MinEst
+	r.MaxEst += r1.MaxEst
+}
+
+// AddAll adds a float64 value to all three fields of the RowEstimate and stores the result.
+func (r *RowEstimate) AddAll(f float64) {
+	r.Est += f
+	r.MinEst += f
+	r.MaxEst += f
+}
+
+// Subtract subtracts two RowEstimates together, storing result in the first RowEstimate.
+func (r *RowEstimate) Subtract(r1 RowEstimate) {
+	r.Est -= r1.Est
+	r.MinEst -= r1.MinEst
+	r.MaxEst -= r1.MaxEst
+}
+
+// MultiplyAll multiplies all three fields of the RowEstimate by a float64 value and stores the result.
+func (r *RowEstimate) MultiplyAll(f float64) {
+	r.Est *= f
+	r.MinEst *= f
+	r.MaxEst *= f
+}
+
+// DivideAll divides all three fields of the RowEstimate by a float64 value and stores the result.
+func (r *RowEstimate) DivideAll(f float64) {
+	r.Est /= f
+	r.MinEst /= f
+	r.MaxEst /= f
+}
+
+// Clamp clamps all three fields of the RowEstimate to the given min and max values.
+// Don't allow MinEst to be greater than Est, or MaxEst to be less than Est.
+func (r *RowEstimate) Clamp(f1, f2 float64) {
+	r.Est = mathutil.Clamp(r.Est, f1, f2)
+	r.MinEst = min(r.MinEst, r.Est)
+	r.MinEst = mathutil.Clamp(r.MinEst, f1, f2)
+	r.MaxEst = max(r.MaxEst, r.Est)
+	r.MaxEst = mathutil.Clamp(r.MaxEst, f1, f2)
+}
+
+// TotalRowCount returns the total count of this histogram.
+func (hg *Histogram) TotalRowCount() float64 {
+	return hg.NotNullCount() + float64(hg.NullCount)
+}
+
+// AbsRowCountDifference returns the absolute difference between the realtime row count
+// and the histogram's total row count, representing data changes since the last ANALYZE.
+func (hg *Histogram) AbsRowCountDifference(realtimeRowCount int64) float64 {
+	return math.Abs(float64(realtimeRowCount) - hg.TotalRowCount())
+}
+
+// NotNullCount indicates the count of non-null values in column histogram and single-column index histogram,
+// for multi-column index histogram, since we cannot define null for the row, we treat all rows as non-null, that means,
+// notNullCount would return same value as TotalRowCount for multi-column index histograms.
+func (hg *Histogram) NotNullCount() float64 {
+	if hg.Len() == 0 {
+		return 0
+	}
+	return float64(hg.Buckets[hg.Len()-1].Count)
+}
+
+// mergeBuckets is used to Merge every two neighbor buckets.
+func (hg *Histogram) mergeBuckets(bucketIdx int) {
+	curBuck := 0
+	c := chunk.NewChunkWithCapacity([]*types.FieldType{hg.Tp}, bucketIdx)
+	for i := 0; i+1 <= bucketIdx; i += 2 {
+		hg.Buckets[curBuck].NDV = hg.Buckets[i+1].NDV + hg.Buckets[i].NDV
+		hg.Buckets[curBuck].Count = hg.Buckets[i+1].Count
+		hg.Buckets[curBuck].Repeat = hg.Buckets[i+1].Repeat
+		c.AppendDatum(0, hg.GetLower(i))
+		c.AppendDatum(0, hg.GetUpper(i+1))
+		curBuck++
+	}
+	if bucketIdx%2 == 0 {
+		hg.Buckets[curBuck] = hg.Buckets[bucketIdx]
+		c.AppendDatum(0, hg.GetLower(bucketIdx))
+		c.AppendDatum(0, hg.GetUpper(bucketIdx))
+		curBuck++
+	}
+	hg.Bounds = c
+	hg.Buckets = hg.Buckets[:curBuck]
+}
+
+// GetIncreaseFactor will return a factor of data increasing after the last analysis.
+func (hg *Histogram) GetIncreaseFactor(totalCount int64) float64 {
+	columnCount := hg.TotalRowCount()
+	if columnCount == 0 {
+		// avoid dividing by 0
+		return 1.0
+	}
+	return float64(totalCount) / columnCount
+}
+
+// validRange checks if the range is Valid, it is used by `SplitRange` to remove the invalid range,
+// the possible types of range are index key range and handle key range.
+func validRange(sc *stmtctx.StatementContext, ran *ranger.Range, encoded bool) bool {
+	var low, high []byte
+	if encoded {
+		low, high = ran.LowVal[0].GetBytes(), ran.HighVal[0].GetBytes()
+	} else {
+		var err error
+		low, err = codec.EncodeKey(sc.TimeZone(), nil, ran.LowVal[0])
+		err = sc.HandleError(err)
+		if err != nil {
+			return false
+		}
+		high, err = codec.EncodeKey(sc.TimeZone(), nil, ran.HighVal[0])
+		err = sc.HandleError(err)
+		if err != nil {
+			return false
+		}
+	}
+	if ran.LowExclude {
+		low = kv.Key(low).PrefixNext()
+	}
+	if !ran.HighExclude {
+		high = kv.Key(high).PrefixNext()
+	}
+	return bytes.Compare(low, high) < 0
+}
+
+func checkKind(vals []types.Datum, kind byte) bool {
+	if kind == types.KindString {
+		kind = types.KindBytes
+	}
+	for _, val := range vals {
+		valKind := val.Kind()
+		if valKind == types.KindNull || valKind == types.KindMinNotNull || valKind == types.KindMaxValue {
+			continue
+		}
+		if valKind == types.KindString {
+			valKind = types.KindBytes
+		}
+		if valKind != kind {
+			return false
+		}
+		// Only check the first non-null value.
+		break
+	}
+	return true
+}
+
+func (hg *Histogram) typeMatch(ranges []*ranger.Range) bool {
+	kind := hg.GetLower(0).Kind()
+	for _, ran := range ranges {
+		if !checkKind(ran.LowVal, kind) || !checkKind(ran.HighVal, kind) {
+			return false
+		}
+	}
+	return true
+}
+
+// SplitRange splits the range according to the histogram lower bound. Note that we treat first bucket's lower bound
+// as -inf and last bucket's upper bound as +inf, so all the split ranges will totally fall in one of the (-inf, l(1)),
+// [l(1), l(2)),...[l(n-2), l(n-1)), [l(n-1), +inf), where n is the number of buckets, l(i) is the i-th bucket's lower bound.
+func (hg *Histogram) SplitRange(sc *stmtctx.StatementContext, oldRanges []*ranger.Range, encoded bool) ([]*ranger.Range, bool) {
+	if !hg.typeMatch(oldRanges) {
+		return oldRanges, false
+	}
+	// Treat the only buckets as (-inf, +inf), so we do not need split it.
+	if hg.Len() == 1 {
+		return oldRanges, true
+	}
+	ranges := make([]*ranger.Range, 0, len(oldRanges))
+	for _, ran := range oldRanges {
+		ranges = append(ranges, ran.Clone())
+	}
+	split := make([]*ranger.Range, 0, len(ranges))
+	for len(ranges) > 0 {
+		// Find the first bound that greater than the LowVal.
+		idx := hg.Bounds.UpperBound(0, &ranges[0].LowVal[0])
+		// Treat last bucket's upper bound as +inf, so we do not need split any more.
+		if idx >= hg.Bounds.NumRows()-1 {
+			split = append(split, ranges...)
+			break
+		}
+		// Treat first buckets's lower bound as -inf, just increase it to the next lower bound.
+		if idx == 0 {
+			idx = 2
+		}
+		// Get the next lower bound.
+		if idx%2 == 1 {
+			idx++
+		}
+		lowerBound := hg.Bounds.GetRow(idx)
+		var i int
+		// Find the first range that need to be split by the lower bound.
+		for ; i < len(ranges); i++ {
+			if chunk.Compare(lowerBound, 0, &ranges[i].HighVal[0]) <= 0 {
+				break
+			}
+		}
+		split = append(split, ranges[:i]...)
+		ranges = ranges[i:]
+		if len(ranges) == 0 {
+			break
+		}
+		// Split according to the lower bound.
+		cmp := chunk.Compare(lowerBound, 0, &ranges[0].LowVal[0])
+		if cmp > 0 {
+			lower := lowerBound.GetDatum(0, hg.Tp)
+			newRange := &ranger.Range{
+				LowExclude:  ranges[0].LowExclude,
+				LowVal:      []types.Datum{ranges[0].LowVal[0]},
+				HighVal:     []types.Datum{lower},
+				HighExclude: true,
+				Collators:   ranges[0].Collators,
+			}
+			if validRange(sc, newRange, encoded) {
+				split = append(split, newRange)
+			}
+			ranges[0].LowVal[0] = lower
+			ranges[0].LowExclude = false
+			if !validRange(sc, ranges[0], encoded) {
+				ranges = ranges[1:]
+			}
+		}
+	}
+	return split, true
+}
+
+// BucketCount returns the count of the bucket with index idx.
+func (hg *Histogram) BucketCount(idx int) int64 {
+	if idx == 0 {
+		return hg.Buckets[0].Count
+	}
+	return hg.Buckets[idx].Count - hg.Buckets[idx-1].Count
+}
+
+// HistogramToProto converts Histogram to its protobuf representation.
+// Note that when this is used, the lower/upper bound in the bucket must be BytesDatum.
+func HistogramToProto(hg *Histogram) *tipb.Histogram {
+	protoHg := &tipb.Histogram{
+		Ndv: hg.NDV,
+	}
+	for i := range hg.Len() {
+		bkt := &tipb.Bucket{
+			Count:      hg.Buckets[i].Count,
+			LowerBound: DeepSlice(hg.GetLower(i).GetBytes()),
+			UpperBound: DeepSlice(hg.GetUpper(i).GetBytes()),
+			Repeats:    hg.Buckets[i].Repeat,
+			Ndv:        &hg.Buckets[i].NDV,
+		}
+		protoHg.Buckets = append(protoHg.Buckets, bkt)
+	}
+	return protoHg
+}
+
+// DeepSlice sallowly clones a slice.
+func DeepSlice[T any](s []T) []T {
+	r := make([]T, len(s))
+	copy(r, s)
+	return r
+}
+
+// HistogramFromProto converts Histogram from its protobuf representation.
+// Note that we will set BytesDatum for the lower/upper bound in the bucket, the decode will
+// be after all histograms merged.
+func HistogramFromProto(protoHg *tipb.Histogram) *Histogram {
+	tp := types.NewFieldType(mysql.TypeBlob)
+	hg := NewHistogram(0, protoHg.Ndv, 0, 0, tp, len(protoHg.Buckets), 0)
+	for _, bucket := range protoHg.Buckets {
+		lower, upper := types.NewBytesDatum(bucket.LowerBound), types.NewBytesDatum(bucket.UpperBound)
+		if bucket.Ndv != nil {
+			hg.AppendBucketWithNDV(&lower, &upper, bucket.Count, bucket.Repeats, *bucket.Ndv)
+		} else {
+			hg.AppendBucket(&lower, &upper, bucket.Count, bucket.Repeats)
+		}
+	}
+	return hg
+}
+
+func (hg *Histogram) popFirstBucket() {
+	hg.Buckets = hg.Buckets[1:]
+	c := chunk.NewChunkWithCapacity([]*types.FieldType{hg.Tp, hg.Tp}, hg.Bounds.NumRows()-2)
+	c.Append(hg.Bounds, 2, hg.Bounds.NumRows())
+	hg.Bounds = c
+}
+
+// IsIndexHist checks whether current histogram is one for index.
+func (hg *Histogram) IsIndexHist() bool {
+	return hg.Tp.GetType() == mysql.TypeBlob
+}
+
+// MergeHistograms merges two histograms.
+func MergeHistograms(sc *stmtctx.StatementContext, lh *Histogram, rh *Histogram, bucketSize int, statsVer int) (*Histogram, error) {
+	if lh.Len() == 0 {
+		return rh, nil
+	}
+	if rh.Len() == 0 {
+		return lh, nil
+	}
+	lh.NDV += rh.NDV
+	lLen := lh.Len()
+	cmp, err := lh.GetUpper(lLen-1).Compare(sc.TypeCtx(), rh.GetLower(0), collate.GetBinaryCollator())
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	offset := int64(0)
+	if cmp == 0 {
+		lh.NDV--
+		lh.Buckets[lLen-1].NDV += rh.Buckets[0].NDV
+		// There's an overlapped one. So we need to subtract it if needed.
+		if rh.Buckets[0].NDV > 0 && lh.Buckets[lLen-1].Repeat > 0 {
+			lh.Buckets[lLen-1].NDV--
+		}
+		lh.updateLastBucket(rh.GetUpper(0), lh.Buckets[lLen-1].Count+rh.Buckets[0].Count, rh.Buckets[0].Repeat, false)
+		offset = rh.Buckets[0].Count
+		rh.popFirstBucket()
+	}
+	for lh.Len() > bucketSize {
+		lh.mergeBuckets(lh.Len() - 1)
+	}
+	if rh.Len() == 0 {
+		return lh, nil
+	}
+	for rh.Len() > bucketSize {
+		rh.mergeBuckets(rh.Len() - 1)
+	}
+	lCount := lh.Buckets[lh.Len()-1].Count
+	rCount := rh.Buckets[rh.Len()-1].Count - offset
+	lAvg := float64(lCount) / float64(lh.Len())
+	rAvg := float64(rCount) / float64(rh.Len())
+	for lh.Len() > 1 && lAvg*2 <= rAvg {
+		lh.mergeBuckets(lh.Len() - 1)
+		lAvg *= 2
+	}
+	for rh.Len() > 1 && rAvg*2 <= lAvg {
+		rh.mergeBuckets(rh.Len() - 1)
+		rAvg *= 2
+	}
+	for i := range rh.Len() {
+		if statsVer >= Version2 {
+			lh.AppendBucketWithNDV(rh.GetLower(i), rh.GetUpper(i), rh.Buckets[i].Count+lCount-offset, rh.Buckets[i].Repeat, rh.Buckets[i].NDV)
+			continue
+		}
+		lh.AppendBucket(rh.GetLower(i), rh.GetUpper(i), rh.Buckets[i].Count+lCount-offset, rh.Buckets[i].Repeat)
+	}
+	for lh.Len() > bucketSize {
+		lh.mergeBuckets(lh.Len() - 1)
+	}
+	return lh, nil
+}
+
+// AvgCountPerNotNullValue gets the average row count per value by the data of histogram.
+func (hg *Histogram) AvgCountPerNotNullValue(totalCount int64) float64 {
+	factor := hg.GetIncreaseFactor(totalCount)
+	totalNotNull := hg.NotNullCount() * factor
+	curNDV := float64(hg.NDV) * factor
+	curNDV = math.Max(curNDV, 1)
+	return totalNotNull / curNDV
+}
+
+// OutOfRange checks if the datum is out of range.
+func (hg *Histogram) OutOfRange(val types.Datum) bool {
+	if hg.Len() == 0 {
+		return false
+	}
+	return chunk.Compare(hg.Bounds.GetRow(0), 0, &val) > 0 ||
+		chunk.Compare(hg.Bounds.GetRow(hg.Bounds.NumRows()-1), 0, &val) < 0
+}
+
+// calculateLeftOverlapPercent calculates the percentage for an out-of-range overlap
+// on the left side of the histogram. The predicate range [l, r] overlaps with
+// the region (boundL, histL), and we calculate the percentage of the shaded area.
+func calculateLeftOverlapPercent(l, r, boundL, histL, histWidth float64) float64 {
+	if histWidth <= 0 {
+		return 0
+	}
+	// bound the left/right ranges of the predicates to the "left triangle" of the histogram.
+	l = max(l, boundL)
+	r = min(r, histL)
+	// If there's no overlap after bounding, return 0.
+	if l >= r {
+		return 0
+	}
+	// NOTE: Ranges are squared to determine a triangular (linear) distribution rather than uniform.
+	// Width of the histogram - squared to normalize to a percentage
+	histWidthSq := math.Pow(histWidth, 2)
+	// Right side of the predicate as distance from the left edge of the histogram
+	rightRange := math.Pow(r-boundL, 2)
+	// Left side of the predicate as distance from the left edge of the histogram
+	leftRange := math.Pow(l-boundL, 2)
+	return (rightRange - leftRange) / histWidthSq
+}
+
+// calculateRightOverlapPercent calculates the percentage for an out-of-range overlap
+// on the right side of the histogram. The predicate range [l, r] overlaps with
+// the region (histR, boundR), and we calculate the percentage of the shaded area.
+func calculateRightOverlapPercent(l, r, histR, boundR, histWidth float64) float64 {
+	if histWidth <= 0 {
+		return 0
+	}
+	// bound the left/right ranges of the predicates to the "right triangle" of the histogram.
+	l = max(l, histR)
+	r = min(r, boundR)
+	// If there's no overlap after bounding, return 0.
+	if l >= r {
+		return 0
+	}
+	// NOTE: Ranges are squared to determine a triangular (linear) distribution rather than uniform.
+	// Width of the histogram - squared to normalize to a percentage
+	histWidthSq := math.Pow(histWidth, 2)
+	// Left side of the predicate as distance from the right edge of the histogram.
+	leftRange := math.Pow(boundR-l, 2)
+	// Right side of the predicate as distance from the right edge of the histogram.
+	rightRange := math.Pow(boundR-r, 2)
+	return (leftRange - rightRange) / histWidthSq
+}
+
+// OutOfRangeShape holds the count-independent geometry of an out-of-range
+// estimate: everything OutOfRangeRowCount derives from the histogram and the
+// queried range alone, with no dependence on realtimeRowCount or modifyCount.
+// Compute it once per (histogram, range) with Histogram.OutOfRangeShape and
+// scale it with ScaleOutOfRangeShape whenever current counts are available;
+// this lets callers cache the shape across changes in the realtime counts.
+type OutOfRangeShape struct {
+	// Empty is set when the histogram has no buckets; the estimate is always 0.
+	Empty bool
+	// Impossible is set when the range is provably empty (an unsigned column
+	// compared against negative bounds) or invalid; the estimate is 0 except in
+	// determinate mode, which returns OneValue before examining the range.
+	Impossible bool
+	// OneValue is the average row count per distinct histogram value,
+	// NotNullCount/HistNDV, used as the estimate floor.
+	OneValue float64
+	// HistNDV is the histogram NDV excluding TopN, floored at 1.
+	HistNDV int64
+	// TotalPercent and MaxTotalPercent are the triangular-distribution overlap
+	// percentages of the queried range with the out-of-range regions on both
+	// sides of the histogram.
+	TotalPercent    float64
+	MaxTotalPercent float64
+}
+
+// OutOfRangeRowCount estimate the row count of part of [lDatum, rDatum] which is out of range of the histogram.
+// It is the composition of OutOfRangeShape (the count-independent geometry)
+// and ScaleOutOfRangeShape (which applies realtimeRowCount/modifyCount).
+func (hg *Histogram) OutOfRangeRowCount(
+	sctx planctx.PlanContext,
+	lDatum, rDatum *types.Datum,
+	realtimeRowCount, modifyCount, histNDV int64,
+) RowEstimate {
+	return hg.ScaleOutOfRangeShape(sctx, hg.OutOfRangeShape(lDatum, rDatum, histNDV), realtimeRowCount, modifyCount)
+}
+
+// OutOfRangeShape computes the count-independent part of the out-of-range
+// estimate for the part of [lDatum, rDatum] outside the histogram's range.
+// Here we assume the density of data is decreasing from the lower/upper bound of the histogram toward outside.
+// The maximum row count it can get is the modifyCount. It reaches the maximum when out-of-range width reaches histogram range width.
+// As it shows below. To calculate the out-of-range row count, we need to calculate the percentage of the shaded area.
+// Note that we assume histL-boundL == histR-histL == boundR-histR here.
+/*
+               /│             │\
+             /  │             │  \
+           /x│  │◄─histogram─►│    \
+         / xx│  │    range    │      \
+       / │xxx│  │             │        \
+     /   │xxx│  │             │          \
+────┴────┴───┴──┴─────────────┴───────────┴─────
+    ▲    ▲   ▲  ▲             ▲           ▲
+    │    │   │  │             │           │
+ boundL  │   │histL         histR       boundR
+         │   │
+    lDatum  rDatum
+*/
+// The percentage of shaded area on the left side calculation formula is:
+// leftPercent = (math.Pow(actualR-boundL, 2) - math.Pow(actualL-boundL, 2)) / math.Pow(histWidth, 2)
+// You can find more details at https://github.com/pingcap/tidb/pull/47966#issuecomment-1778866876
+func (hg *Histogram) OutOfRangeShape(lDatum, rDatum *types.Datum, histNDV int64) OutOfRangeShape {
+	if hg.Len() == 0 {
+		return OutOfRangeShape{Empty: true}
+	}
+
+	// Calculate a default of "one value".
+	// oneValue assumes "one value qualifies", and is used as a lower bound.
+	histNDV = max(histNDV, 1)
+	shape := OutOfRangeShape{
+		OneValue: hg.NotNullCount() / float64(histNDV),
+		HistNDV:  histNDV,
+	}
+
+	// A range whose upper bound is NULL or MinNotNull holds only NULL values,
+	// e.g. the [NULL, MinNotNull) range that cross estimation builds for the rows
+	// before an `IS NOT NULL` range. NULLs are counted separately and are never
+	// outside the histogram's range. Return before the scalar conversion, which
+	// maps NULL to 0 and MinNotNull to -MaxFloat64 and so inverts the range.
+	if rDatum.IsNull() || rDatum.Kind() == types.KindMinNotNull {
+		shape.Impossible = true
+		return shape
+	}
+
+	// Calculate how much of the statistics share a common prefix.
+	// For bytes and string type, we need to cut the common prefix when converting them to scalar value.
+	// Here we calculate the length of common prefix.
+	// TODO: If the common prefix is large, we may underestimate the out-of-range
+	// portion because we can't distinguish the values with the same prefix.
+	commonPrefix := 0
+	if hg.GetLower(0).Kind() == types.KindBytes || hg.GetLower(0).Kind() == types.KindString {
+		// Calculate the common prefix length among the lower and upper bound of histogram and the range we want to estimate.
+		commonPrefix = commonPrefixLength(hg.GetLower(0).GetBytes(),
+			hg.GetUpper(hg.Len()-1).GetBytes(),
+			lDatum.GetBytes(),
+			rDatum.GetBytes())
+	}
+
+	// Convert the range we want to estimate to scalar value(float64)
+	l := convertDatumToScalar(lDatum, commonPrefix)
+	r := convertDatumToScalar(rDatum, commonPrefix)
+	unsigned := mysql.HasUnsignedFlag(hg.Tp.GetFlag())
+	// If this is an unsigned column, we need to make sure values are not negative.
+	// Normal negative value should have become 0. But this still might happen when met MinNotNull here.
+	// Maybe it's better to do this transformation in the ranger like the normal negative value.
+	// Track whether negative values were clamped to 0, to detect impossible ranges.
+	var leftClamped, rightClamped bool
+	if unsigned {
+		if l < 0 {
+			l = 0
+			leftClamped = true
+		}
+		if r < 0 {
+			r = 0
+			rightClamped = true
+		}
+		// If both bounds collapsed to 0 due to clamping negative values, this is
+		// an impossible range (e.g., unsigned_col < 0). Return 0 estimate.
+		if l == 0 && r == 0 && (leftClamped || rightClamped) {
+			shape.Impossible = true
+			return shape
+		}
+	}
+
+	// Convert the lower and upper bound of the histogram to scalar value(float64)
+	histL := convertDatumToScalar(hg.GetLower(0), commonPrefix)
+	histR := convertDatumToScalar(hg.GetUpper(hg.Len()-1), commonPrefix)
+	histWidth := histR - histL
+	// If we find that the histogram width is too small or too large - we still may need to consider
+	// the impact of modifications to the table. Reset the histogram width to 0.
+	if histWidth < 0 {
+		histWidth = 0
+	}
+	if math.IsInf(histWidth, 1) {
+		histWidth = 0
+	}
+	boundL := histL - histWidth
+	boundR := histR + histWidth
+
+	// Calculate the width of the predicate
+	// TODO: If predWidth == 0, it may be because the common prefix is too large.
+	// In future - out of range for equal predicates should also use this logic
+	// for consistency. We need to handle both "equal" and "large common prefix".
+	predWidth := r - l
+	if predWidth < 0 {
+		// This should never happen.
+		intest.Assert(false, "Right bound should not be less than left bound")
+
+		shape.Impossible = true
+		return shape
+	} else if predWidth == 0 {
+		// Set histWidth to 0 so that we can still return a minimum of oneValue,
+		// and return the max as worst case.
+		histWidth = 0
+	}
+
+	// Calculate the out of range percentages
+	// Calculate left overlap percentage if the range overlaps with (boundL, histL)
+	leftPercent := calculateLeftOverlapPercent(l, r, boundL, histL, histWidth)
+	// Calculate right overlap percentage if the range overlaps with (histR, boundR)
+	rightPercent := calculateRightOverlapPercent(l, r, histR, boundR, histWidth)
+
+	shape.TotalPercent = min(leftPercent*0.5+rightPercent*0.5, 1.0)
+	shape.MaxTotalPercent = min(leftPercent+rightPercent, 1.0)
+	return shape
+}
+
+// ScaleOutOfRangeShape combines an OutOfRangeShape with the current
+// realtimeRowCount and modifyCount to produce the out-of-range row estimate.
+// It is cheap: all histogram probing already happened in OutOfRangeShape.
+func (hg *Histogram) ScaleOutOfRangeShape(
+	sctx planctx.PlanContext,
+	shape OutOfRangeShape,
+	realtimeRowCount, modifyCount int64,
+) (result RowEstimate) {
+	if shape.Empty {
+		return DefaultRowEst(0)
+	}
+	oneValue := shape.OneValue
+
+	// If modifications are not allowed, return the one value.
+	// In OptObjectiveDeterminate mode, we can't rely on real time statistics, so default to assuming
+	// one value qualifies.
+	allowUseModifyCount := sctx.GetSessionVars().GetOptObjective() != vardef.OptObjectiveDeterminate
+	if !allowUseModifyCount {
+		return RowEstimate{Est: oneValue, MinEst: oneValue, MaxEst: oneValue}
+	}
+
+	// Adjust oneValue if the NDV is low
+	// If NDV is low, it may no longer be representative of the data since ANALYZE
+	// was last run. Use a default value against realtimeRowCount.
+	// If NDV is not representitative, then hg.NotNullCount may not be either.
+	if float64(shape.HistNDV) < outOfRangeBetweenRate {
+		oneValue = max(min(oneValue, float64(realtimeRowCount)/outOfRangeBetweenRate), 1.0)
+	}
+
+	if shape.Impossible {
+		return DefaultRowEst(0)
+	}
+
+	// Calculate the added rows
+	// Use absolute value to account for the case where rows may have been added on one side,
+	// but deleted from the other, resulting in qualifying out of range rows even though
+	// realtimeRowCount is less than histogram count
+	addedRows := hg.AbsRowCountDifference(realtimeRowCount)
+	maxAddedRows := addedRows
+
+	// Calculate the estimated rows
+	estRows := oneValue
+	skewRatio := sctx.GetSessionVars().RiskRangeSkewRatio
+	sctx.GetSessionVars().RecordRelevantOptVar(vardef.TiDBOptRiskRangeSkewRatio)
+	if shape.TotalPercent > 0 {
+		// Multiplying addedRows by 0.5 provides the assumption that 50% "addedRows" are inside
+		// the histogram range, and 50% (0.5) are out-of-range. Users can adjust this
+		// magic number by setting the session variable `tidb_opt_risk_range_skew_ratio`.
+		// When skewRatio > 0, estRows sets the starting point for the skew ratio calculation.
+		addedRowMultiplier := 0.5
+		// NOTE: Skew ratio is used twice in this function.
+		// This first usage allows a user to specify a ratio that is smaller or
+		// larger than the default 0.5.
+		if skewRatio > 0 {
+			addedRowMultiplier = skewRatio
+		}
+		estRows = (addedRows * addedRowMultiplier) * shape.TotalPercent
+	}
+
+	// Calculate a potential worst case for use in final MaxEst
+	// We may have missed the true lowest/highest values due to sampling OR there could be a delay in
+	// updates to modifyCount (meaning modifyCount is incorrectly set to 0). So ensure we always
+	// account for at least 1% of the total row count as a worst case for "addedRows".
+	// We inflate this here so ONLY to impact the MaxEst value.
+	if modifyCount == 0 || addedRows == 0 {
+		if realtimeRowCount <= 0 {
+			realtimeRowCount = int64(hg.TotalRowCount())
+		}
+		// Use outOfRangeBetweenRate as a divisor to get a small percentage of the approximate
+		// modifyCount (since outOfRangeBetweenRate has a default value of 100).
+		maxAddedRows = max(maxAddedRows, float64(realtimeRowCount)/outOfRangeBetweenRate)
+	}
+	if shape.MaxTotalPercent > 0 {
+		// Always apply MaxTotalPercent to maxAddedRows to limit scaling when the predicate has an upper bound
+		maxAddedRows *= shape.MaxTotalPercent
+	}
+
+	// Calculate the final min/max/est rows including the skew ratio adjustment
+	result.MinEst = min(estRows, oneValue)
+	// NOTE: Skew ratio is used twice in this function.
+	// This second usage scales the estimate from the base estimate to the max estimate.
+	if skewRatio > 0 {
+		result = CalculateSkewRatioCounts(estRows, maxAddedRows, skewRatio)
+	} else {
+		// Do not scale the estimate if skew ratio is not set.
+		result.Est = estRows
+	}
+	result.Est = max(result.Est, oneValue)
+	result.MaxEst = max(result.Est, maxAddedRows)
+
+	return result
+}
+
+// Copy deep copies the histogram.
+func (hg *Histogram) Copy() *Histogram {
+	if hg == nil {
+		return nil
+	}
+	newHist := *hg
+	if hg.Bounds != nil {
+		newHist.Bounds = hg.Bounds.CopyConstruct()
+	}
+	newHist.Buckets = make([]Bucket, 0, len(hg.Buckets))
+	newHist.Buckets = append(newHist.Buckets, hg.Buckets...)
+	return &newHist
+}
+
+// TruncateHistogram truncates the histogram to `numBkt` buckets.
+func (hg *Histogram) TruncateHistogram(numBkt int) *Histogram {
+	hist := hg.Copy()
+	hist.Buckets = hist.Buckets[:numBkt]
+	hist.Bounds.TruncateTo(numBkt * 2)
+	return hist
+}
+
+type dataCnt struct {
+	data []byte
+	cnt  uint64
+}
+
+// GetIndexPrefixLens returns an array representing
+func GetIndexPrefixLens(data []byte, numCols int) (prefixLens []int, err error) {
+	prefixLens = make([]int, 0, numCols)
+	var colData []byte
+	prefixLen := 0
+	for len(data) > 0 {
+		colData, data, err = codec.CutOne(data)
+		if err != nil {
+			return nil, err
+		}
+		prefixLen += len(colData)
+		prefixLens = append(prefixLens, prefixLen)
+	}
+	return prefixLens, nil
+}
+
+// ExtractTopN extracts topn from histogram.
+func (hg *Histogram) ExtractTopN(cms *CMSketch, topN *TopN, numCols int, numTopN uint32) error {
+	if hg.Len() == 0 || cms == nil || numTopN == 0 {
+		return nil
+	}
+	dataSet := make(map[string]struct{}, hg.Bounds.NumRows())
+	dataCnts := make([]dataCnt, 0, hg.Bounds.NumRows())
+	hg.PreCalculateScalar()
+	// Set a limit on the frequency of boundary values to avoid extract values with low frequency.
+	limit := hg.NotNullCount() / float64(hg.Len())
+	// Since our histogram are equal depth, they must occurs on the boundaries of buckets.
+	for i := range hg.Bounds.NumRows() {
+		data := hg.Bounds.GetRow(i).GetBytes(0)
+		prefixLens, err := GetIndexPrefixLens(data, numCols)
+		if err != nil {
+			return err
+		}
+		for _, prefixLen := range prefixLens {
+			prefixColData := data[:prefixLen]
+			_, ok := dataSet[string(prefixColData)]
+			if ok {
+				continue
+			}
+			dataSet[string(prefixColData)] = struct{}{}
+			res := hg.BetweenRowCount(nil, types.NewBytesDatum(prefixColData), types.NewBytesDatum(kv.Key(prefixColData).PrefixNext())).Est
+			if res >= limit {
+				dataCnts = append(dataCnts, dataCnt{prefixColData, uint64(res)})
+			}
+		}
+	}
+	slices.SortStableFunc(dataCnts, func(a, b dataCnt) int { return -cmp.Compare(a.cnt, b.cnt) })
+	if len(dataCnts) > int(numTopN) {
+		dataCnts = dataCnts[:numTopN]
+	}
+	topN.TopN = make([]TopNMeta, 0, len(dataCnts))
+	for _, dataCnt := range dataCnts {
+		h1, h2 := murmur3.Sum128(dataCnt.data)
+		realCnt := cms.queryHashValue(nil, h1, h2)
+		cms.SubValue(h1, h2, realCnt)
+		topN.AppendTopN(dataCnt.data, realCnt)
+	}
+	topN.Sort()
+	return nil
+}
+
+// bucketRef identifies a partition bucket. Pass 2 reads upper/lower
+// bounds on demand via chunk.Row.DatumWithBuffer into a reusable
+// scratch Datum (see fillUpper/fillLower below), no heap allocation
+// for int/float/string/bytes types, a small interface box for Decimal
+// or Time. Keeping the ref itself tiny means sortedRefs stays ~32 MB
+// at 8 k partitions × 500 buckets (vs ~350 MB if we inlined Datums).
+type bucketRef struct {
+	histIdx   uint16
+	bucketIdx uint16
+}
+
+// bucketMergeEntry is one partition's current head in the k-way merge.
+// The upper bound Datum is cached at insertion time so heap sift
+// compares directly against a cached value, avoiding repeated Chunk
+// indirection.
+type bucketMergeEntry struct {
+	upper     types.Datum
+	histIdx   uint16
+	bucketIdx uint16
+}
+
+// bucketMergeHeap is a min-heap over bucketMergeEntry keyed by upper
+// bound. Ties are surfaced in heap order (deterministic for a given
+// input, but otherwise arbitrary); that is enough because both passes
+// consume all same-upper refs as one group, so their relative order is
+// immaterial. Shared state (StatementContext, any compare error
+// observed during sift) lives on the heap rather than being duplicated
+// onto every entry.
+//
+// Heap operations (pushEntry / popMin / initHeap) are implemented
+// directly rather than going through container/heap, whose any-typed
+// Push/Pop boxes each entry into an interface. With an ~80 B entry,
+// that's ~100 B per pop in extra allocation, significant at the
+// multi-million-pop scale of an 8k-partition merge.
+type bucketMergeHeap struct {
+	cmpErr  error
+	sc      *stmtctx.StatementContext
+	entries []bucketMergeEntry
+}
+
+func (h *bucketMergeHeap) Len() int { return len(h.entries) }
+func (h *bucketMergeHeap) less(i, j int) bool {
+	if h.cmpErr != nil {
+		return false
+	}
+	res, err := h.entries[i].upper.Compare(h.sc.TypeCtx(), &h.entries[j].upper, collate.GetBinaryCollator())
+	if err != nil {
+		h.cmpErr = err
+		return false
+	}
+	return res < 0
+}
+func (h *bucketMergeHeap) swap(i, j int) { h.entries[i], h.entries[j] = h.entries[j], h.entries[i] }
+
+func (h *bucketMergeHeap) up(j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.less(j, i) {
+			break
+		}
+		h.swap(i, j)
+		j = i
+	}
+}
+
+func (h *bucketMergeHeap) down(i0, n int) {
+	i := i0
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.less(j2, j1) {
+			j = j2
+		}
+		if !h.less(j, i) {
+			break
+		}
+		h.swap(i, j)
+		i = j
+	}
+}
+
+// pushEntry, popMin and initHeap share an error convention: less()
+// cannot return an error (its signature is fixed by the heap idiom), so
+// comparison failures are captured into cmpErr and short-circuit
+// subsequent comparisons. These three mutating methods surface cmpErr
+// in their return value so callers cannot silently lose a stashed
+// comparison error.
+func (h *bucketMergeHeap) pushEntry(e bucketMergeEntry) error {
+	h.entries = append(h.entries, e)
+	h.up(len(h.entries) - 1)
+	return h.cmpErr
+}
+
+func (h *bucketMergeHeap) popMin() (bucketMergeEntry, error) {
+	n := len(h.entries) - 1
+	h.swap(0, n)
+	h.down(0, n)
+	e := h.entries[n]
+	h.entries = h.entries[:n]
+	return e, h.cmpErr
+}
+
+func (h *bucketMergeHeap) initHeap() error {
+	n := len(h.entries)
+	for i := n/2 - 1; i >= 0; i-- {
+		h.down(i, n)
+	}
+	return h.cmpErr
+}
+
+func (h *bucketMergeHeap) peek() *bucketMergeEntry {
+	if len(h.entries) == 0 {
+		return nil
+	}
+	return &h.entries[0]
+}
+
+// topNEntry is a TopN value with its count. flattenSortedTopN first
+// collects one entry per partition TopN slot, then compacts to one
+// entry per unique value with the counts summed.
+type topNEntry struct {
+	encoded []byte
+	count   uint64
+}
+
+// topNCursor walks the compacted (encoded-key-sorted, one entry per
+// unique value) partition TopN entries.
+type topNCursor struct {
+	entries []topNEntry
+	i       int
+}
+
+func (c *topNCursor) valid() bool { return c.i < len(c.entries) }
+
+// peekEncoded returns the current value's encoded key.
+func (c *topNCursor) peekEncoded() []byte { return c.entries[c.i].encoded }
+
+// next consumes and returns the current entry.
+func (c *topNCursor) next() topNEntry {
+	e := c.entries[c.i]
+	c.i++
+	return e
+}
+
+// bucketGroupCursor walks the partition histogram buckets in
+// upper-bound order, one same-upper group at a time, k-way-merging
+// the per-partition bucket arrays (each already sorted by upper)
+// through bucketMergeHeap. Every popped ref is appended to sortedRefs,
+// so after the walk Pass 2 can reuse the full sorted ref stream
+// without rebuilding the heap.
+type bucketGroupCursor struct {
+	heap       bucketMergeHeap
+	hists      []*Histogram
+	sc         *stmtctx.StatementContext
+	tz         *time.Location
+	sortedRefs []bucketRef
+	isIndex    bool
+}
+
+// newBucketGroupCursor seeds the merge heap with each partition's
+// first non-empty bucket.
+func newBucketGroupCursor(sc *stmtctx.StatementContext, hists []*Histogram, totalBuckets int, isIndex bool) (*bucketGroupCursor, error) {
+	c := &bucketGroupCursor{
+		heap: bucketMergeHeap{
+			entries: make([]bucketMergeEntry, 0, len(hists)),
+			sc:      sc,
+		},
+		hists:      hists,
+		sortedRefs: make([]bucketRef, 0, totalBuckets),
+		sc:         sc,
+		tz:         sc.TimeZone(),
+		isIndex:    isIndex,
+	}
+	for hi, hist := range hists {
+		if hist == nil {
+			continue
+		}
+		if e, ok := c.firstNonEmptyBucket(uint16(hi), 0); ok {
+			c.heap.entries = append(c.heap.entries, e)
+		}
+	}
+	if err := c.heap.initHeap(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *bucketGroupCursor) valid() bool { return c.heap.Len() > 0 }
+
+// peekUpper returns the smallest not-yet-consumed upper bound.
+func (c *bucketGroupCursor) peekUpper() *types.Datum { return &c.heap.peek().upper }
+
+// firstNonEmptyBucket scans hists[histIdx] starting at startIdx for
+// the first bucket whose mass (count - prev count) is positive, and
+// returns the corresponding bucketMergeEntry. Used both to seed the
+// merge heap and to advance a partition after a popMin: the only
+// difference is the start index.
+//
+// Zero-mass buckets do occur (adjacent buckets sharing an upper
+// bound, or residue from an earlier merge). Skipping them here lets
+// the rest of the walk assume every popped ref has count > 0, rather
+// than repeating a skip-if-empty guard at each consumer.
+func (c *bucketGroupCursor) firstNonEmptyBucket(histIdx uint16, startIdx int) (bucketMergeEntry, bool) {
+	h := c.hists[histIdx]
+	for bi := startIdx; bi < h.Len(); bi++ {
+		count := h.Buckets[bi].Count
+		if bi > 0 {
+			count -= h.Buckets[bi-1].Count
+		}
+		if count > 0 {
+			return bucketMergeEntry{
+				histIdx:   histIdx,
+				bucketIdx: uint16(bi),
+				upper:     h.Bounds.GetRow(2*bi+1).GetDatum(0, h.Tp),
+			}, true
+		}
+	}
+	return bucketMergeEntry{}, false
+}
+
+// advance pops the heap's min entry, saves its ref to sortedRefs, and
+// advances that partition to its next non-empty bucket. Callers guard
+// with valid() so the heap is non-empty here.
+func (c *bucketGroupCursor) advance() (bucketMergeEntry, error) {
+	intest.Assert(c.heap.Len() > 0, "advance called on empty bucketGroupCursor")
+	entry, err := c.heap.popMin()
+	if err != nil {
+		return bucketMergeEntry{}, err
+	}
+	c.sortedRefs = append(c.sortedRefs, bucketRef{
+		histIdx:   entry.histIdx,
+		bucketIdx: entry.bucketIdx,
+	})
+	if next, ok := c.firstNonEmptyBucket(entry.histIdx, int(entry.bucketIdx)+1); ok {
+		if err := c.heap.pushEntry(next); err != nil {
+			return bucketMergeEntry{}, err
+		}
+	}
+	return entry, nil
+}
+
+// nextGroup consumes all buckets sharing the current minimum upper
+// bound (the heap surfaces them consecutively) and returns their
+// summed Repeat. When needEncoded is set it also returns the shared
+// upper in TopN-encoded form, for the global TopN candidate.
+func (c *bucketGroupCursor) nextGroup(needEncoded bool) ([]byte, uint64, error) {
+	first, err := c.advance()
+	if err != nil {
+		return nil, 0, err
+	}
+	sumRepeat := uint64(c.hists[first.histIdx].Buckets[first.bucketIdx].Repeat)
+	for c.heap.Len() > 0 {
+		cmpRes, err := c.heap.peek().upper.Compare(c.sc.TypeCtx(), &first.upper, collate.GetBinaryCollator())
+		if err != nil {
+			return nil, 0, err
+		}
+		if cmpRes != 0 {
+			break
+		}
+		e, err := c.advance()
+		if err != nil {
+			return nil, 0, err
+		}
+		sumRepeat += uint64(c.hists[e.histIdx].Buckets[e.bucketIdx].Repeat)
+	}
+	if !needEncoded {
+		return nil, sumRepeat, nil
+	}
+	if c.isIndex {
+		return c.hists[first.histIdx].Bounds.GetRow(int(first.bucketIdx)*2 + 1).GetBytes(0), sumRepeat, nil
+	}
+	encoded, err := codec.EncodeKey(c.tz, nil, first.upper)
+	if err != nil {
+		return nil, 0, err
+	}
+	return encoded, sumRepeat, nil
+}
+
+// topNCandidate is Pass 1's merge-walk product for one unique value:
+// the value's total frequency across all partition TopNs and bucket
+// Repeats. Candidates compete in a bounded min-heap for the global
+// TopN slots.
+type topNCandidate struct {
+	encoded     []byte
+	totalCount  uint64 // value frequency (TopN counts + bucket Repeats)
+	repeatCount uint64 // bucket Repeats only, for the 1d totHistCount adjustment
+}
+
+// flattenSortedTopN flattens every partition's TopN entries into one
+// slice with a single entry per unique value, carrying that value's
+// summed count across partitions (step 1a of
+// MergePartTopNAndHistToGlobal). The encoded bytes are referenced, not
+// copied.
+//
+// The order is the one Pass 1 walks the entries against the bucket
+// stream with, which sortTopNEntries decides. Either way the encoded
+// key stays the identity: two entries are the same value only if their
+// encoded keys are equal.
+func flattenSortedTopN(
+	sc *stmtctx.StatementContext, topNs []*TopN, ft *types.FieldType, isIndex bool,
+) ([]topNEntry, error) {
+	totalTopN := 0
+	for _, topN := range topNs {
+		if topN == nil || len(topN.TopN) == 0 {
+			continue
+		}
+		totalTopN += len(topN.TopN)
+	}
+	allTopN := make([]topNEntry, 0, totalTopN)
+	for _, topN := range topNs {
+		if topN == nil || len(topN.TopN) == 0 {
+			continue
+		}
+		for _, val := range topN.TopN {
+			allTopN = append(allTopN, topNEntry{encoded: val.Encoded, count: val.Count})
+		}
+	}
+	if err := sortTopNEntries(sc, allTopN, ft, isIndex); err != nil {
+		return nil, err
+	}
+	// Compact runs of equal values (the same value can be TopN in
+	// several partitions) into one entry with the summed count, so
+	// consumers can rely on entries being unique. In place: the write
+	// index trails the read index.
+	compacted := allTopN[:0]
+	for i := 0; i < len(allTopN); {
+		e := allTopN[i]
+		for i++; i < len(allTopN) && bytes.Equal(allTopN[i].encoded, e.encoded); i++ {
+			e.count += allTopN[i].count
+		}
+		compacted = append(compacted, e)
+	}
+	return compacted, nil
+}
+
+// sortTopNEntries orders the flattened stream the way Pass 1 walks it
+// against the bucket stream. That is the encoded byte order, except for
+// ENUM and SET, which encode as their numeric value but compare by
+// element name, and BIT, which encodes numerically but compares as a
+// binary literal with leading zeros trimmed. Those three have to be
+// ordered by their decoded values, with the encoded key as a tie-break
+// so entries for the same value stay adjacent for the compaction that
+// follows. An index bound is the encoded key itself, so the index path
+// never needs this. TestTopNOrderingMatchesDatumOrder pins the type
+// list against what the encodings actually do.
+func sortTopNEntries(
+	sc *stmtctx.StatementContext, allTopN []topNEntry, ft *types.FieldType, isIndex bool,
+) error {
+	byteOrdered := isIndex
+	switch ft.GetType() {
+	case mysql.TypeEnum, mysql.TypeSet, mysql.TypeBit:
+	default:
+		byteOrdered = true
+	}
+	if byteOrdered {
+		slices.SortFunc(allTopN, func(a, b topNEntry) int {
+			return bytes.Compare(a.encoded, b.encoded)
+		})
+		return nil
+	}
+
+	// Keyed by value, not by entry: the same value is typically in many
+	// partitions' TopN, and these types have few distinct values, so
+	// this decodes once per value rather than once per entry.
+	tz := sc.TimeZone()
+	datums := make(map[string]types.Datum, len(allTopN))
+	for _, e := range allTopN {
+		if _, ok := datums[string(e.encoded)]; ok {
+			continue
+		}
+		d, err := topNMetaToDatum(TopNMeta{Encoded: e.encoded}, ft, false, tz)
+		if err != nil {
+			return err
+		}
+		datums[string(e.encoded)] = d
+	}
+	var cmpErr error
+	tc := sc.TypeCtx()
+	slices.SortFunc(allTopN, func(a, b topNEntry) int {
+		da, db := datums[string(a.encoded)], datums[string(b.encoded)]
+		c, err := da.Compare(tc, &db, collate.GetBinaryCollator())
+		if err != nil {
+			cmpErr = err
+			return 0
+		}
+		if c != 0 {
+			return c
+		}
+		return bytes.Compare(a.encoded, b.encoded)
+	})
+	return cmpErr
+}
+
+// sumPartitionTotals collects the global totals from the partition
+// histograms (step 1b): row count inside buckets, null count, column
+// size, and the overall bucket count.
+func sumPartitionTotals(hists []*Histogram) (totHistCount, totNull, totColSize int64, totalBuckets int) {
+	for _, hist := range hists {
+		if hist == nil {
+			continue
+		}
+		totColSize += hist.TotColSize
+		totNull += hist.NullCount
+		histLen := hist.Len()
+		totalBuckets += histLen
+		if histLen > 0 {
+			totHistCount += hist.Buckets[histLen-1].Count
+		}
+	}
+	return totHistCount, totNull, totColSize, totalBuckets
+}
+
+// selectGlobalTopN turns the winning candidates into the global TopN
+// (step 1d). It returns the TopN (nil when there are no candidates), a
+// presence map keyed by encoded value for Pass 2, and the summed
+// bucket Repeats of the promoted values, which the caller subtracts
+// from the histogram total since the global TopN owns those rows.
+//
+// numCandidates is how many distinct values step 1c offered to the
+// heap, which is not recoverable from the heap itself: it is bounded at
+// numTopN, so a full heap cannot tell "exactly numTopN candidates, all
+// of which fit" apart from "more candidates than slots, some evicted".
+//
+// When there were more candidates than slots, count==1 entries are a
+// noise sample: they carry no selectivity signal beyond what the
+// histogram + NDV fallback already provides, and the specific
+// singletons that won the heap race are arbitrary. Drop them. When
+// every candidate fit, singletons are the complete distinct-value
+// enumeration and carry exact range information; keep them.
+//
+// This pruning is gated on numTopN matching the active analyze
+// default (tidb_analyze_default_num_topn) to mirror per-table analyze:
+// BuildHistAndTopN (builder.go) only prunes when numTopN is that
+// default, treating any explicit size as a value the user wants
+// honored. Without this gate a partitioned table's global TopN would
+// drop singletons that an identical non-partitioned table keeps.
+func selectGlobalTopN(topNHeap *generic.BoundedMinHeap[topNCandidate], numTopN uint32, numCandidates int) (*TopN, map[hack.MutableString]struct{}, int64) {
+	topNSlice := topNHeap.ToSortedSlice()
+	if isAnalyzeDefaultValue(int(numTopN), vardef.AnalyzeDefaultNumTopN.Load()) && numCandidates > int(numTopN) {
+		filtered := topNSlice[:0]
+		for _, e := range topNSlice {
+			if e.totalCount >= 2 {
+				filtered = append(filtered, e)
+			}
+		}
+		topNSlice = filtered
+	}
+	var globalTopN *TopN
+	// For Pass 2. Only presence is needed.
+	globalTopNMap := make(map[hack.MutableString]struct{})
+	var promotedRepeats int64
+	if len(topNSlice) > 0 {
+		globalTopN = NewTopN(int(numTopN))
+		for _, e := range topNSlice {
+			globalTopN.AppendTopN(e.encoded, e.totalCount)
+			globalTopNMap[hack.String(e.encoded)] = struct{}{}
+			promotedRepeats += int64(e.repeatCount)
+		}
+		// The heap orders by count (descending) but TopN's downstream consumers
+		// (findTopN/LowerBound/BetweenCount) assume entries are sorted by encoded bytes.
+		globalTopN.Sort()
+	}
+	return globalTopN, globalTopNMap, promotedRepeats
+}
+
+// collectVirtualTopN filters allTopN (sorted, one entry per unique
+// value) down to the values that didn't make the global TopN (step
+// 1e), returning them and their total count. Those rows were excluded
+// from partition histograms (put into partition TopN instead), so they
+// enter the global histogram as virtual single-value buckets and their
+// total joins totHistCount. A value that equals some partition
+// bucket's upper needs no special casing: its virtual bucket and that
+// partition bucket share an upper, so Pass 2 coalesces them into the
+// same group. The filter writes at most one entry per entry read,
+// which makes the in-place reuse of allTopN safe.
+func collectVirtualTopN(allTopN []topNEntry, globalTopNMap map[hack.MutableString]struct{}) ([]topNEntry, int64) {
+	virtualHistTopN := allTopN[:0]
+	var totalCount int64
+	for _, e := range allTopN {
+		if _, inGlobal := globalTopNMap[hack.String(e.encoded)]; inGlobal || e.count == 0 {
+			continue
+		}
+		totalCount += int64(e.count)
+		virtualHistTopN = append(virtualHistTopN, e)
+	}
+	return virtualHistTopN, totalCount
+}
+
+// MergePartTopNAndHistToGlobal merges partition-level TopN lists and
+// histograms into a single global TopN and histogram via two sorted
+// merge-walks:
+//
+// Pass 1: merge two sorted sequences, the partition-TopN entries and
+// the partition histogram bucket refs (k-way-merged across partitions
+// by upper bound), advancing whichever current head is smaller. For
+// each unique key, sum partition-TopN counts and partition bucket
+// Repeats at that upper into totalCount, and feed the result through a
+// bounded min-heap to pick the global TopN. As a side effect this
+// produces sortedRefs, the bucket refs in upper-bound order, which
+// Pass 2 reuses without rebuilding the heap.
+//
+// Pass 2: walk sortedRefs + leftover (non-promoted) TopN entries and
+// merge them into the global histogram, producing one global bucket
+// each time the accumulated mass since the previous global bucket
+// reaches target = totHistCount / expBucketNumber. Groups whose
+// upper matches a global TopN value have their Repeat subtracted
+// out (the global TopN counter owns those rows).
+//
+// Accuracy caveat: groups partition buckets by upper only. The full
+// partition bucket count is attributed at its upper; partition
+// (lower, upper) interiors are not inspected. This is forced by the
+// input, partition stats expose only (lower, upper, count, repeat).
+//
+// The approximation works because each partition's bucket is itself
+// roughly equi-depth, so its rows are roughly uniform inside
+// [lower, upper). Range estimation later assumes the same uniformity
+// over the global bucket, and uniform-of-uniforms is uniform, the
+// merge preserves correctness for a global bucket's total count and
+// for point-equality at the upper (Repeat is summed across partitions
+// at the same upper).
+//
+// Real-world cases where this loses accuracy:
+//   - A partition bucket much wider than its peers gets its full
+//     count attributed at its upper, while contributing its (lower)
+//     to the global bucket's lower. Estimates near the global lower
+//     can over-count if that partition's data actually clustered
+//     near its upper.
+//   - Within-bucket skew the partition stats can't represent (e.g.,
+//     a Zipf-shaped run inside a single partition bucket). The
+//     partition stats already smoothed it; the merge can't recover.
+//   - Interpolated `WHERE x < mid` for `mid` inside a global bucket:
+//     linear interpolation assumes uniform density, so error scales
+//     with the partition-level density variation that the merge
+//     averaged over.
+func MergePartTopNAndHistToGlobal(
+	sc *stmtctx.StatementContext,
+	killer *sqlkiller.SQLKiller,
+	topNs []*TopN,
+	hists []*Histogram,
+	numTopN uint32,
+	expBucketNumber int64,
+	isIndex bool,
+) (*TopN, *Histogram, error) {
+	// ANALYZE grammar requires WITH N BUCKETS > 0 (handleAnalyzeOptions
+	// validates this), and the default is 256, so this is only reachable
+	// via a programmer error in a caller.
+	intest.Assert(expBucketNumber > 0, "expBucketNumber must be positive")
+	if len(hists) > math.MaxUint16 {
+		return nil, nil, errors.Errorf("MergePartTopNAndHistToGlobal: too many partition histograms (%d > %d)", len(hists), math.MaxUint16)
+	}
+
+	// Need at least one non-nil histogram to recover column type, ID, and
+	// last-update version for the global stats. Empty-but-non-nil histograms
+	// are fine (TopN-only columns still carry a Histogram wrapper).
+	var firstHist *Histogram
+	for _, h := range hists {
+		if h == nil {
+			continue
+		}
+		if h.Len() > math.MaxUint16 {
+			return nil, nil, errors.Errorf("MergePartTopNAndHistToGlobal: partition histogram has too many buckets (%d > %d)", h.Len(), math.MaxUint16)
+		}
+		if firstHist == nil {
+			firstHist = h
+		}
+	}
+	if firstHist == nil {
+		return nil, nil, errors.Errorf("MergePartTopNAndHistToGlobal: no partition histograms provided")
+	}
+
+	tz := sc.TimeZone()
+	statslogutil.StatsLogger().Info("MergePartTopNAndHistToGlobal start",
+		zap.Int64("histID", firstHist.ID),
+		zap.Stringer("tp", firstHist.Tp),
+		zap.Bool("isIndex", isIndex),
+		zap.Int("hists", len(hists)),
+		zap.Int("topNs", len(topNs)))
+
+	// ---------------------------------------------------------------
+	// Pass 1: Determine global TopN via sorted merge of TopN entries
+	// and histogram bucket Repeats. And get the biggest bucket groups.
+	// ---------------------------------------------------------------
+
+	// 1a. Flatten + sort + compact the partition TopN entries: one
+	// entry per unique value, counts summed across partitions. allTopN
+	// covers every partition-TopN value (not a leftover subset); Pass 1
+	// walks it against the bucket refs. After global TopN selection,
+	// the non-promoted values become the virtual histogram entries
+	// Pass 2 walks (step 1e).
+	allTopN, err := flattenSortedTopN(sc, topNs, firstHist.Tp, isIndex)
+	if err != nil {
+		return nil, nil, err
+	}
+	statslogutil.StatsLogger().Info("MergePartTopNAndHistToGlobal step 1a: sorted partition TopN",
+		zap.Int("topNEntries", len(allTopN)))
+
+	// 1b. Collect partition totals and build the bucket-group cursor
+	// (a k-way merge over the per-partition bucket arrays, each already
+	// sorted by upper bound).
+	totHistCount, totNull, totColSize, totalBuckets := sumPartitionTotals(hists)
+	bucketCur, err := newBucketGroupCursor(sc, hists, totalBuckets, isIndex)
+	if err != nil {
+		return nil, nil, err
+	}
+	topNCur := &topNCursor{entries: allTopN}
+	statslogutil.StatsLogger().Info("MergePartTopNAndHistToGlobal step 1b: built k-way merge heap",
+		zap.Int("heapSize", bucketCur.heap.Len()),
+		zap.Int("totalBuckets", totalBuckets))
+
+	if !topNCur.valid() && !bucketCur.valid() {
+		return nil, NewHistogram(firstHist.ID, 0, totNull, firstHist.LastUpdateVersion,
+			firstHist.Tp, 0, totColSize), nil
+	}
+
+	// 1c. Merge-walk both cursors. For each unique encoded key the walk
+	// produces one topNCandidate:
+	//
+	//   totalCount = Σ partition-TopN counts + Σ bucket Repeats at upper
+	//
+	// totalCount is the value's frequency, used to pick the global TopN.
+	// A wide bucket [a, b] with count=100 repeat=5 only has 5 occurrences
+	// of the upper value b, the other 95 rows are some other values in
+	// [a, b).
+	topNHeap := generic.NewBoundedMinHeap(int(numTopN), func(a, b topNCandidate) int {
+		return cmp.Compare(a.totalCount, b.totalCount)
+	})
+
+	// HandleSignal does atomic loads and a time.Now() on every call; at
+	// a few million iterations on 8k-partition tables that overhead
+	// adds up. Check once per 1024 iterations, worst-case cancellation
+	// latency on the order of a millisecond.
+	var checkKillCount uint32
+	// Pool size for selectGlobalTopN: the heap caps at numTopN and so
+	// cannot report how many distinct values were offered to it.
+	var numCandidates int
+	for topNCur.valid() || bucketCur.valid() {
+		if checkKillCount&1023 == 0 {
+			if err := killer.HandleSignal(); err != nil {
+				return nil, nil, err
+			}
+		}
+		checkKillCount++
+
+		// Decide which cursor(s) hold the smallest pending value: the
+		// one with the smaller head, or both when the heads are equal
+		// (the value then gets contributions from both streams).
+		var consumeTopN, consumeBuckets bool
+		switch {
+		case !topNCur.valid():
+			consumeBuckets = true
+		case !bucketCur.valid():
+			consumeTopN = true
+		default:
+			d, err := topNMetaToDatum(TopNMeta{Encoded: topNCur.peekEncoded()}, firstHist.Tp, isIndex, tz)
+			if err != nil {
+				return nil, nil, err
+			}
+			ord, err := d.Compare(sc.TypeCtx(), bucketCur.peekUpper(), collate.GetBinaryCollator())
+			if err != nil {
+				return nil, nil, err
+			}
+			consumeTopN = ord <= 0
+			consumeBuckets = ord >= 0
+		}
+
+		var entry topNCandidate
+		if consumeTopN {
+			e := topNCur.next()
+			entry.encoded, entry.totalCount = e.encoded, e.count
+		}
+		if consumeBuckets {
+			encoded, sumRepeat, err := bucketCur.nextGroup(entry.encoded == nil)
+			if err != nil {
+				return nil, nil, err
+			}
+			if entry.encoded == nil {
+				entry.encoded = encoded
+			}
+			entry.repeatCount = sumRepeat
+			entry.totalCount += sumRepeat
+		}
+		if entry.totalCount > 0 {
+			numCandidates++
+			topNHeap.Add(entry)
+		}
+	}
+	// The cursor collected every popped ref in upper-bound order; Pass 2
+	// reuses this stream without rebuilding the heap.
+	sortedRefs := bucketCur.sortedRefs
+	statslogutil.StatsLogger().Info("MergePartTopNAndHistToGlobal step 1c: merge-walked TopN + buckets",
+		zap.Int("sortedRefs", len(sortedRefs)),
+		zap.Int("topNHeapSize", topNHeap.Len()))
+
+	// 1d. Extract the global TopN from the candidate heap. The promoted
+	// values' rows leave the histogram: subtract their bucket Repeats
+	// (massAndRepeat performs the matching per-bucket subtraction).
+	globalTopN, globalTopNMap, promotedRepeats := selectGlobalTopN(topNHeap, numTopN, numCandidates)
+	totHistCount -= promotedRepeats
+
+	// 1e. Non-promoted TopN values enter the histogram instead, as
+	// virtual single-value buckets.
+	virtualHistTopN, virtualTopNCount := collectVirtualTopN(allTopN, globalTopNMap)
+	totHistCount += virtualTopNCount
+	globalTopNSize := 0
+	if globalTopN != nil {
+		globalTopNSize = len(globalTopN.TopN)
+	}
+	statslogutil.StatsLogger().Info("MergePartTopNAndHistToGlobal step 1d: extracted global TopN",
+		zap.Int("globalTopN", globalTopNSize),
+		zap.Int64("totHistCount", totHistCount))
+
+	merged := newGlobalMergeRefs(sc, sortedRefs, hists, globalTopNMap, isIndex)
+	if len(virtualHistTopN) > 0 {
+		if err := merged.mergeVirtualTopN(virtualHistTopN, firstHist); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	globalHist, err := buildGlobalHistogram(
+		killer, merged,
+		totHistCount, totNull, totColSize, expBucketNumber,
+		firstHist,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	return globalTopN, globalHist, nil
+}
+
+// globalMergeRefs is the ref stream Pass 2 walks plus everything
+// needed to interpret one ref, so buildGlobalHistogram reads as the
+// bare equi-depth walk. It hides:
+//
+//   - Bound access: refs point into hists; upper/lower/effectiveUpper
+//     read bounds on demand into caller scratch Datums (see bucketRef
+//     for why refs stay 4 bytes).
+//   - globalTopNMap: values promoted to the global TopN. The global
+//     TopN owns those rows, so massAndRepeat subtracts the Repeat of
+//     a bucket whose upper is such a value.
+//   - remainingMass / splitEffectiveUpper: residue of refs split by
+//     an earlier merge step's overlap scan (see recordSplit).
+type globalMergeRefs struct {
+	actualUpper         types.Datum // scratch reused across massAndRepeat calls
+	globalTopNMap       map[hack.MutableString]struct{}
+	remainingMass       map[bucketRef]int64
+	splitEffectiveUpper map[bucketRef]types.Datum
+	sc                  *stmtctx.StatementContext
+	tz                  *time.Location
+	refs                []bucketRef
+	hists               []*Histogram
+	encodeBuf           []byte // scratch reused across massAndRepeat calls
+	isIndex             bool
+}
+
+func newGlobalMergeRefs(
+	sc *stmtctx.StatementContext,
+	refs []bucketRef,
+	hists []*Histogram,
+	globalTopNMap map[hack.MutableString]struct{},
+	isIndex bool,
+) *globalMergeRefs {
+	return &globalMergeRefs{
+		refs:                refs,
+		hists:               hists,
+		globalTopNMap:       globalTopNMap,
+		remainingMass:       make(map[bucketRef]int64),
+		splitEffectiveUpper: make(map[bucketRef]types.Datum),
+		sc:                  sc,
+		tz:                  sc.TimeZone(),
+		isIndex:             isIndex,
+	}
+}
+
+func (r *globalMergeRefs) numRefs() int { return len(r.refs) }
+
+// upperOf reads a raw ref's upper bound into dst.
+func (r *globalMergeRefs) upperOf(ref bucketRef, dst *types.Datum) {
+	h := r.hists[ref.histIdx]
+	h.Bounds.GetRow(int(ref.bucketIdx)*2+1).DatumWithBuffer(0, h.Tp, dst)
+}
+
+// upper reads ref i's actual upper bound into dst.
+func (r *globalMergeRefs) upper(i int, dst *types.Datum) {
+	r.upperOf(r.refs[i], dst)
+}
+
+// lower reads ref i's lower bound into dst.
+func (r *globalMergeRefs) lower(i int, dst *types.Datum) {
+	ref := r.refs[i]
+	h := r.hists[ref.histIdx]
+	h.Bounds.GetRow(int(ref.bucketIdx)*2).DatumWithBuffer(0, h.Tp, dst)
+}
+
+// effectiveUpper reads the upper bound Pass 2 should treat ref i as
+// having: the recorded cut for a split ref, the actual upper otherwise.
+func (r *globalMergeRefs) effectiveUpper(i int, dst *types.Datum) {
+	if eu, ok := r.splitEffectiveUpper[r.refs[i]]; ok {
+		*dst = eu
+		return
+	}
+	r.upper(i, dst)
+}
+
+// cmpBounds compares two bound Datums the way the merge orders refs.
+func (r *globalMergeRefs) cmpBounds(a, b *types.Datum) (int, error) {
+	return a.Compare(r.sc.TypeCtx(), b, collate.GetBinaryCollator())
+}
+
+// isGlobalTopNVal reports whether a bucket bound is a global TopN
+// value. Callers must pass an actual upper, never a post-split
+// effective upper: only an actual upper carries a value's Repeat.
+func (r *globalMergeRefs) isGlobalTopNVal(up *types.Datum) (bool, error) {
+	if r.isIndex {
+		// An index bound is the encoded key the TopN is keyed by.
+		_, ok := r.globalTopNMap[hack.String(up.GetBytes())]
+		return ok, nil
+	}
+	var err error
+	r.encodeBuf, err = codec.EncodeKey(r.tz, r.encodeBuf[:0], *up)
+	if err != nil {
+		return false, err
+	}
+	_, ok := r.globalTopNMap[hack.String(r.encodeBuf)]
+	return ok, nil
+}
+
+// massAndRepeat returns ref i's contribution to the global histogram.
+// fresh is false when the ref carries split residue from an earlier
+// merge step: the residue is the unattributed mass left for the ref's
+// [lower, effectiveUpper] range, and its Repeat already went to the
+// merged bucket that did the split, so repeat is 0. When the actual
+// upper is a global TopN value the global TopN owns those rows, so
+// the Repeat is subtracted from the mass and zeroed.
+func (r *globalMergeRefs) massAndRepeat(i int) (mass, repeat int64, fresh bool, err error) {
+	ref := r.refs[i]
+	if rem, ok := r.remainingMass[ref]; ok {
+		return rem, 0, false, nil
+	}
+	fresh = true
+	h := r.hists[ref.histIdx]
+	mass = h.Buckets[ref.bucketIdx].Count
+	if ref.bucketIdx > 0 {
+		mass -= h.Buckets[ref.bucketIdx-1].Count
+	}
+	repeat = h.Buckets[ref.bucketIdx].Repeat
+	r.upper(i, &r.actualUpper)
+	var matched bool
+	matched, err = r.isGlobalTopNVal(&r.actualUpper)
+	if err != nil {
+		return
+	}
+	if matched {
+		mass -= repeat
+		repeat = 0
+	}
+	return
+}
+
+// markConsumed records that ref i's mass has been fully attributed to
+// the merged bucket under construction, so later merge steps see it
+// as zero mass.
+func (r *globalMergeRefs) markConsumed(i int) {
+	r.remainingMass[r.refs[i]] = 0
+}
+
+// recordSplit records the result of splitting ref i at cut: leftMass
+// stays for later merge steps, and the ref's effective upper becomes
+// the cut.
+func (r *globalMergeRefs) recordSplit(i int, leftMass int64, cut *types.Datum) {
+	r.remainingMass[r.refs[i]] = leftMass
+	r.splitEffectiveUpper[r.refs[i]] = *cut
+}
+
+// mergeVirtualTopN converts the TopN entries that didn't make the
+// global TopN into virtual histograms of single-value buckets, and
+// merges their refs into r.refs by upper bound, so Pass 2 walks one
+// uniform ref stream with no special TopN handling.
+//
+// Entries are chunked into MaxUint16-sized virtual histograms so
+// bucketIdx (uint16) never overflows. The chunking is the cost of
+// bucketRef's narrow fields; see bucketRef for why the ref stays small.
+// virtualHistTopN is already encoded-key sorted, so chunks have
+// non-overlapping upper-bound ranges and can be referenced in
+// (chunkIdx, withinChunk) form.
+func (r *globalMergeRefs) mergeVirtualTopN(virtualHistTopN []topNEntry, firstHist *Histogram) error {
+	const chunkSize = math.MaxUint16
+	numChunks := (len(virtualHistTopN) + chunkSize - 1) / chunkSize
+	if uint64(len(r.hists))+uint64(numChunks) > math.MaxUint16 {
+		return errors.Errorf("MergePartTopNAndHistToGlobal: too many virtual histograms (%d partitions + %d virtual chunks > %d)", len(r.hists), numChunks, math.MaxUint16)
+	}
+	virtualHistIdxs := make([]uint16, numChunks)
+	for k := range numChunks {
+		start := k * chunkSize
+		end := min(start+chunkSize, len(virtualHistTopN))
+		chunk := NewHistogram(firstHist.ID, 0, 0, 0, firstHist.Tp, end-start, 0)
+		var chunkCum int64
+		for _, e := range virtualHistTopN[start:end] {
+			var d types.Datum
+			if r.isIndex {
+				d.SetBytes(e.encoded)
+			} else {
+				var err error
+				d, err = topNMetaToDatum(TopNMeta{Encoded: e.encoded}, firstHist.Tp, r.isIndex, r.tz)
+				if err != nil {
+					return err
+				}
+			}
+			chunkCum += int64(e.count)
+			chunk.AppendBucketWithNDV(&d, &d, chunkCum, int64(e.count), 0)
+		}
+		virtualHistIdxs[k] = uint16(len(r.hists))
+		r.hists = append(r.hists, chunk)
+	}
+
+	// Two-pointer merge of the partition refs (from the k-way merge)
+	// and the chunked virtual buckets, keyed by upper bound.
+	sortedRefs := r.refs
+	unifiedRefs := make([]bucketRef, 0, len(sortedRefs)+len(virtualHistTopN))
+	var refUpper, virtUpper types.Datum
+	si, vi := 0, 0
+	virtualRef := func(vi int) bucketRef {
+		return bucketRef{histIdx: virtualHistIdxs[vi/chunkSize], bucketIdx: uint16(vi % chunkSize)}
+	}
+	for si < len(sortedRefs) && vi < len(virtualHistTopN) {
+		r.upperOf(sortedRefs[si], &refUpper)
+		vRef := virtualRef(vi)
+		r.upperOf(vRef, &virtUpper)
+		c, err := r.cmpBounds(&refUpper, &virtUpper)
+		if err != nil {
+			return err
+		}
+		if c <= 0 {
+			unifiedRefs = append(unifiedRefs, sortedRefs[si])
+			si++
+		} else {
+			unifiedRefs = append(unifiedRefs, vRef)
+			vi++
+		}
+	}
+	unifiedRefs = append(unifiedRefs, sortedRefs[si:]...)
+	for ; vi < len(virtualHistTopN); vi++ {
+		unifiedRefs = append(unifiedRefs, virtualRef(vi))
+	}
+	r.refs = unifiedRefs
+	return nil
+}
+
+// buildGlobalHistogram is Pass 2 of MergePartTopNAndHistToGlobal: an
+// equi-depth merge over refs, the upper-bound-sorted stream of
+// partition bucket refs plus virtual-histogram refs built from
+// non-promoted TopN entries. Per-ref bookkeeping (bound access,
+// global-TopN Repeat ownership, split residue) lives behind
+// globalMergeRefs; only the core walk is here.
+//
+// The walk runs right-to-left, building one merged bucket at a time
+// in three phases:
+//
+//  1. Accumulate: consume refs into the in-progress bucket, extending
+//     its lower bound to the leftmost lower seen so far, until the
+//     equi-depth gate fires: cumulative mass reaches
+//     bucketCount/expBucketNumber of the total AND the bucket holds
+//     at least ~80% of target (avoids runt buckets after an
+//     overshoot).
+//  2. Coalesce the group: a "group" is the set of refs sharing one
+//     effective upper-bound value. If the gate fires mid-group at the
+//     merged upper, consume the rest of the group. Otherwise, restore
+//     the bucket to its state before the group and leave the whole group
+//     for the next bucket. This keeps a partial Repeat from becoming
+//     the next bucket's upper-bound frequency.
+//  3. Overlap scan: refs further left whose [lower, effectiveUpper]
+//     crosses the closed bucket's lower bound (currentLeftMost) are
+//     either totally inside (their whole mass joins the bucket) or
+//     overlapping. An overlapping ref is split proportionally under
+//     the uniform assumption (calcFraction4Datums): the fraction
+//     right of the cut plus the full Repeat (a point mass at the
+//     actual upper, right of any cut below it) joins the bucket; the
+//     left residue is recorded via recordSplit with the cut as the
+//     ref's new effective upper, to be consumed by later merged
+//     buckets.
+//
+// Merged buckets are collected right-to-left, each with the mass
+// accumulated since the previous emit, then reversed into the
+// ascending global histogram.
+func buildGlobalHistogram(
+	killer *sqlkiller.SQLKiller,
+	refs *globalMergeRefs,
+	totHistCount, totNull, totColSize, expBucketNumber int64,
+	firstHist *Histogram,
+) (*Histogram, error) {
+	globalHist := NewHistogram(firstHist.ID, 0, totNull, firstHist.LastUpdateVersion,
+		firstHist.Tp, int(expBucketNumber), totColSize)
+
+	if totHistCount <= 0 || refs.numRefs() == 0 {
+		statslogutil.StatsLogger().Info("buildGlobalHistogram: empty histogram (early return)")
+		return globalHist, nil
+	}
+
+	target := max(totHistCount/expBucketNumber, 1)
+
+	// Scratch Datums for on-demand bound reads.
+	var refUpper, refLower, scanUpper, scanLower types.Datum
+
+	// Emits are collected RTL and reversed at the end.
+	type mergedBucket struct {
+		lower, upper types.Datum
+		mass, repeat int64
+	}
+	globalBucketsRtl := make([]mergedBucket, 0, expBucketNumber)
+
+	var sum, prevSum int64
+	bucketCount := int64(1)
+	var currentLeftMost *types.Datum
+	var mergedUpper *types.Datum
+	var mergedRepeat int64
+
+	// Checkpoint before the current same-upper group. A cut within the
+	// group can be moved back here, even if it makes the bucket smaller
+	// than the equi-depth target, so the next bucket retains its Repeat.
+	var groupUpper types.Datum
+	var groupStart int
+	var groupStartSum int64
+	var groupStartLower *types.Datum
+
+	updateLeftMost := func(d *types.Datum) (err error) {
+		if currentLeftMost == nil {
+			v := *d
+			currentLeftMost = &v
+			return nil
+		}
+		c, err := refs.cmpBounds(d, currentLeftMost)
+		if err != nil {
+			return err
+		}
+		if c < 0 {
+			v := *d
+			currentLeftMost = &v
+		}
+		return nil
+	}
+
+	var checkKillCount uint32
+	for i := refs.numRefs() - 1; i >= 0; i-- {
+		if checkKillCount&1023 == 0 {
+			if err := killer.HandleSignal(); err != nil {
+				return nil, err
+			}
+		}
+		checkKillCount++
+
+		mass, repeat, fresh, err := refs.massAndRepeat(i)
+		if err != nil {
+			return nil, err
+		}
+		if mass <= 0 {
+			// Fully consumed by an earlier overlap scan, or a bucket
+			// fully owned by the global TopN.
+			continue
+		}
+
+		refs.effectiveUpper(i, &refUpper)
+		newGroup := mergedUpper == nil
+		if !newGroup {
+			c, err := refs.cmpBounds(&refUpper, &groupUpper)
+			if err != nil {
+				return nil, err
+			}
+			newGroup = c != 0
+		}
+		if newGroup {
+			groupUpper = refUpper
+			groupStart = i
+			groupStartSum = sum
+			groupStartLower = currentLeftMost
+		}
+		if mergedUpper == nil {
+			v := refUpper
+			mergedUpper = &v
+		}
+
+		refs.lower(i, &refLower)
+		if err := updateLeftMost(&refLower); err != nil {
+			return nil, err
+		}
+
+		sum += mass
+
+		if fresh && repeat > 0 {
+			c, err := refs.cmpBounds(&refUpper, mergedUpper)
+			if err != nil {
+				return nil, err
+			}
+			if c == 0 {
+				mergedRepeat += repeat
+			}
+		}
+
+		// Floor division, not cross-multiplication: the latter rounds
+		// the threshold up and shifts the cut by one row on small totals.
+		if sum < totHistCount*bucketCount/expBucketNumber {
+			continue
+		}
+		// This is sum-prevSum >= 80% of target without a division.
+		if (sum-prevSum)*5 < target*4 {
+			continue
+		}
+		// Reserve the leftmost slot for the trailing merged bucket.
+		if int64(len(globalBucketsRtl)) >= expBucketNumber-1 {
+			continue
+		}
+
+		// Do not split the current same-upper group at the size gate.
+		for i > 0 {
+			ahead := i - 1
+			mass2, repeat2, fresh2, err := refs.massAndRepeat(ahead)
+			if err != nil {
+				return nil, err
+			}
+			if mass2 <= 0 {
+				i = ahead
+				continue
+			}
+			refs.effectiveUpper(ahead, &scanUpper)
+			c, err := refs.cmpBounds(&scanUpper, &groupUpper)
+			if err != nil {
+				return nil, err
+			}
+			if c != 0 {
+				break
+			}
+			if groupStartSum > prevSum {
+				// This group's upper is below mergedUpper. Returning just
+				// the unconsumed refs would leave a partial Repeat on the
+				// next bucket, so return the already consumed refs as well.
+				sum = groupStartSum
+				currentLeftMost = groupStartLower
+				// The overlap scan starts at groupStart; the outer loop
+				// revisits it after decrementing i.
+				i = groupStart + 1
+				break
+			}
+			i = ahead
+			sum += mass2
+			if fresh2 && repeat2 > 0 {
+				mergedRepeat += repeat2
+			}
+			refs.lower(i, &refLower)
+			if err := updateLeftMost(&refLower); err != nil {
+				return nil, err
+			}
+		}
+
+		// Overlap scan. Walks its own index leftward and never moves i:
+		// the outer walk revisits the scanned refs, skipping consumed
+		// ones via the mass check, so it lands next on whichever ref
+		// still has residue to consume.
+		for j := i - 1; j >= 0; j-- {
+			mass2, repeat2, _, err := refs.massAndRepeat(j)
+			if err != nil {
+				return nil, err
+			}
+			if mass2 <= 0 {
+				continue
+			}
+			refs.effectiveUpper(j, &scanUpper)
+			c, err := refs.cmpBounds(&scanUpper, currentLeftMost)
+			if err != nil {
+				return nil, err
+			}
+			// scanUpper <= currentLeftMost: the ref ends at or before the
+			// boundary, so it belongs to a bucket further left. On equality
+			// its Repeat is a point mass at that bucket's upper, and only a
+			// bucket whose upper is the value can represent it: EqualRowCount
+			// returns Bucket.Repeat on a match against the upper. Attributing
+			// it to the merged bucket (where the value is the lower) would
+			// bury those rows as interior mass and estimate the value at 0.
+			if c <= 0 {
+				break
+			}
+
+			refs.lower(j, &scanLower)
+			c, err = refs.cmpBounds(&scanLower, currentLeftMost)
+			if err != nil {
+				return nil, err
+			}
+			if c >= 0 {
+				// Totally inside.
+				sum += mass2
+				refs.markConsumed(j)
+				continue
+			}
+
+			// Overlapping ref. splittable is the uniform-distributed
+			// non-Repeat mass; Repeat is a point mass at the upper
+			// and stays with the right portion of any cut below it.
+			splittable := mass2 - repeat2
+			if splittable <= 0 {
+				sum += mass2
+				refs.markConsumed(j)
+				continue
+			}
+			rightFrac := 1 - calcFraction4Datums(&scanLower, &scanUpper, currentLeftMost)
+			rightMass := int64(float64(splittable)*rightFrac) + repeat2
+			sum += rightMass
+			refs.recordSplit(j, mass2-rightMass, currentLeftMost)
+		}
+
+		globalBucketsRtl = append(globalBucketsRtl, mergedBucket{
+			lower:  *currentLeftMost,
+			upper:  *mergedUpper,
+			mass:   sum - prevSum,
+			repeat: mergedRepeat,
+		})
+
+		bucketCount++
+		prevSum = sum
+		currentLeftMost = nil
+		mergedUpper = nil
+		mergedRepeat = 0
+	}
+
+	// Trailing merged bucket: in-progress data that didn't fire the gate.
+	if currentLeftMost != nil && mergedUpper != nil && sum > prevSum {
+		globalBucketsRtl = append(globalBucketsRtl, mergedBucket{
+			lower:  *currentLeftMost,
+			upper:  *mergedUpper,
+			mass:   sum - prevSum,
+			repeat: mergedRepeat,
+		})
+	}
+
+	var cum int64
+	for k := len(globalBucketsRtl) - 1; k >= 0; k-- {
+		cum += globalBucketsRtl[k].mass
+		globalHist.AppendBucketWithNDV(&globalBucketsRtl[k].lower, &globalBucketsRtl[k].upper, cum, globalBucketsRtl[k].repeat, 0)
+	}
+
+	statslogutil.StatsLogger().Info("buildGlobalHistogram: built global histogram",
+		zap.Int("buckets", len(globalHist.Buckets)))
+
+	return globalHist, nil
+}
+
+const (
+	// AllLoaded indicates all statistics are loaded
+	AllLoaded = iota
+	// AllEvicted indicates all statistics are evicted
+	AllEvicted
+)
+
+// StatsLoadedStatus indicates the status of statistics
+type StatsLoadedStatus struct {
+	statsInitialized bool
+	evictedStatus    int
+}
+
+// NewStatsFullLoadStatus returns the status that the column/index fully loaded
+func NewStatsFullLoadStatus() StatsLoadedStatus {
+	return StatsLoadedStatus{
+		statsInitialized: true,
+		evictedStatus:    AllLoaded,
+	}
+}
+
+// NewStatsAllEvictedStatus returns the status that only loads count/nullCount/NDV and doesn't load CMSketch/TopN/Histogram.
+// When we load table stats, column stats is in AllEvicted status by default. CMSketch/TopN/Histogram of column is only
+// loaded when we really need column stats.
+func NewStatsAllEvictedStatus() StatsLoadedStatus {
+	return StatsLoadedStatus{
+		statsInitialized: true,
+		evictedStatus:    AllEvicted,
+	}
+}
+
+// Copy copies the status
+func (s *StatsLoadedStatus) Copy() StatsLoadedStatus {
+	return StatsLoadedStatus{
+		statsInitialized: s.statsInitialized,
+		evictedStatus:    s.evictedStatus,
+	}
+}
+
+// IsStatsInitialized indicates whether the column/index's statistics was loaded from storage before.
+// Note that `IsStatsInitialized` only can be set in initializing
+func (s StatsLoadedStatus) IsStatsInitialized() bool {
+	return s.statsInitialized
+}
+
+// IsLoadNeeded indicates whether it needs load statistics during LoadNeededHistograms or sync stats
+// If the column/index was loaded and any statistics of it is evicting, it also needs re-load statistics.
+func (s StatsLoadedStatus) IsLoadNeeded() bool {
+	if s.statsInitialized {
+		return s.evictedStatus > AllLoaded
+	}
+	// If statsInitialized is false, it means there is no stats for the column/index in the storage.
+	// Hence, we don't need to trigger the task of loading the column/index stats.
+	return false
+}
+
+// IsEssentialStatsLoaded indicates whether the essential statistics is loaded.
+// If the column/index was loaded, and at least histogram and topN still exists, the necessary statistics is still loaded.
+func (s StatsLoadedStatus) IsEssentialStatsLoaded() bool {
+	return s.statsInitialized && (s.evictedStatus < AllEvicted)
+}
+
+// IsAllEvicted indicates whether all the stats got evicted or not.
+func (s StatsLoadedStatus) IsAllEvicted() bool {
+	return s.statsInitialized && s.evictedStatus >= AllEvicted
+}
+
+// IsFullLoad indicates whether the stats are full loaded
+func (s StatsLoadedStatus) IsFullLoad() bool {
+	return s.statsInitialized && s.evictedStatus == AllLoaded
+}

@@ -1,0 +1,29 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "initstats",
+    srcs = [
+        "load_stats.go",
+        "load_stats_page.go",
+    ],
+    importpath = "github.com/pingcap/tidb/pkg/statistics/handle/initstats",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/config",
+        "//pkg/metrics",
+        "//pkg/util",
+        "//pkg/util/logutil",
+        "@com_github_pingcap_errors//:errors",
+        "@org_uber_go_atomic//:atomic",
+        "@org_uber_go_zap//:zap",
+    ],
+)
+
+go_test(
+    name = "initstats_test",
+    timeout = "short",
+    srcs = ["load_stats_page_test.go"],
+    embed = [":initstats"],
+    flaky = True,
+    deps = ["@com_github_stretchr_testify//require"],
+)

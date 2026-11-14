@@ -31,15 +31,17 @@ import (
 )
 
 var (
-	pkgDir string
-	outDir string
+	pkgDir  string
+	outDir  string
+	pgoFile string
+	nextGen bool
 )
 
 const codeTemplate = `
 package main
 
 import (
-	"github.com/pingcap/tidb/plugin"
+	"github.com/pingcap/tidb/pkg/plugin"
 )
 
 func PluginManifest() *plugin.Manifest {
@@ -75,6 +77,8 @@ func PluginManifest() *plugin.Manifest {
 func init() {
 	flag.StringVar(&pkgDir, "pkg-dir", "", "plugin package folder path")
 	flag.StringVar(&outDir, "out-dir", "", "plugin packaged folder path")
+	flag.StringVar(&pgoFile, "pgo-file", "", "go profile-guided optimization(pgo) file path")
+	flag.BoolVar(&nextGen, "next-gen", false, "whether to build plugin with next-gen features")
 	flag.Usage = usage
 }
 
@@ -99,8 +103,15 @@ func main() {
 		log.Printf("unable to resolve absolute representation of output path , %+v\n", err)
 		flag.Usage()
 	}
+	if pgoFile != "" {
+		pgoFile, err = filepath.Abs(pgoFile)
+		if err != nil {
+			log.Printf("unable to resolve absolute representation of pgo-file path , %+v\n", err)
+			flag.Usage()
+		}
+	}
 
-	var manifest map[string]interface{}
+	var manifest map[string]any
 	_, err = toml.DecodeFile(filepath.Join(pkgDir, "manifest.toml"), &manifest)
 	if err != nil {
 		log.Printf("read pkg %s's manifest failure, %+v\n", pkgDir, err)
@@ -109,10 +120,6 @@ func main() {
 	manifest["buildTime"] = time.Now().String()
 
 	pluginName := manifest["name"].(string)
-	if strings.Contains(pluginName, "-") {
-		log.Printf("plugin name should not contain '-'\n")
-		os.Exit(1)
-	}
 	if pluginName != filepath.Base(pkgDir) {
 		log.Printf("plugin package must be same with plugin name in manifest file\n")
 		os.Exit(1)
@@ -126,7 +133,7 @@ func main() {
 	}
 
 	genFileName := filepath.Join(pkgDir, filepath.Base(pkgDir)+".gen.go")
-	genFile, err := os.OpenFile(genFileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
+	genFile, err := os.OpenFile(genFileName, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0700) // #nosec G302
 	if err != nil {
 		log.Printf("generate code failure during prepare output file, %+v\n", err)
 		os.Exit(1)
@@ -145,15 +152,7 @@ func main() {
 	}
 
 	outputFile := filepath.Join(outDir, pluginName+"-"+version+".so")
-	ctx := context.Background()
-	buildCmd := exec.CommandContext(ctx, "go", "build",
-		"-buildmode=plugin",
-		"-o", outputFile, pkgDir)
-	buildCmd.Dir = pkgDir
-	buildCmd.Stderr = os.Stderr
-	buildCmd.Stdout = os.Stdout
-	buildCmd.Env = append(os.Environ(), "GO111MODULE=on")
-	err = buildCmd.Run()
+	err = buildPlugin(context.Background(), pkgDir, outputFile, pgoFile, nextGen)
 	if err != nil {
 		log.Printf("compile plugin source code failure, %+v\n", err)
 		os.Exit(1)
@@ -165,4 +164,96 @@ func main() {
 	if err != nil {
 		log.Printf("print manifest detail failure, err: %v", err)
 	}
+}
+
+func buildPlugin(ctx context.Context, pkgDir, outputFile, pgoFile string, nextGen bool) error {
+	workDir, err := os.MkdirTemp("", "tidb-plugin-work-")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := os.RemoveAll(workDir); err != nil {
+			log.Printf("remove temporary plugin workspace failure: %v", err)
+		}
+	}()
+	buildEnv, err := pluginBuildEnv(ctx, pkgDir, filepath.Join(workDir, "go.work"))
+	if err != nil {
+		return err
+	}
+
+	flags := make([]string, 0, 4)
+	flags = append(flags, "build")
+	if pgoFile != "" {
+		flags = append(flags, "-pgo="+pgoFile)
+	}
+
+	buildTags := []string{"codes"}
+	if nextGen {
+		buildTags = append(buildTags, "nextgen")
+	}
+
+	flags = append(flags,
+		"-tags="+strings.Join(buildTags, ","),
+		"-buildmode=plugin",
+		"-o", outputFile, pkgDir)
+	buildCmd := exec.CommandContext(ctx, "go", flags...)
+	buildCmd.Dir = pkgDir
+	buildCmd.Stderr = os.Stderr
+	buildCmd.Stdout = os.Stdout
+	buildCmd.Env = buildEnv
+	return buildCmd.Run()
+}
+
+func pluginBuildEnv(ctx context.Context, pkgDir, workFile string) ([]string, error) {
+	env := append(os.Environ(), "GO111MODULE=on")
+	runGo := func(args ...string) (string, error) {
+		cmd := exec.CommandContext(ctx, "go", args...)
+		cmd.Dir = pkgDir
+		cmd.Env = env
+		cmd.Stderr = os.Stderr
+		output, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("go %s: %w", strings.Join(args, " "), err)
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	work, err := runGo("env", "GOWORK")
+	if err != nil {
+		return nil, err
+	}
+	if work != "" && work != "off" {
+		return env, nil
+	}
+	modFile, err := runGo("env", "GOMOD")
+	if err != nil {
+		return nil, err
+	}
+	if modFile == "" || modFile == os.DevNull {
+		return nil, fmt.Errorf("plugin package %s must belong to a Go module", pkgDir)
+	}
+	tidbDir, err := runGo("list", "-m", "-f", "{{.Dir}}", "github.com/pingcap/tidb")
+	if err != nil {
+		return nil, err
+	}
+	if tidbDir == "" {
+		if _, err := runGo("mod", "download", "github.com/pingcap/tidb"); err != nil {
+			return nil, err
+		}
+		tidbDir, err = runGo("list", "-m", "-f", "{{.Dir}}", "github.com/pingcap/tidb")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Dependency replacements are not inherited by importing modules. Include
+	// TiDB as a workspace main module so plugins use its compatibility pins too.
+	args := []string{"work", "init", filepath.Dir(modFile)}
+	if tidbDir != filepath.Dir(modFile) {
+		args = append(args, tidbDir)
+	}
+	env = append(env, "GOWORK="+workFile)
+	if _, err := runGo(args...); err != nil {
+		return nil, err
+	}
+	return env, nil
 }

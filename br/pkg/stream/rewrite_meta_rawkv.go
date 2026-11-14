@@ -1,0 +1,903 @@
+// Copyright 2022-present PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package stream
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
+	berrors "github.com/pingcap/tidb/br/pkg/errors"
+	"github.com/pingcap/tidb/br/pkg/restore/ingestrec"
+	"github.com/pingcap/tidb/br/pkg/restore/tiflashrec"
+	"github.com/pingcap/tidb/br/pkg/utils"
+	"github.com/pingcap/tidb/br/pkg/utils/consts"
+	"github.com/pingcap/tidb/pkg/ddl"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta"
+	"github.com/pingcap/tidb/pkg/meta/model"
+	"github.com/pingcap/tidb/pkg/parser/ast"
+	"go.uber.org/zap"
+)
+
+type UpstreamID = int64
+type DownstreamID = int64
+
+// TableReplace specifies table information mapping from up-stream cluster to down-stream cluster.
+type TableReplace struct {
+	Name           string
+	TableID        DownstreamID
+	TargetDBName   string
+	TargetDBID     DownstreamID
+	HasForeignKeys bool
+	// SourceName is the upstream table name observed before routing.
+	// It is runtime-only; persisted routes already own their target identity.
+	SourceName string
+	// SkipMetaDelete prevents a historical source location from deleting the
+	// same downstream key owned by the table's latest location. Runtime-only.
+	SkipMetaDelete bool
+	// ForeignKeyReferences contains source names observed while scanning log
+	// metadata. It is persisted in the PiTR ID map so checkpoint retries retain
+	// the same routed-dependency validation information.
+	ForeignKeyReferences []ForeignKeyReference
+	IsView               bool
+	PartitionMap         map[UpstreamID]DownstreamID
+	IndexMap             map[UpstreamID]DownstreamID
+	FilteredOut          bool
+}
+
+// ForeignKeyReference identifies a source object named by a table's foreign
+// key. Names are kept in source form so the restore task can determine whether
+// a configured route would change the reference without rewriting it yet.
+type ForeignKeyReference struct {
+	Schema string
+	Table  string
+}
+
+// EffectiveDBName returns the table-level target database name when present.
+// Old ID maps don't contain table-level database information, so they fall
+// back to the database mapping that contains the table.
+func (tr *TableReplace) EffectiveDBName(parent *DBReplace) string {
+	if tr.TargetDBName != "" {
+		return tr.TargetDBName
+	}
+	return parent.Name
+}
+
+// EffectiveDBID returns the table-level target database ID when present.
+// A zero ID is reserved for backward-compatible fallback to the parent map.
+func (tr *TableReplace) EffectiveDBID(parent *DBReplace) DownstreamID {
+	if tr.TargetDBID != 0 {
+		return tr.TargetDBID
+	}
+	return parent.DbID
+}
+
+// DBReplace specifies database information mapping from up-stream cluster to down-stream cluster.
+type DBReplace struct {
+	Name        string
+	DbID        DownstreamID
+	TableMap    map[UpstreamID]*TableReplace
+	FilteredOut bool
+	Reused      bool
+	// SourceName identifies this upstream schema independently of the target Name.
+	// It is persisted so later log-only restores can route new upstream table IDs.
+	SourceName string
+	// SchemaRouted reports that an explicit schema-level rename rule matched
+	// this source schema. The schema itself is then restored even when every
+	// selected table is overridden to another target schema. It is persisted in
+	// the PiTR ID map so a retry keeps replaying the target schema's DBInfo.
+	SchemaRouted bool
+	// SourceDBInfo keeps the latest source DBInfo observed during the log scan.
+	// It is runtime-only (not persisted) and is used to create a table-route
+	// target schema with the source schema's charset/collation/placement instead
+	// of defaults.
+	SourceDBInfo *model.DBInfo
+}
+
+// SchemaRouteTarget returns the independently restored target of a selected
+// schema-level rule. Table-level overrides do not remove this ownership, so
+// creation, ID allocation and conflict checks must include it.
+func (dr *DBReplace) SchemaRouteTarget() (string, bool) {
+	if dr.FilteredOut || !dr.SchemaRouted || dr.Name == "" {
+		return "", false
+	}
+	return dr.Name, true
+}
+
+// RestoresDatabaseMetadata reports whether this mapping still owns its target
+// database metadata. When every selected table is explicitly routed to another
+// schema, replaying the parent DBInfo would create an unrelated empty source
+// schema. The decision is derived from persisted table routes so resume follows
+// the same behavior without another checkpoint field.
+func (dr *DBReplace) RestoresDatabaseMetadata() bool {
+	if dr.FilteredOut {
+		return false
+	}
+	if dr.SchemaRouted {
+		// A schema-level rename rule explicitly restores the schema itself, even
+		// when all of its selected tables are overridden to other target schemas.
+		return true
+	}
+	hasSelectedTable := false
+	for _, tableReplace := range dr.TableMap {
+		if tableReplace.FilteredOut {
+			continue
+		}
+		hasSelectedTable = true
+		if tableReplace.TargetDBName == "" ||
+			ast.NewCIStr(tableReplace.TargetDBName).L == ast.NewCIStr(dr.Name).L {
+			return true
+		}
+	}
+	return !hasSelectedTable
+}
+
+// SchemasReplace specifies schemas information mapping from up-stream cluster to down-stream cluster.
+type SchemasReplace struct {
+	DbReplaceMap  map[UpstreamID]*DBReplace
+	fromPitrIdMap bool
+
+	delRangeRecorder *brDelRangeExecWrapper
+	ingestRecorder   *ingestrec.IngestRecorder
+	TiflashRecorder  *tiflashrec.TiFlashRecorder
+	RewriteTS        uint64 // used to rewrite commit ts in meta kv.
+
+	AfterTableRewrittenFn func(deleted bool, tableInfo *model.TableInfo)
+	setRestoreTableMode   bool
+
+	// track deleted tables, maps dbID -> tableIDs
+	deletedTables        map[UpstreamID]map[UpstreamID]struct{}
+	protectedTargetDBIDs map[DownstreamID]struct{}
+}
+
+// NewTableReplace creates a TableReplace struct.
+func NewTableReplace(name string, newID DownstreamID) *TableReplace {
+	return &TableReplace{
+		Name:         name,
+		TableID:      newID,
+		PartitionMap: make(map[UpstreamID]DownstreamID),
+		IndexMap:     make(map[UpstreamID]DownstreamID),
+		FilteredOut:  false,
+	}
+}
+
+// NewDBReplace creates a DBReplace struct.
+func NewDBReplace(name string, newID DownstreamID) *DBReplace {
+	return &DBReplace{
+		Name:        name,
+		DbID:        newID,
+		TableMap:    make(map[UpstreamID]*TableReplace),
+		FilteredOut: false,
+		Reused:      false,
+	}
+}
+
+// NewSchemasReplace creates a SchemasReplace struct.
+func NewSchemasReplace(
+	dbReplaceMap map[UpstreamID]*DBReplace,
+	fromPitrIdMap bool,
+	tiflashRecorder *tiflashrec.TiFlashRecorder,
+	restoreTS uint64,
+	recordDeleteRange func(*PreDelRangeQuery),
+	setRestoreTableMode bool,
+) *SchemasReplace {
+	globalTableIdMap := make(map[UpstreamID]DownstreamID)
+	// protectedTargetDBIDs holds target schemas that are shared by routed tables
+	// from more than one source schema. A DBInfo delete from one source schema
+	// must not drop a schema that other routed tables still depend on, so these
+	// target schemas are never deleted during log replay.
+	//
+	// This is intentionally static: a routed target schema created by this restore
+	// is retained even if every owner and routed table is dropped before the
+	// restore endpoint, so an otherwise empty target schema may remain. Reused
+	// (pre-existing) targets must never be dropped either. Garbage-collecting a
+	// restore-created target would require persisted ownership plus a dynamic
+	// reference count.
+	protectedTargetDBIDs := make(map[DownstreamID]struct{})
+	targetDBReferenceCounts := make(map[DownstreamID]int)
+	for _, dr := range dbReplaceMap {
+		if dr.FilteredOut {
+			continue
+		}
+		targetDBReferenceCounts[dr.DbID]++
+		for tblID, tr := range dr.TableMap {
+			if tr.FilteredOut {
+				continue
+			}
+			globalTableIdMap[tblID] = tr.TableID
+			maps.Copy(globalTableIdMap, tr.PartitionMap)
+			if tr.TargetDBID != 0 && (tr.TargetDBID != dr.DbID ||
+				ast.NewCIStr(tr.EffectiveDBName(dr)).L != ast.NewCIStr(dr.Name).L) {
+				protectedTargetDBIDs[tr.TargetDBID] = struct{}{}
+			}
+		}
+	}
+	for targetDBID, count := range targetDBReferenceCounts {
+		if count > 1 {
+			protectedTargetDBIDs[targetDBID] = struct{}{}
+		}
+	}
+
+	return &SchemasReplace{
+		DbReplaceMap:         dbReplaceMap,
+		fromPitrIdMap:        fromPitrIdMap,
+		delRangeRecorder:     newDelRangeExecWrapper(globalTableIdMap, recordDeleteRange),
+		ingestRecorder:       ingestrec.New(),
+		TiflashRecorder:      tiflashRecorder,
+		RewriteTS:            restoreTS,
+		setRestoreTableMode:  setRestoreTableMode,
+		deletedTables:        make(map[UpstreamID]map[UpstreamID]struct{}),
+		protectedTargetDBIDs: protectedTargetDBIDs,
+	}
+}
+
+func (sr *SchemasReplace) rewriteKeyForDB(key []byte, cf string) ([]byte, error) {
+	rawMetaKey, err := ParseTxnMetaKeyFrom(key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	dbID, err := meta.ParseDBKey(rawMetaKey.Field)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	dbMap, exist := sr.DbReplaceMap[dbID]
+	if !exist {
+		if sr.fromPitrIdMap {
+			log.Warn("failed to find db id in maps, but it is from pitr id map.", zap.Int64("dbID", dbID))
+			return nil, nil
+		}
+		return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find db id:%v in maps", dbID)
+	}
+	if !dbMap.RestoresDatabaseMetadata() || dbMap.Reused {
+		return nil, nil
+	}
+
+	rawMetaKey.UpdateField(meta.DBkey(dbMap.DbID))
+	if cf == consts.WriteCF {
+		rawMetaKey.UpdateTS(sr.RewriteTS)
+	}
+	return rawMetaKey.EncodeMetaKey(), nil
+}
+
+func (sr *SchemasReplace) rewriteDBInfo(value []byte) ([]byte, error) {
+	dbInfo := new(model.DBInfo)
+	if err := json.Unmarshal(value, dbInfo); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	dbMap, exist := sr.DbReplaceMap[dbInfo.ID]
+	if !exist {
+		if sr.fromPitrIdMap {
+			log.Warn("failed to find db id in maps, but it is from pitr id map.", zap.Int64("dbID", dbInfo.ID))
+			return nil, nil
+		}
+		return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find db id:%v in maps", dbInfo.ID)
+	}
+	if !dbMap.RestoresDatabaseMetadata() || dbMap.Reused {
+		return nil, nil
+	}
+
+	dbInfo.ID = dbMap.DbID
+	if _, protected := sr.protectedTargetDBIDs[dbMap.DbID]; protected {
+		// The target is an independent shared container. Skipping the source
+		// DROP tombstone is insufficient: its earlier DBInfo Puts also carry
+		// WriteOnly/DeleteOnly states which must not survive in the target.
+		dbInfo.State = model.StatePublic
+	}
+	if dbMap.Name != "" {
+		dbInfo.Name = ast.NewCIStr(dbMap.Name)
+	}
+	newValue, err := json.Marshal(dbInfo)
+	if err != nil {
+		return nil, err
+	}
+	return newValue, nil
+}
+
+func (sr *SchemasReplace) rewriteEntryForDB(e *kv.Entry, cf string) (*kv.Entry, error) {
+	rawMetaKey, err := ParseTxnMetaKeyFrom(e.Key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	dbID, err := meta.ParseDBKey(rawMetaKey.Field)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	r, err := sr.rewriteValue(
+		e.Value,
+		cf,
+		func(value []byte) ([]byte, error) {
+			return sr.rewriteDBInfo(value)
+		},
+	)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	newValue := r.NewValue
+	newKey, err := sr.rewriteKeyForDB(e.Key, cf)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if newKey == nil {
+		return nil, nil
+	}
+	// A table-level cross-schema route uses a target schema as an independent
+	// container. A DBInfo delete from another source database must not remove
+	// that shared container and all routed tables in it.
+	if r.Deleted {
+		dbReplace, exists := sr.DbReplaceMap[dbID]
+		if !exists {
+			return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find db id:%v in maps", dbID)
+		}
+		if _, protected := sr.protectedTargetDBIDs[dbReplace.DbID]; protected {
+			return nil, nil
+		}
+	}
+
+	// track deleted databases in the same structure as deleted tables
+	if r.Deleted {
+		// add deleted database with empty table set
+		if _, ok := sr.deletedTables[dbID]; !ok {
+			sr.deletedTables[dbID] = make(map[int64]struct{})
+		}
+	}
+
+	return &kv.Entry{Key: newKey, Value: newValue}, nil
+}
+
+func (sr *SchemasReplace) rewriteKeyForTable(
+	key []byte,
+	cf string,
+	parseField func([]byte) (tableID int64, err error),
+	encodeField func(tableID int64) []byte,
+) ([]byte, error) {
+	var (
+		err   error
+		exist bool
+	)
+	rawMetaKey, err := ParseTxnMetaKeyFrom(key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	dbID, err := meta.ParseDBKey(rawMetaKey.Key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	tableID, err := parseField(rawMetaKey.Field)
+	if err != nil {
+		log.Warn("parse table key failed", zap.ByteString("field", rawMetaKey.Field))
+		return nil, errors.Trace(err)
+	}
+
+	dbReplace, exist := sr.DbReplaceMap[dbID]
+	if !exist {
+		if sr.fromPitrIdMap {
+			log.Warn("failed to find db id in maps, but it is from pitr id map.", zap.Int64("dbID", dbID))
+			return nil, nil
+		}
+		return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find db id:%v in maps", dbID)
+	}
+	if dbReplace.FilteredOut {
+		return nil, nil
+	}
+
+	tableReplace, exist := dbReplace.TableMap[tableID]
+	if !exist {
+		if sr.fromPitrIdMap {
+			log.Warn("failed to find table id in maps, but it is from pitr id map.", zap.Int64("dbID", dbID), zap.Int64("tableID", tableID))
+			return nil, nil
+		}
+		return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find table id:%v in maps", tableID)
+	}
+
+	// don't restore meta kv change for system db, not supported yet
+	if tableReplace.FilteredOut || utils.IsSysOrTempSysDB(tableReplace.EffectiveDBName(dbReplace)) {
+		return nil, nil
+	}
+
+	rawMetaKey.UpdateKey(meta.DBkey(tableReplace.EffectiveDBID(dbReplace)))
+	rawMetaKey.UpdateField(encodeField(tableReplace.TableID))
+	if cf == consts.WriteCF {
+		rawMetaKey.UpdateTS(sr.RewriteTS)
+	}
+	return rawMetaKey.EncodeMetaKey(), nil
+}
+
+func (sr *SchemasReplace) rewriteTableInfo(value []byte, dbID int64) ([]byte, error) {
+	var (
+		tableInfo    model.TableInfo
+		err          error
+		exist        bool
+		dbReplace    *DBReplace
+		tableReplace *TableReplace
+	)
+	if err := json.Unmarshal(value, &tableInfo); err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	// construct or find the id map.
+	dbReplace, exist = sr.DbReplaceMap[dbID]
+	if !exist {
+		if sr.fromPitrIdMap {
+			log.Warn("failed to find db id in maps, but it is from pitr id map.", zap.Int64("dbID", dbID))
+			return nil, nil
+		}
+		return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find db id:%v in maps", dbID)
+	}
+	if dbReplace.FilteredOut {
+		return nil, nil
+	}
+
+	tableReplace, exist = dbReplace.TableMap[tableInfo.ID]
+	if !exist {
+		if sr.fromPitrIdMap {
+			log.Warn("failed to find table id in maps, but it is from pitr id map.", zap.Int64("dbID", dbID), zap.Int64("tableID", tableInfo.ID))
+			return nil, nil
+		}
+		return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find table id:%v in maps", tableInfo.ID)
+	}
+	if tableReplace.FilteredOut {
+		return nil, nil
+	}
+
+	// update table ID and partition ID.
+	tableInfo.ID = tableReplace.TableID
+	tableInfo.DBID = tableReplace.EffectiveDBID(dbReplace)
+	partitions := tableInfo.GetPartitionInfo()
+	if partitions != nil {
+		for i, tbl := range partitions.Definitions {
+			newID, exist := tableReplace.PartitionMap[tbl.ID]
+			if !exist {
+				log.Error("expect partition info in table replace but got none", zap.Int64("partitionID", tbl.ID))
+				return nil, errors.Annotatef(berrors.ErrInvalidArgument, "failed to find partition id:%v in replace maps", tbl.ID)
+			}
+			partitions.Definitions[i].ID = newID
+		}
+	}
+
+	// Force to disable TTL_ENABLE when restore
+	if tableInfo.TTLInfo != nil {
+		tableInfo.TTLInfo.Enable = false
+	}
+	// Set TableInfo to be restore mode during log replay, will release the mode after PiTR finishes
+	if sr.setRestoreTableMode {
+		tableInfo.Mode = model.TableModeRestore
+	}
+	// Set Table Name directly to be the name at the end of the restore to avoid potential name conflicts
+	if tableReplace.Name != "" {
+		tableInfo.Name = ast.NewCIStr(tableReplace.Name)
+	}
+	if sr.AfterTableRewrittenFn != nil {
+		sr.AfterTableRewrittenFn(false, &tableInfo)
+	}
+
+	// marshal to json
+	newValue, err := json.Marshal(&tableInfo)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return newValue, nil
+}
+
+func (sr *SchemasReplace) rewriteEntryForTable(e *kv.Entry, cf string) (*kv.Entry, error) {
+	dbID, err := ParseDBIDFromTableKey(e.Key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	result, err := sr.rewriteValue(
+		e.Value,
+		cf,
+		func(value []byte) ([]byte, error) {
+			return sr.rewriteTableInfo(value, dbID)
+		},
+	)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	var newTableID int64 = 0
+	var oldTableID int64 = 0
+	newKey, err := sr.rewriteKeyForTable(e.Key, cf, func(b []byte) (int64, error) {
+		tableID, err := meta.ParseTableKey(b)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		oldTableID = tableID
+		return tableID, nil
+	}, func(tableID int64) []byte {
+		newTableID = tableID
+		return meta.TableKey(tableID)
+	})
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	// got filtered
+	if newKey == nil {
+		return nil, nil
+	}
+
+	// NOTE: the normal path is in the `SchemaReplace.rewriteTableInfo`
+	//       for now, we rewrite key and value separately hence we cannot
+	//       get a view of (is_delete, table_id, table_info) at the same time :(.
+	//       Maybe we can extract the rewrite part from rewriteTableInfo.
+	if result.Deleted {
+		if _, ok := sr.deletedTables[dbID]; !ok {
+			sr.deletedTables[dbID] = make(map[int64]struct{})
+		}
+		sr.deletedTables[dbID][oldTableID] = struct{}{}
+		if sr.AfterTableRewrittenFn != nil {
+			dbReplace := sr.DbReplaceMap[dbID]
+			tableReplace := dbReplace.TableMap[oldTableID]
+			sr.AfterTableRewrittenFn(true, &model.TableInfo{
+				ID:   newTableID,
+				DBID: tableReplace.EffectiveDBID(dbReplace),
+			})
+		}
+	} else if result.Put {
+		// handle the rename/exchange partition back case:
+		// 1.a. RENAME TABLE test.t1 TO test2.t1;
+		// 1.b. RENAME TABLE test2.t1 TO test.t1;
+		// 2.a. ALTER TABLE test.t_exchange_partition EXCHANGE PARTITION p_to_be_exchanged WITH TABLE test.t_non_partitioned_table;
+		// 2.b. ALTER TABLE test.t_exchange_partition EXCHANGE PARTITION p_to_be_exchanged WITH TABLE test.t_non_partitioned_table;
+		// NOTE: the table test.t1 and test.t_non_partitioned_table(id=t_non_partitioned_table) needs to remove the record from deleted
+		//       tables to make sure they are refreshed meta after database.
+		// NOTE: the table test2.t1 and test.t_non_partitioned_table(id=p_to_be_exchanged) will be filtered out so its metakv will not
+		//       be restored. Therefore no need to record them into deleted tables to refresh them.
+		if m, ok := sr.deletedTables[dbID]; ok {
+			if _, ok := m[oldTableID]; ok {
+				log.Info("remove item from deleted tables because deleted table is created again",
+					zap.Int64("upstream db id", dbID), zap.Int64("upstream table id", oldTableID))
+				delete(m, oldTableID)
+			}
+		}
+	}
+
+	return &kv.Entry{Key: newKey, Value: result.NewValue}, nil
+}
+
+func (sr *SchemasReplace) rewriteEntryForAutoIncrementIDKey(e *kv.Entry, cf string) (*kv.Entry, error) {
+	newKey, err := sr.rewriteKeyForTable(
+		e.Key,
+		cf,
+		meta.ParseAutoIncrementIDKey,
+		meta.AutoIncrementIDKey,
+	)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if newKey == nil {
+		return nil, nil
+	}
+
+	return &kv.Entry{Key: newKey, Value: e.Value}, nil
+}
+
+func (sr *SchemasReplace) rewriteEntryForAutoTableIDKey(e *kv.Entry, cf string) (*kv.Entry, error) {
+	newKey, err := sr.rewriteKeyForTable(
+		e.Key,
+		cf,
+		meta.ParseAutoTableIDKey,
+		meta.AutoTableIDKey,
+	)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if newKey == nil {
+		return nil, nil
+	}
+
+	return &kv.Entry{Key: newKey, Value: e.Value}, nil
+}
+
+func (sr *SchemasReplace) rewriteEntryForSequenceKey(e *kv.Entry, cf string) (*kv.Entry, error) {
+	newKey, err := sr.rewriteKeyForTable(
+		e.Key,
+		cf,
+		meta.ParseSequenceKey,
+		meta.SequenceKey,
+	)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if newKey == nil {
+		return nil, nil
+	}
+
+	return &kv.Entry{Key: newKey, Value: e.Value}, nil
+}
+
+func (sr *SchemasReplace) rewriteEntryForAutoRandomTableIDKey(e *kv.Entry, cf string) (*kv.Entry, error) {
+	newKey, err := sr.rewriteKeyForTable(
+		e.Key,
+		cf,
+		meta.ParseAutoRandomTableIDKey,
+		meta.AutoRandomTableIDKey,
+	)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if newKey == nil {
+		return nil, nil
+	}
+
+	return &kv.Entry{Key: newKey, Value: e.Value}, nil
+}
+
+type rewriteResult struct {
+	Deleted  bool
+	Put      bool
+	NewValue []byte
+}
+
+// rewriteValue rewrite the value if cf is "default", or rewrite the shortValue if cf is "write".
+func (sr *SchemasReplace) rewriteValue(value []byte, cf string, rewriteFunc func([]byte) ([]byte, error)) (rewriteResult, error) {
+	switch cf {
+	case consts.DefaultCF:
+		newValue, err := rewriteFunc(value)
+		if err != nil {
+			return rewriteResult{}, errors.Trace(err)
+		}
+		return rewriteResult{
+			NewValue: newValue,
+			Deleted:  false,
+			Put:      false,
+		}, nil
+	case consts.WriteCF:
+		rawWriteCFValue := new(RawWriteCFValue)
+		if err := rawWriteCFValue.ParseFrom(value); err != nil {
+			return rewriteResult{}, errors.Trace(err)
+		}
+
+		if rawWriteCFValue.IsRollback() {
+			return rewriteResult{
+				NewValue: value,
+				Deleted:  false,
+				Put:      false,
+			}, nil
+		}
+
+		rawWriteCFValue.MarkPhysicalImportTxnSource()
+		if rawWriteCFValue.IsDelete() {
+			return rewriteResult{
+				NewValue: rawWriteCFValue.EncodeTo(),
+				Deleted:  true,
+				Put:      false,
+			}, nil
+		}
+		if !rawWriteCFValue.HasShortValue() {
+			return rewriteResult{
+				NewValue: rawWriteCFValue.EncodeTo(),
+				Put:      true,
+			}, nil
+		}
+
+		shortValue, err := rewriteFunc(rawWriteCFValue.GetShortValue())
+		if err != nil {
+			log.Info("failed to rewrite short value",
+				zap.ByteString("write-type", []byte{rawWriteCFValue.GetWriteType()}),
+				zap.Int("short-value-len", len(rawWriteCFValue.GetShortValue())))
+			return rewriteResult{}, errors.Trace(err)
+		}
+
+		rawWriteCFValue.UpdateShortValue(shortValue)
+		return rewriteResult{NewValue: rawWriteCFValue.EncodeTo(), Put: true}, nil
+	default:
+		panic(fmt.Sprintf("not support cf:%s", cf))
+	}
+}
+
+func (sr *SchemasReplace) GetIngestRecorder() *ingestrec.IngestRecorder {
+	return sr.ingestRecorder
+}
+
+// GetDeletedTables returns a map of dbID to a set of tableIDs that were marked as deleted
+func (sr *SchemasReplace) GetDeletedTables() map[UpstreamID]map[UpstreamID]struct{} {
+	return sr.deletedTables
+}
+
+// skipHistoricalAliasDelete protects metadata keys shared by routed source
+// locations, including their auto-ID counters. The final source location still
+// owns actual DROP tombstones.
+func (sr *SchemasReplace) skipHistoricalAliasDelete(key *RawMetaKey, value []byte, cf string) (bool, error) {
+	if cf != consts.WriteCF || !meta.IsDBkey(key.Key) {
+		return false, nil
+	}
+	var parseID func([]byte) (int64, error)
+	switch {
+	case meta.IsTableKey(key.Field):
+		parseID = meta.ParseTableKey
+	case meta.IsAutoIncrementIDKey(key.Field):
+		parseID = meta.ParseAutoIncrementIDKey
+	case meta.IsAutoTableIDKey(key.Field):
+		parseID = meta.ParseAutoTableIDKey
+	case meta.IsSequenceKey(key.Field):
+		parseID = meta.ParseSequenceKey
+	case meta.IsAutoRandomTableIDKey(key.Field):
+		parseID = meta.ParseAutoRandomTableIDKey
+	default:
+		return false, nil
+	}
+	dbID, err := meta.ParseDBKey(key.Key)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	tableID, err := parseID(key.Field)
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	db := sr.DbReplaceMap[dbID]
+	if db == nil || db.TableMap[tableID] == nil || !db.TableMap[tableID].SkipMetaDelete {
+		return false, nil
+	}
+	var write RawWriteCFValue
+	if err := write.ParseFrom(value); err != nil {
+		return false, errors.Trace(err)
+	}
+	return write.IsDelete(), nil
+}
+
+// RewriteMetaKvEntry uses to rewrite tableID/dbID in entry.key and entry.value
+func (sr *SchemasReplace) RewriteMetaKvEntry(e *kv.Entry, cf string) (*kv.Entry, error) {
+	if !utils.IsMetaDBKey(e.Key) {
+		// need to special handle ddl job history during actual restore phase. The job history contains index ingestion
+		// and range deletion that need to be handled separately after restore.
+		if cf == consts.DefaultCF && utils.IsMetaDDLJobHistoryKey(e.Key) { // mDDLJobHistory
+			job := &model.Job{}
+			if err := job.Decode(e.Value); err != nil {
+				log.Debug("failed to decode the job",
+					zap.String("error", err.Error()), zap.String("job", string(e.Value)))
+				// The value in write-cf is like "p\XXXX\XXX" need not restore. skip it
+				// The value in default-cf that can Decode() need restore.
+				return nil, nil
+			}
+
+			return nil, sr.processIngestIndexAndDeleteRangeFromJob(job)
+		}
+		return nil, nil
+	}
+
+	rawKey, err := ParseTxnMetaKeyFrom(e.Key)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	if skip, err := sr.skipHistoricalAliasDelete(rawKey, e.Value, cf); err != nil {
+		return nil, err
+	} else if skip {
+		return nil, nil
+	}
+
+	if meta.IsDBkey(rawKey.Field) {
+		return sr.rewriteEntryForDB(e, cf)
+	} else if !meta.IsDBkey(rawKey.Key) {
+		return nil, nil
+	}
+
+	if meta.IsTableKey(rawKey.Field) {
+		return sr.rewriteEntryForTable(e, cf)
+	} else if meta.IsAutoIncrementIDKey(rawKey.Field) {
+		return sr.rewriteEntryForAutoIncrementIDKey(e, cf)
+	} else if meta.IsAutoTableIDKey(rawKey.Field) {
+		return sr.rewriteEntryForAutoTableIDKey(e, cf)
+	} else if meta.IsSequenceKey(rawKey.Field) {
+		return sr.rewriteEntryForSequenceKey(e, cf)
+	} else if meta.IsAutoRandomTableIDKey(rawKey.Field) {
+		return sr.rewriteEntryForAutoRandomTableIDKey(e, cf)
+	}
+	return nil, nil
+}
+
+func (sr *SchemasReplace) tryRecordIngestIndex(job *model.Job) error {
+	if job.Type != model.ActionMultiSchemaChange {
+		return sr.ingestRecorder.TryAddJob(job, false)
+	}
+
+	for i, sub := range job.MultiSchemaInfo.SubJobs {
+		proxyJob := sub.ToProxyJob(job, i)
+		// ASSERT: the proxyJob can not be MultiSchemaInfo anymore
+		if err := sr.ingestRecorder.TryAddJob(&proxyJob, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// processIngestIndexAndDeleteRangeFromJob handles two special cases during log backup meta key replay.
+// 1. index ingestion is not captured by the log backup, thus we need to restore them manually later
+// 2. delete range also needs to be handled to clean up dropped table since it was previously relying on GC to clean it up
+func (sr *SchemasReplace) processIngestIndexAndDeleteRangeFromJob(job *model.Job) error {
+	if ddl.JobNeedGC(job) {
+		if err := ddl.AddDelRangeJobInternal(context.TODO(), sr.delRangeRecorder, job); err != nil {
+			return err
+		}
+	}
+
+	return sr.tryRecordIngestIndex(job)
+}
+
+type DelRangeParams struct {
+	JobID    int64
+	ElemID   int64
+	StartKey string
+	EndKey   string
+}
+
+type PreDelRangeQuery struct {
+	Sql        string
+	ParamsList []DelRangeParams
+}
+
+type brDelRangeExecWrapper struct {
+	globalTableIdMap map[UpstreamID]DownstreamID
+
+	recordDeleteRange func(*PreDelRangeQuery)
+
+	// temporary values
+	query *PreDelRangeQuery
+}
+
+func newDelRangeExecWrapper(
+	globalTableIdMap map[UpstreamID]DownstreamID,
+	recordDeleteRange func(*PreDelRangeQuery),
+) *brDelRangeExecWrapper {
+	return &brDelRangeExecWrapper{
+		globalTableIdMap:  globalTableIdMap,
+		recordDeleteRange: recordDeleteRange,
+
+		query: nil,
+	}
+}
+
+// UpdateTSOForJob just does nothing. BR would generate ts after log restore done.
+func (bdr *brDelRangeExecWrapper) UpdateTSOForJob() error {
+	return nil
+}
+
+func (bdr *brDelRangeExecWrapper) PrepareParamsList(sz int) {
+	bdr.query = &PreDelRangeQuery{
+		ParamsList: make([]DelRangeParams, 0, sz),
+	}
+}
+
+func (bdr *brDelRangeExecWrapper) RewriteTableID(tableID int64) (int64, bool) {
+	newTableID, exists := bdr.globalTableIdMap[tableID]
+	if !exists {
+		log.Warn("failed to find the downstream id when rewrite delete range, "+
+			"it might due to table has been filtered out if filters have been specified", zap.Int64("old tableID", tableID))
+	}
+	return newTableID, exists
+}
+
+func (bdr *brDelRangeExecWrapper) AppendParamsList(jobID, elemID int64, startKey, endKey string) {
+	bdr.query.ParamsList = append(bdr.query.ParamsList, DelRangeParams{jobID, elemID, startKey, endKey})
+}
+
+func (bdr *brDelRangeExecWrapper) ConsumeDeleteRange(ctx context.Context, sql string) error {
+	bdr.query.Sql = sql
+	bdr.recordDeleteRange(bdr.query)
+	bdr.query = nil
+	return nil
+}

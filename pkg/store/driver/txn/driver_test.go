@@ -1,0 +1,157 @@
+// Copyright 2021 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package txn
+
+import (
+	stderrors "errors"
+	"testing"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/util/dbterror/exeerrors"
+	"github.com/stretchr/testify/require"
+	tikverr "github.com/tikv/client-go/v2/error"
+)
+
+func TestLockNotFoundPrint(t *testing.T) {
+	msg := "Txn(Mvcc(TxnLockNotFound { start_ts: 408090278408224772, commit_ts: 408090279311835140, " +
+		"key: [116, 128, 0, 0, 0, 0, 0, 50, 137, 95, 105, 128, 0, 0, 0, 0,0 ,0, 1, 1, 67, 49, 57, 48, 57, 50, 57, 48, 255, 48, 48, 48, 48, 48, 52, 56, 54, 255, 50, 53, 53, 50, 51, 0, 0, 0, 252] }))"
+	key := prettyLockNotFoundKey(msg)
+	expected := "{tableID=12937, indexID=1, indexValues={C19092900000048625523, }}"
+	require.Equal(t, expected, key)
+}
+
+func TestLockUpgradeConflictMapsToNonRetryableDeadlock(t *testing.T) {
+	err := extractKeyErr(errors.WithStack(&tikverr.ErrLockUpgradeConflict{
+		LockUpgradeConflict: &kvrpcpb.LockUpgradeConflict{
+			Key:          []byte("key"),
+			StartTs:      101,
+			OwnerStartTs: 202,
+			Reason:       kvrpcpb.LockUpgradeConflict_SecondUpgrader,
+		},
+	}))
+	require.Error(t, err)
+	require.False(t, kv.ErrWriteConflict.Equal(err))
+	require.False(t, kv.ErrTxnRetryable.Equal(err))
+
+	var deadlock *tikverr.ErrDeadlock
+	require.ErrorAs(t, err, &deadlock)
+	require.False(t, deadlock.IsRetryable)
+	require.Equal(t, uint64(202), deadlock.LockTs)
+	require.Equal(t, []byte("key"), deadlock.LockKey)
+}
+
+func TestSharedLockLostErrorMapping(t *testing.T) {
+	originalMode := errors.RedactLogEnabled.Load()
+	t.Cleanup(func() { errors.RedactLogEnabled.Store(originalMode) })
+
+	newClientErr := func() error {
+		return errors.WithStack(&tikverr.ErrSharedLockLost{
+			SharedLockLost: &kvrpcpb.SharedLockLost{
+				Key:     []byte("key"),
+				StartTs: 101,
+			},
+		})
+	}
+
+	errors.RedactLogEnabled.Store(errors.RedactLogDisable)
+	err := extractKeyErr(newClientErr())
+	require.EqualError(
+		t,
+		err,
+		"[tikv:9015]Shared lock was lost during lock upgrade; transaction cannot continue, txnStartTS=101, key=6B6579",
+	)
+	require.True(t, kv.ErrSharedLockLost.Equal(err))
+	require.False(t, kv.ErrTxnRetryable.Equal(err))
+	require.False(t, kv.ErrWriteConflict.Equal(err))
+	require.False(t, kv.IsTxnRetryableError(err))
+	require.False(t, terror.ErrResultUndetermined.Equal(err))
+	var deadlock *tikverr.ErrDeadlock
+	require.False(t, stderrors.As(err, &deadlock))
+	require.False(t, exeerrors.ErrDeadlock.Equal(err))
+
+	emptyErr := extractKeyErr(errors.WithStack(&tikverr.ErrSharedLockLost{}))
+	require.EqualError(
+		t,
+		emptyErr,
+		"[tikv:9015]Shared lock was lost during lock upgrade; transaction cannot continue, txnStartTS=0, key=",
+	)
+	require.True(t, kv.ErrSharedLockLost.Equal(emptyErr))
+
+	errors.RedactLogEnabled.Store(errors.RedactLogEnable)
+	redactedErr := extractKeyErr(newClientErr())
+	require.EqualError(
+		t,
+		redactedErr,
+		"[tikv:9015]Shared lock was lost during lock upgrade; transaction cannot continue, txnStartTS=101, key=?",
+	)
+	require.True(t, kv.ErrSharedLockLost.Equal(redactedErr))
+}
+
+func TestWriteConflictPrettyFormat(t *testing.T) {
+	conflict := &kvrpcpb.WriteConflict{
+		StartTs:          399402937522847774,
+		ConflictTs:       399402937719455772,
+		ConflictCommitTs: 399402937719455773,
+		Key:              []byte{116, 128, 0, 0, 0, 0, 0, 1, 155, 95, 105, 128, 0, 0, 0, 0, 0, 0, 1, 1, 82, 87, 48, 49, 0, 0, 0, 0, 251, 1, 55, 54, 56, 50, 50, 49, 49, 48, 255, 57, 0, 0, 0, 0, 0, 0, 0, 248, 1, 0, 0, 0, 0, 0, 0, 0, 0, 247},
+		Primary:          []byte{116, 128, 0, 0, 0, 0, 0, 1, 155, 95, 105, 128, 0, 0, 0, 0, 0, 0, 1, 1, 82, 87, 48, 49, 0, 0, 0, 0, 251, 1, 55, 54, 56, 50, 50, 49, 49, 48, 255, 57, 0, 0, 0, 0, 0, 0, 0, 248, 1, 0, 0, 0, 0, 0, 0, 0, 0, 247},
+		Reason:           kvrpcpb.WriteConflict_Unknown,
+	}
+
+	expectedStr := "[kv:9007]Write conflict, " +
+		"txnStartTS=399402937522847774, conflictStartTS=399402937719455772, conflictCommitTS=399402937719455773, " +
+		"key={tableID=411, indexID=1, indexValues={RW01, 768221109, , }}, " +
+		"originalKey=74800000000000019b5f698000000000000001015257303100000000fb013736383232313130ff3900000000000000f8010000000000000000f7, " +
+		"primary={tableID=411, indexID=1, indexValues={RW01, 768221109, , }}, " +
+		"originalPrimaryKey=74800000000000019b5f698000000000000001015257303100000000fb013736383232313130ff3900000000000000f8010000000000000000f7, " +
+		"reason=Unknown " +
+		kv.TxnRetryableMark
+	require.EqualError(t, newWriteConflictError(conflict), expectedStr)
+
+	conflict = &kvrpcpb.WriteConflict{
+		StartTs:          399402937522847774,
+		ConflictTs:       399402937719455772,
+		ConflictCommitTs: 399402937719455773,
+		Key:              []byte{0x6d, 0x44, 0x42, 0x3a, 0x35, 0x36, 0x0, 0x0, 0x0, 0xfc, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x68, 0x54, 0x49, 0x44, 0x3a, 0x31, 0x30, 0x38, 0x0, 0xfe},
+		Primary:          []byte{0x6d, 0x44, 0x42, 0x3a, 0x35, 0x36, 0x0, 0x0, 0x0, 0xfc, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x68, 0x54, 0x49, 0x44, 0x3a, 0x31, 0x30, 0x38, 0x0, 0xfe},
+		Reason:           kvrpcpb.WriteConflict_Optimistic,
+	}
+	expectedStr = "[kv:9007]Write conflict, " +
+		"txnStartTS=399402937522847774, conflictStartTS=399402937719455772, conflictCommitTS=399402937719455773, " +
+		"key={metaKey=true, key=DB:56, field=TID:108}, " +
+		"originalKey=6d44423a3536000000fc00000000000000685449443a31303800fe, " +
+		"primary={metaKey=true, key=DB:56, field=TID:108}, " +
+		"originalPrimaryKey=6d44423a3536000000fc00000000000000685449443a31303800fe, " +
+		"reason=Optimistic " +
+		kv.TxnRetryableMark
+	require.EqualError(t, newWriteConflictError(conflict), expectedStr)
+
+	// test log redaction
+	original := errors.RedactLogEnabled.Load()
+	errors.RedactLogEnabled.Store(errors.RedactLogEnable)
+	defer func() { errors.RedactLogEnabled.Store(original) }()
+	expectedStr = "[kv:9007]Write conflict, " +
+		"txnStartTS=399402937522847774, conflictStartTS=399402937719455772, conflictCommitTS=399402937719455773, " +
+		"key=????, reason=Optimistic " + kv.TxnRetryableMark
+	require.EqualError(t, newWriteConflictError(conflict), expectedStr)
+
+	errors.RedactLogEnabled.Store(errors.RedactLogMarker)
+	defer func() { errors.RedactLogEnabled.Store(original) }()
+	expectedStr = "[kv:9007]Write conflict, " +
+		"txnStartTS=399402937522847774, conflictStartTS=399402937719455772, conflictCommitTS=399402937719455773, " +
+		"key=‹›‹{metaKey=true, key=DB:56, field=TID:108}, originalKey=6d44423a3536000000fc00000000000000685449443a31303800fe, primary=›‹›‹{metaKey=true, key=DB:56, field=TID:108}, originalPrimaryKey=6d44423a3536000000fc00000000000000685449443a31303800fe›, reason=Optimistic " + kv.TxnRetryableMark
+	require.EqualError(t, newWriteConflictError(conflict), expectedStr)
+}

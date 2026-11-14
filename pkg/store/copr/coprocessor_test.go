@@ -1,0 +1,1987 @@
+// Copyright 2016 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package copr
+
+import (
+	"context"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/pingcap/kvproto/pkg/coprocessor"
+	"github.com/pingcap/kvproto/pkg/errorpb"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/resourcegroup"
+	"github.com/pingcap/tidb/pkg/store/driver/backoff"
+	derr "github.com/pingcap/tidb/pkg/store/driver/error"
+	"github.com/pingcap/tidb/pkg/util/paging"
+	"github.com/pingcap/tidb/pkg/util/trxevents"
+	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/testutils"
+	"github.com/tikv/client-go/v2/tikv"
+	"github.com/tikv/client-go/v2/tikvrpc"
+	"github.com/tikv/client-go/v2/txnkv/txnsnapshot"
+	tikvutil "github.com/tikv/client-go/v2/util"
+	pd "github.com/tikv/pd/client"
+	pdgc "github.com/tikv/pd/client/clients/gc"
+	"github.com/tikv/pd/client/constants"
+	"github.com/tikv/pd/client/pkg/caller"
+)
+
+type recordingRunawayChecker struct {
+	resourcegroup.RunawayChecker
+	processedKeys atomic.Int64
+}
+
+func (c *recordingRunawayChecker) CheckThresholds(_ *tikvutil.RUDetails, processedKeys int64, _ error) error {
+	c.processedKeys.Add(processedKeys)
+	return nil
+}
+
+func buildTestCopTasks(bo *Backoffer, cache *RegionCache, ranges *KeyRanges, req *kv.Request, eventCb trxevents.EventCallback) ([]*copTask, error) {
+	return buildCopTasks(bo, ranges, &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		eventCb:  eventCb,
+		respChan: true,
+	})
+}
+
+func TestEnsureMonotonicKeyRanges(t *testing.T) {
+	ctx := context.Background()
+	ranges := NewKeyRanges([]kv.KeyRange{
+		{StartKey: []byte("b"), EndKey: []byte("d")},
+		{StartKey: []byte("a"), EndKey: []byte("b")},
+	})
+	reordered := ensureMonotonicKeyRanges(ctx, ranges)
+	require.True(t, reordered)
+	require.Equal(t, "a", string(ranges.At(0).StartKey))
+	require.Equal(t, "b", string(ranges.At(0).EndKey))
+	require.Equal(t, "b", string(ranges.At(1).StartKey))
+
+	sortedRanges := NewKeyRanges([]kv.KeyRange{
+		{StartKey: []byte("a"), EndKey: []byte("b")},
+		{StartKey: []byte("b"), EndKey: []byte("c")},
+	})
+	reordered = ensureMonotonicKeyRanges(ctx, sortedRanges)
+	require.False(t, reordered)
+}
+
+func TestCoprRequestLimiter(t *testing.T) {
+	t.Run("SetAttemptLimiter", testSetRequestAttemptLimiter)
+	t.Run("Finished", testRequestAttemptLimiterFinished)
+	t.Run("WaitStats", testLimiterWaitStats)
+}
+
+func testSetRequestAttemptLimiter(t *testing.T) {
+	newAttemptLimiter := func(req *kv.Request, finishCh chan struct{}, storeType kv.StoreType) tikvrpc.RequestAttemptLimiterFunc {
+		worker := &copIteratorWorker{
+			req:      req,
+			finishCh: finishCh,
+			stats:    &copIteratorRuntimeStats{},
+		}
+		rpcReq := tikvrpc.NewRequest(tikvrpc.CmdCop, &coprocessor.Request{})
+		worker.setRequestAttemptLimiter(rpcReq, &copTask{storeType: storeType})
+		return rpcReq.RequestAttemptLimiter
+	}
+
+	t.Run("NoLimiter", func(t *testing.T) {
+		require.Nil(t, newAttemptLimiter(&kv.Request{}, make(chan struct{}), kv.TiKV))
+	})
+
+	t.Run("TiFlash", func(t *testing.T) {
+		req := &kv.Request{CoprRequestLimiter: kv.NewCoprRequestLimiter(1)}
+		require.Nil(t, newAttemptLimiter(req, make(chan struct{}), kv.TiFlash))
+	})
+
+	t.Run("RequestLimiterFallback", func(t *testing.T) {
+		requestLimiter := kv.NewCoprRequestLimiter(1)
+		attemptLimiter := newAttemptLimiter(
+			&kv.Request{CoprRequestLimiter: requestLimiter}, make(chan struct{}), kv.TiKV)
+		require.NotNil(t, attemptLimiter)
+
+		release, err := attemptLimiter(context.Background(), 42)
+		require.NoError(t, err)
+		require.NotNil(t, release)
+		require.False(t, requestLimiter.TryAcquire())
+		release()
+	})
+
+	t.Run("QueryLimiterPrecedence", func(t *testing.T) {
+		requestLimiter := kv.NewCoprRequestLimiter(1)
+		queryLimiter := kv.NewQueryCopStoreLimiter(1)
+		attemptLimiter := newAttemptLimiter(&kv.Request{
+			CoprRequestLimiter:   requestLimiter,
+			QueryCopStoreLimiter: queryLimiter,
+		}, make(chan struct{}), kv.TiKV)
+		require.NotNil(t, attemptLimiter)
+
+		release, err := attemptLimiter(context.Background(), 42)
+		require.NoError(t, err)
+		require.NotNil(t, release)
+		require.False(t, queryLimiter.GetStoreLimiter(42).TryAcquire())
+		require.True(t, requestLimiter.TryAcquire())
+		requestLimiter.Release()
+		release()
+	})
+}
+
+func testRequestAttemptLimiterFinished(t *testing.T) {
+	finishCh := make(chan struct{})
+	close(finishCh)
+	limiter := kv.NewCoprRequestLimiter(1)
+	worker := &copIteratorWorker{
+		req:      &kv.Request{CoprRequestLimiter: limiter},
+		finishCh: finishCh,
+		stats:    &copIteratorRuntimeStats{},
+	}
+	rpcReq := tikvrpc.NewRequest(tikvrpc.CmdCop, &coprocessor.Request{})
+	worker.setRequestAttemptLimiter(rpcReq, &copTask{storeType: kv.TiKV})
+
+	release, err := rpcReq.RequestAttemptLimiter(context.Background(), 42)
+	require.ErrorIs(t, err, errCoprRequestLimiterFinished)
+	require.Nil(t, release)
+	require.True(t, limiter.TryAcquire())
+	limiter.Release()
+}
+
+func testLimiterWaitStats(t *testing.T) {
+	stats := LimiterWaitStats{}
+	require.True(t, stats.IsZero())
+	stats.Record(time.Millisecond)
+	stats.Merge(LimiterWaitStats{TotalTime: 3 * time.Millisecond, MaxTime: 2 * time.Millisecond})
+	require.Equal(t, LimiterWaitStats{
+		TotalTime: 4 * time.Millisecond,
+		MaxTime:   2 * time.Millisecond,
+	}, stats)
+	require.False(t, stats.IsZero())
+}
+
+func TestBuildTasks(t *testing.T) {
+	t.Run("WithoutBuckets", testBuildTasksWithoutBuckets)
+	t.Run("ByBuckets", testBuildTasksByBuckets)
+}
+
+func testBuildTasksWithoutBuckets(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	req := &kv.Request{}
+	flashReq := &kv.Request{}
+	flashReq.StoreType = kv.TiFlash
+	tasks, err := buildTestCopTasks(bo, cache, buildCopRanges("a", "c"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "c")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "c"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "c")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("g", "n"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "g", "n")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("g", "n"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "g", "n")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("m", "n"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "m", "n")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("m", "n"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "m", "n")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "k"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "g")
+	taskEqual(t, tasks[1], regionIDs[1], 0, "g", "k")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "k"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "g")
+	taskEqual(t, tasks[1], regionIDs[1], 0, "g", "k")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "x"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 4)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "g")
+	taskEqual(t, tasks[1], regionIDs[1], 0, "g", "n")
+	taskEqual(t, tasks[2], regionIDs[2], 0, "n", "t")
+	taskEqual(t, tasks[3], regionIDs[3], 0, "t", "x")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "x"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 4)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "g")
+	taskEqual(t, tasks[1], regionIDs[1], 0, "g", "n")
+	taskEqual(t, tasks[2], regionIDs[2], 0, "n", "t")
+	taskEqual(t, tasks[3], regionIDs[3], 0, "t", "x")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "b", "b", "c"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "b", "b", "c")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "b", "b", "c"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "b", "b", "c")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "b", "e", "f"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "b", "e", "f")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "b", "e", "f"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "b", "e", "f")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("g", "n", "o", "p"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "g", "n")
+	taskEqual(t, tasks[1], regionIDs[2], 0, "o", "p")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("g", "n", "o", "p"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "g", "n")
+	taskEqual(t, tasks[1], regionIDs[2], 0, "o", "p")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("h", "k", "m", "p"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "h", "k", "m", "n")
+	taskEqual(t, tasks[1], regionIDs[2], 0, "n", "p")
+
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("h", "k", "m", "p"), flashReq, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	taskEqual(t, tasks[0], regionIDs[1], 0, "h", "k", "m", "n")
+	taskEqual(t, tasks[1], regionIDs[2], 0, "n", "p")
+}
+
+func testBuildTasksByBuckets(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	// region:  nil------------------n-----------x-----------nil
+	// buckets: nil----c----g----k---n----t------x-----------nil
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("n"), []byte("x"))
+	cluster.SplitRegionBuckets(regionIDs[0], [][]byte{{}, {'c'}, {'g'}, {'k'}, {'n'}}, regionIDs[0])
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{{'n'}, {'t'}, {'x'}}, regionIDs[1])
+	cluster.SplitRegionBuckets(regionIDs[2], [][]byte{{'x'}, {}}, regionIDs[2])
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	// one range per bucket
+	// region:  nil------------------n-----------x-----------nil
+	// buckets: nil----c----g----k---n----t------x-----------nil
+	// range&task: a-b c-d   h-i k---n o-p    u--x-----------nil
+	req := &kv.Request{}
+	regionRanges := []struct {
+		regionID uint64
+		ranges   []string
+	}{
+		{regionIDs[0], []string{"a", "b", "c", "d", "h", "i", "k", "n"}},
+		{regionIDs[1], []string{"o", "p", "u", "x"}},
+		{regionIDs[2], []string{"x", ""}},
+	}
+	for _, regionRange := range regionRanges {
+		regionID, ranges := regionRange.regionID, regionRange.ranges
+		tasks, err := buildTestCopTasks(bo, cache, buildCopRanges(ranges...), req, nil)
+		require.NoError(t, err)
+		require.Len(t, tasks, len(ranges)/2)
+		for i, task := range tasks {
+			taskEqual(t, task, regionID, regionID, ranges[2*i], ranges[2*i+1])
+		}
+	}
+
+	// one request multiple regions
+	allRanges := []string{}
+	for _, regionRange := range regionRanges {
+		allRanges = append(allRanges, regionRange.ranges...)
+	}
+	tasks, err := buildTestCopTasks(bo, cache, buildCopRanges(allRanges...), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, len(allRanges)/2)
+	taskIdx := 0
+	for _, regionRange := range regionRanges {
+		regionID, ranges := regionRange.regionID, regionRange.ranges
+		for i := 0; i < len(ranges); i += 2 {
+			taskEqual(t, tasks[taskIdx], regionID, regionID, ranges[i], ranges[i+1])
+			taskIdx++
+		}
+	}
+
+	// several ranges per bucket
+	// region:  nil---------------------------n-----------x-----------nil
+	// buckets: nil-----c-------g-------k-----n----t------x-----------nil
+	// ranges:  nil-a b-c d-e f-g h-i j-k-l m-n
+	// tasks:   nil-a b-c
+	//                    d-e f-g
+	//                            h-i j-k
+	//                                  k-l m-n
+	keyRanges := []string{
+		"", "a", "b", "c",
+		"d", "e", "f", "g",
+		"h", "i", "j", "k",
+		"k", "l", "m", "n",
+	}
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges(keyRanges...), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, len(keyRanges)/4)
+	for i, task := range tasks {
+		taskEqual(t, task, regionIDs[0], regionIDs[0], keyRanges[4*i], keyRanges[4*i+1], keyRanges[4*i+2], keyRanges[4*i+3])
+	}
+
+	// cross bucket ranges
+	// buckets: nil-----c-------g---------k---n----t------x-----------nil
+	// ranges:  nil-------d   e---h i---j
+	// tasks:   nil-----c
+	//                  c-d   e-g
+	//                          g-h i---j
+	keyRanges = []string{
+		"", "d", "e", "h", "i", "j",
+	}
+	expectedTaskRanges := [][]string{
+		{"", "c"},
+		{"c", "d", "e", "g"},
+		{"g", "h", "i", "j"},
+	}
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges(keyRanges...), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, len(expectedTaskRanges))
+	for i, task := range tasks {
+		taskEqual(t, task, regionIDs[0], regionIDs[0], expectedTaskRanges[i]...)
+	}
+
+	// cross several buckets ranges
+	// region:    n  -----------------------------  x
+	// buckets:   n   --   q -- r --  t -- u -- v -- x
+	// ranges:    n--o  p--q       s  ------------ w
+	// tasks:     n--o  p--q
+	//                             s--t
+	//								  t -- u
+	//									   u -- v
+	//											v--w
+	expectedTaskRanges = [][]string{
+		{"n", "o", "p", "q"},
+		{"s", "t"},
+		{"t", "u"},
+		{"u", "v"},
+		{"v", "w"},
+	}
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{{'n'}, {'q'}, {'r'}, {'t'}, {'u'}, {'v'}, {'x'}}, regionIDs[1])
+	cache = NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("n", "o", "p", "q", "s", "w"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, len(expectedTaskRanges))
+	for i, task := range tasks {
+		taskEqual(t, task, regionIDs[1], regionIDs[1], expectedTaskRanges[i]...)
+	}
+
+	// out of range buckets
+	// region:  n------------------x
+	// buckets:       q---s---u
+	// ranges:  n-o p ----s t---v w-x
+	// tasks:   n-o p-q
+	//                 q--s
+	//                      t-u
+	//                        u-v w-x
+	expectedTaskRanges = [][]string{
+		{"n", "o", "p", "q"},
+		{"q", "s"},
+		{"t", "u"},
+		{"u", "v", "w", "x"},
+	}
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{{'q'}, {'s'}, {'u'}}, regionIDs[1])
+	cache = NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("n", "o", "p", "s", "t", "v", "w", "x"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, len(expectedTaskRanges))
+	for i, task := range tasks {
+		taskEqual(t, task, regionIDs[1], regionIDs[1], expectedTaskRanges[i]...)
+	}
+
+	// out of range buckets
+	// region:    n------------x
+	// buckets: g-------t---------z
+	// ranges:     o-p   u-w
+	// tasks:      o-p
+	//                   u-w
+	expectedTaskRanges = [][]string{
+		{"o", "p"},
+		{"u", "w"},
+	}
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{{'g'}, {'t'}, {'z'}}, regionIDs[1])
+	cache = NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("o", "p", "u", "w"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, len(expectedTaskRanges))
+	for i, task := range tasks {
+		taskEqual(t, task, regionIDs[1], regionIDs[1], expectedTaskRanges[i]...)
+	}
+
+	// cover the whole region
+	// region:    n--------------x
+	// buckets:   n -- q -- r -- x
+	// ranges:    n--------------x
+	// tasks:     o -- q
+	//                 q -- r
+	//						r -- x
+	expectedTaskRanges = [][]string{
+		{"n", "q"},
+		{"q", "r"},
+		{"r", "x"},
+	}
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{{'n'}, {'q'}, {'r'}, {'x'}}, regionIDs[1])
+	cache = NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("n", "x"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, len(expectedTaskRanges))
+	for i, task := range tasks {
+		taskEqual(t, task, regionIDs[1], regionIDs[1], expectedTaskRanges[i]...)
+	}
+}
+
+func TestSplitKeyRangesByLocationsWithoutBuckets(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	locRanges, err := cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("a", "c")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 1)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "a", "c")
+
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("a", "c")), 0, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 0)
+
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("h", "y")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 3)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "h", "n")
+	rangeEqual(t, locRanges[1].Ranges.ToRanges(), "n", "t")
+	rangeEqual(t, locRanges[2].Ranges.ToRanges(), "t", "y")
+
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("h", "n")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 1)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "h", "n")
+
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("s", "s")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 1)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "s", "s")
+
+	// min --> max
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("a", "z")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 4)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "a", "g")
+	rangeEqual(t, locRanges[1].Ranges.ToRanges(), "g", "n")
+	rangeEqual(t, locRanges[2].Ranges.ToRanges(), "n", "t")
+	rangeEqual(t, locRanges[3].Ranges.ToRanges(), "t", "z")
+
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("a", "z")), 3, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 3)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "a", "g")
+	rangeEqual(t, locRanges[1].Ranges.ToRanges(), "g", "n")
+	rangeEqual(t, locRanges[2].Ranges.ToRanges(), "n", "t")
+
+	// many range
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 4)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "a", "b", "c", "d", "e", "f", "f", "g")
+	rangeEqual(t, locRanges[1].Ranges.ToRanges(), "g", "h", "i", "j", "k", "l", "m", "n")
+	rangeEqual(t, locRanges[2].Ranges.ToRanges(), "o", "p", "q", "r", "s", "t")
+	rangeEqual(t, locRanges[3].Ranges.ToRanges(), "u", "v", "w", "x", "y", "z")
+
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("a", "b", "b", "h", "h", "m", "n", "t", "v", "w")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 4)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "a", "b", "b", "g")
+	rangeEqual(t, locRanges[1].Ranges.ToRanges(), "g", "h", "h", "m", "n")
+	rangeEqual(t, locRanges[2].Ranges.ToRanges(), "n", "t")
+	rangeEqual(t, locRanges[3].Ranges.ToRanges(), "v", "w")
+
+	locRanges, err = cache.SplitKeyRangesByLocations(bo, NewKeyRanges(BuildKeyRanges("a", "b", "v", "w")), UnspecifiedLimit, false, false)
+	require.NoError(t, err)
+	require.Len(t, locRanges, 2)
+	rangeEqual(t, locRanges[0].Ranges.ToRanges(), "a", "b")
+	rangeEqual(t, locRanges[1].Ranges.ToRanges(), "v", "w")
+}
+
+func TestSplitKeyRanges(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	ranges, err := cache.SplitRegionRanges(bo, BuildKeyRanges("a", "c"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 1)
+	rangeEqual(t, ranges, "a", "c")
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("a", "c"), 0)
+	require.NoError(t, err)
+	require.Len(t, ranges, 0)
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("h", "y"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 3)
+	rangeEqual(t, ranges, "h", "n", "n", "t", "t", "y")
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("s", "z"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 2)
+	rangeEqual(t, ranges, "s", "t", "t", "z")
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("s", "s"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 1)
+	rangeEqual(t, ranges, "s", "s")
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("t", "t"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 1)
+	rangeEqual(t, ranges, "t", "t")
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("t", "u"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 1)
+	rangeEqual(t, ranges, "t", "u")
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("u", "z"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 1)
+	rangeEqual(t, ranges, "u", "z")
+
+	// min --> max
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("a", "z"), UnspecifiedLimit)
+	require.NoError(t, err)
+	require.Len(t, ranges, 4)
+	rangeEqual(t, ranges, "a", "g", "g", "n", "n", "t", "t", "z")
+
+	ranges, err = cache.SplitRegionRanges(bo, BuildKeyRanges("a", "z"), 3)
+	require.NoError(t, err)
+	require.Len(t, ranges, 3)
+	rangeEqual(t, ranges, "a", "g", "g", "n", "n", "t")
+}
+
+func TestRebuild(t *testing.T) {
+	// nil --- 'm' --- nil
+	// <-  0  -> <- 1 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	storeID, regionIDs, peerIDs := testutils.BootstrapWithMultiRegions(cluster, []byte("m"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	req := &kv.Request{}
+	tasks, err := buildTestCopTasks(bo, cache, buildCopRanges("a", "z"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "m")
+	taskEqual(t, tasks[1], regionIDs[1], 0, "m", "z")
+
+	// nil -- 'm' -- 'q' -- nil
+	// <-  0 -> <--1-> <-2-->
+	regionIDs = append(regionIDs, cluster.AllocID())
+	peerIDs = append(peerIDs, cluster.AllocID())
+	cluster.Split(regionIDs[1], regionIDs[2], []byte("q"), []uint64{peerIDs[2]}, storeID)
+	cache.InvalidateCachedRegion(tasks[1].region)
+
+	req.Desc = true
+	tasks, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "z"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 3)
+	taskEqual(t, tasks[2], regionIDs[0], 0, "a", "m")
+	taskEqual(t, tasks[1], regionIDs[1], 0, "m", "q")
+	taskEqual(t, tasks[0], regionIDs[2], 0, "q", "z")
+}
+
+func buildCopRanges(keys ...string) *KeyRanges {
+	return NewKeyRanges(BuildKeyRanges(keys...))
+}
+
+func taskEqual(t *testing.T, task *copTask, regionID, bucketsVer uint64, keys ...string) {
+	require.Equal(t, task.region.GetID(), regionID)
+	require.Equal(t, task.bucketsVer, bucketsVer)
+	for i := range task.ranges.Len() {
+		r := task.ranges.At(i)
+		require.Equal(t, string(r.StartKey), keys[2*i])
+		require.Equal(t, string(r.EndKey), keys[2*i+1])
+	}
+}
+
+func rangeEqual(t *testing.T, ranges []kv.KeyRange, keys ...string) {
+	for i := range ranges {
+		r := ranges[i]
+		require.Equal(t, string(r.StartKey), keys[2*i])
+		require.Equal(t, string(r.EndKey), keys[2*i+1])
+	}
+}
+
+func TestBuildPagingTasks(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	req := &kv.Request{}
+	req.Paging.Enable = true
+	req.Paging.MinPagingSize = paging.MinPagingSize
+	tasks, err := buildTestCopTasks(bo, cache, buildCopRanges("a", "c"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "c")
+	require.True(t, tasks[0].paging)
+	require.Equal(t, tasks[0].pagingSize, paging.MinPagingSize)
+}
+
+func TestBuildCopTaskDoesNotCancelBoCtx(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	req := &kv.Request{}
+	req.Paging.Enable = true
+	req.Paging.MinPagingSize = paging.MinPagingSize
+	req.MaxExecutionTime = 10000
+	_, err = buildTestCopTasks(bo, cache, buildCopRanges("a", "c"), req, nil)
+	require.NoError(t, err)
+	contextDone := false
+	select {
+	case <-bo.GetCtx().Done():
+		contextDone = true
+	default:
+	}
+	require.False(t, contextDone, "buildCopTasks should not cancel bo context")
+}
+
+func TestBuildPagingTasksDisablePagingForSmallLimit(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	req := &kv.Request{}
+	req.Paging.Enable = true
+	req.Paging.MinPagingSize = paging.MinPagingSize
+	req.LimitSize = 1
+	tasks, err := buildTestCopTasks(bo, cache, buildCopRanges("a", "c"), req, nil)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "c")
+	require.False(t, tasks[0].paging)
+	require.Equal(t, tasks[0].pagingSize, uint64(0))
+}
+
+func TestBuildCopTasksWithPagingSizeBytes(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	// A byte budget lives on the request and is the single source of truth.
+	req := &kv.Request{KeepOrder: true}
+	req.Paging.PagingSizeBytes = uint64(4 * 1024 * 1024)
+	tasks, err := buildCopTasks(bo, buildCopRanges("a", "c"), &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		respChan: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	taskEqual(t, tasks[0], regionIDs[0], 0, "a", "c")
+	// A byte budget alone must not turn on row-count paging at the task level,
+	// but it still enlarges the response channel like row-count paging does.
+	require.False(t, tasks[0].paging)
+	require.Equal(t, uint64(0), tasks[0].pagingSize)
+	require.Equal(t, 18, cap(tasks[0].respChan))
+
+	// The byte budget bounds a page but is not a read-size prediction: no hint
+	// until a page is observed, then the learned estimate.
+	worker := &copIteratorWorker{req: req, ema: newRUEMA()}
+	require.Zero(t, worker.predictedReadBytes())
+	worker.ema.Observe(1_048_576, time.Now())
+	require.Equal(t, uint64(1_048_576), worker.predictedReadBytes())
+
+	// Row-count paging with a tiny limit downgrades independently; the byte
+	// budget on the request is untouched by that downgrade.
+	req.Paging.Enable = true
+	req.Paging.MinPagingSize = paging.MinPagingSize
+	req.LimitSize = 1
+	tasks, err = buildCopTasks(bo, buildCopRanges("a", "c"), &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		respChan: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.False(t, tasks[0].paging)
+	require.Equal(t, uint64(0), tasks[0].pagingSize)
+	require.Equal(t, uint64(4*1024*1024), req.Paging.PagingSizeBytes)
+	require.Equal(t, 18, cap(tasks[0].respChan))
+
+	// Without a byte budget, row-count paging alone must not send a pre-charge
+	// hint, even after the EMA has observed a page.
+	rowCountReq := &kv.Request{}
+	rowCountReq.Paging.Enable = true
+	rowCountReq.Paging.MinPagingSize = paging.MinPagingSize
+	tasks, err = buildCopTasks(bo, buildCopRanges("a", "c"), &buildCopTaskOpt{
+		req:   rowCountReq,
+		cache: cache,
+	})
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	require.True(t, tasks[0].paging)
+	ema := newRUEMA()
+	ema.Observe(1_048_576, time.Now())
+	worker = &copIteratorWorker{req: rowCountReq, ema: ema}
+	require.Zero(t, worker.predictedReadBytes())
+}
+
+func toCopRange(r kv.KeyRange) *coprocessor.KeyRange {
+	coprRange := coprocessor.KeyRange{}
+	coprRange.Start = r.StartKey
+	coprRange.End = r.EndKey
+	return &coprRange
+}
+
+func toRange(r *KeyRanges) []kv.KeyRange {
+	ranges := make([]kv.KeyRange, 0, r.Len())
+	if r.first != nil {
+		ranges = append(ranges, *r.first)
+	}
+	ranges = append(ranges, r.mid...)
+	if r.last != nil {
+		ranges = append(ranges, *r.last)
+	}
+	return ranges
+}
+
+func TestCalculateRetry(t *testing.T) {
+	worker := copIteratorWorker{}
+
+	// split in one range
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("b", "c")[0]
+		retry := worker.calculateRetry(NewKeyRanges(ranges), toCopRange(split), false)
+		rangeEqual(t, toRange(retry), "b", "c", "e", "g")
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("e", "f")[0]
+		retry := worker.calculateRetry(NewKeyRanges(ranges), toCopRange(split), true)
+		rangeEqual(t, toRange(retry), "a", "c", "e", "f")
+	}
+
+	// across ranges
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("b", "f")[0]
+		retry := worker.calculateRetry(NewKeyRanges(ranges), toCopRange(split), false)
+		rangeEqual(t, toRange(retry), "b", "c", "e", "g")
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("b", "f")[0]
+		retry := worker.calculateRetry(NewKeyRanges(ranges), toCopRange(split), true)
+		rangeEqual(t, toRange(retry), "a", "c", "e", "f")
+	}
+
+	// exhaust the ranges
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("a", "g")[0]
+		retry := worker.calculateRetry(NewKeyRanges(ranges), toCopRange(split), false)
+		rangeEqual(t, toRange(retry), "a", "c", "e", "g")
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("a", "g")[0]
+		retry := worker.calculateRetry(NewKeyRanges(ranges), toCopRange(split), true)
+		rangeEqual(t, toRange(retry), "a", "c", "e", "g")
+	}
+
+	// nil range
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		retry := worker.calculateRetry(NewKeyRanges(ranges), nil, false)
+		rangeEqual(t, toRange(retry), "a", "c", "e", "g")
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		retry := worker.calculateRetry(NewKeyRanges(ranges), nil, true)
+		rangeEqual(t, toRange(retry), "a", "c", "e", "g")
+	}
+}
+
+func TestCalculateRemain(t *testing.T) {
+	worker := copIteratorWorker{}
+
+	// split in one range
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("a", "b")[0]
+		remain := worker.calculateRemain(NewKeyRanges(ranges), toCopRange(split), false)
+		rangeEqual(t, toRange(remain), "b", "c", "e", "g")
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("f", "g")[0]
+		remain := worker.calculateRemain(NewKeyRanges(ranges), toCopRange(split), true)
+		rangeEqual(t, toRange(remain), "a", "c", "e", "f")
+	}
+
+	// across ranges
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("a", "f")[0]
+		remain := worker.calculateRemain(NewKeyRanges(ranges), toCopRange(split), false)
+		rangeEqual(t, toRange(remain), "f", "g")
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("b", "g")[0]
+		remain := worker.calculateRemain(NewKeyRanges(ranges), toCopRange(split), true)
+		rangeEqual(t, toRange(remain), "a", "b")
+	}
+
+	// exhaust the ranges
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("a", "g")[0]
+		remain := worker.calculateRemain(NewKeyRanges(ranges), toCopRange(split), false)
+		require.Equal(t, remain.Len(), 0)
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		split := BuildKeyRanges("a", "g")[0]
+		remain := worker.calculateRemain(NewKeyRanges(ranges), toCopRange(split), true)
+		require.Equal(t, remain.Len(), 0)
+	}
+
+	// nil range
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		remain := worker.calculateRemain(NewKeyRanges(ranges), nil, false)
+		rangeEqual(t, toRange(remain), "a", "c", "e", "g")
+	}
+	{
+		ranges := BuildKeyRanges("a", "c", "e", "g")
+		remain := worker.calculateRemain(NewKeyRanges(ranges), nil, true)
+		rangeEqual(t, toRange(remain), "a", "c", "e", "g")
+	}
+}
+
+func TestBasicSmallTaskConc(t *testing.T) {
+	require.False(t, isSmallTask(&copTask{RowCountHint: -1}))
+	require.False(t, isSmallTask(&copTask{RowCountHint: 0}))
+	require.True(t, isSmallTask(&copTask{RowCountHint: 1}))
+	require.True(t, isSmallTask(&copTask{RowCountHint: 6}))
+	require.True(t, isSmallTask(&copTask{RowCountHint: CopSmallTaskRow}))
+	require.False(t, isSmallTask(&copTask{RowCountHint: CopSmallTaskRow + 1}))
+	_, conc := smallTaskConcurrency([]*copTask{}, 16)
+	require.GreaterOrEqual(t, conc, 0)
+}
+
+func TestBuildCopTasksWithRowCountHint(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+	_, _, _ = testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+	req := &kv.Request{}
+	ranges := buildCopRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	tasks, err := buildCopTasks(bo, ranges, &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		rowHints: []int{1, 1, 3, CopSmallTaskRow},
+	})
+	require.Nil(t, err)
+	require.Equal(t, len(tasks), 4)
+	// task[0] ["a"-"c", "d"-"e"]
+	require.Equal(t, tasks[0].RowCountHint, 2)
+	// task[1] ["h"-"n"]
+	require.Equal(t, tasks[1].RowCountHint, 3)
+	// task[2] ["n"-"t"]
+	require.Equal(t, tasks[2].RowCountHint, 3)
+	// task[3] ["t"-"x", "y"-"z"]
+	require.Equal(t, tasks[3].RowCountHint, 3+CopSmallTaskRow)
+	_, conc := smallTaskConcurrency(tasks, 16)
+	require.Equal(t, conc, 1)
+
+	ranges = buildCopRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	tasks, err = buildCopTasks(bo, ranges, &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		rowHints: []int{1, 1, 3, 3},
+	})
+	require.Nil(t, err)
+	require.Equal(t, len(tasks), 4)
+	// task[0] ["a"-"c", "d"-"e"]
+	require.Equal(t, tasks[0].RowCountHint, 2)
+	// task[1] ["h"-"n"]
+	require.Equal(t, tasks[1].RowCountHint, 3)
+	// task[2] ["n"-"t"]
+	require.Equal(t, tasks[2].RowCountHint, 3)
+	// task[3] ["t"-"x", "y"-"z"]
+	require.Equal(t, tasks[3].RowCountHint, 6)
+	_, conc = smallTaskConcurrency(tasks, 16)
+	require.Equal(t, conc, 2)
+
+	// cross-region long range
+	ranges = buildCopRanges("a", "z")
+	tasks, err = buildCopTasks(bo, ranges, &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		rowHints: []int{10},
+	})
+	require.Nil(t, err)
+	require.Equal(t, len(tasks), 4)
+	// task[0] ["a"-"g"]
+	require.Equal(t, tasks[0].RowCountHint, 10)
+	// task[1] ["g"-"n"]
+	require.Equal(t, tasks[1].RowCountHint, 10)
+	// task[2] ["n"-"t"]
+	require.Equal(t, tasks[2].RowCountHint, 10)
+	// task[3] ["t"-"z"]
+	require.Equal(t, tasks[3].RowCountHint, 10)
+}
+
+func TestSmallTaskConcurrencyLimit(t *testing.T) {
+	smallTaskCount := 1000
+	tasks := make([]*copTask, 0, smallTaskCount)
+	for range smallTaskCount {
+		tasks = append(tasks, &copTask{
+			RowCountHint: 1,
+		})
+	}
+	count, conc := smallTaskConcurrency(tasks, 1)
+	require.Equal(t, smallConcPerCore, conc)
+	require.Equal(t, smallTaskCount, count)
+	// also handle 0 value.
+	count, conc = smallTaskConcurrency(tasks, 0)
+	require.Equal(t, smallConcPerCore, conc)
+	require.Equal(t, smallTaskCount, count)
+}
+
+func TestBatchStoreCoprOnlySendToLeader(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+	_, _, _ = testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+	req := &kv.Request{
+		StoreBatchSize:     3,
+		StoreBusyThreshold: time.Second,
+	}
+	ranges := buildCopRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	tasks, err := buildCopTasks(bo, ranges, &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		rowHints: []int{1, 1, 3, 3},
+	})
+	require.Len(t, tasks, 1)
+	require.Zero(t, tasks[0].busyThreshold)
+	batched := tasks[0].batchTaskList
+	require.Len(t, batched, 3)
+	for _, task := range batched {
+		require.Zero(t, task.task.busyThreshold)
+	}
+
+	req = &kv.Request{
+		StoreBatchSize:     0,
+		StoreBusyThreshold: time.Second,
+	}
+	tasks, err = buildCopTasks(bo, ranges, &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		rowHints: []int{1, 1, 3, 3},
+	})
+	require.Len(t, tasks, 4)
+	for _, task := range tasks {
+		require.Equal(t, task.busyThreshold, time.Second)
+	}
+}
+
+func TestStoreBatchTasksPreserveChildBucketsVersion(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	defer func() {
+		pdClient.Close()
+		err = mockClient.Close()
+		require.NoError(t, err)
+	}()
+
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("n"), []byte("x"))
+	cluster.SplitRegionBuckets(regionIDs[0], [][]byte{{}, {'n'}}, 101)
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{{'n'}, {'x'}}, 202)
+	cluster.SplitRegionBuckets(regionIDs[2], [][]byte{{'x'}, {}}, 303)
+	pdCli := tikv.NewCodecPDClient(tikv.ModeTxn, pdClient)
+	defer pdCli.Close()
+
+	cache := NewRegionCache(tikv.NewRegionCache(pdCli))
+	defer cache.Close()
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+
+	req := &kv.Request{StoreBatchSize: 3}
+	tasks, err := buildCopTasks(bo, buildCopRanges("a", "b", "o", "p", "y", "z"), &buildCopTaskOpt{
+		req:      req,
+		cache:    cache,
+		rowHints: []int{1, 1, 1},
+	})
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+
+	pbTasks := tasks[0].ToPBBatchTasks()
+	require.Len(t, pbTasks, 2)
+	versionByRegion := make(map[uint64]uint64, len(pbTasks))
+	for _, pbTask := range pbTasks {
+		versionByRegion[pbTask.GetRegionId()] = pbTask.GetBucketsVersion()
+	}
+	require.Equal(t, map[uint64]uint64{
+		regionIDs[1]: 202,
+		regionIDs[2]: 303,
+	}, versionByRegion)
+}
+
+func testHandleBatchCopResponseMergedAndUnansweredTasks(t *testing.T) {
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+	var batched, fallback atomic.Uint64
+	executionStats := &copIteratorRuntimeStats{}
+	runawayChecker := &recordingRunawayChecker{}
+	worker := &copIteratorWorker{
+		req:                     &kv.Request{RunawayChecker: runawayChecker},
+		kvclient:                &txnsnapshot.ClientHelper{},
+		storeBatchedNum:         &batched,
+		storeBatchedFallbackNum: &fallback,
+		stats:                   executionStats,
+	}
+
+	mergedTask := &copTask{taskID: 1}
+	inlineTask := &copTask{taskID: 2}
+	inlineData := []byte("inline-task-data")
+	responses, remains, err := worker.handleBatchCopResponse(bo, &requestLockHints{}, nil, &coprocessor.Response{
+		BatchResponses: []*coprocessor.StoreBatchTaskResponse{
+			{
+				TaskId:                 mergedTask.taskID,
+				DataMergedIntoResponse: true,
+				ExecDetailsV2: &kvrpcpb.ExecDetailsV2{
+					ScanDetailV2: &kvrpcpb.ScanDetailV2{ProcessedVersions: 7},
+				},
+			},
+			{TaskId: inlineTask.taskID, Data: inlineData},
+		},
+	}, map[uint64]*batchedCopTask{
+		mergedTask.taskID: {task: mergedTask},
+		inlineTask.taskID: {task: inlineTask},
+	})
+	require.NoError(t, err)
+	require.Empty(t, remains)
+	require.Len(t, responses, 1)
+	require.Equal(t, inlineData, []byte(responses[0].pbResp.Data))
+	require.Equal(t, uint64(2), batched.Load())
+	require.Zero(t, fallback.Load())
+	collectedStats := (&copIterator{stats: executionStats}).CollectUnconsumedCopRuntimeStats()
+	require.Len(t, collectedStats, 1)
+	require.Equal(t, int64(7), collectedStats[0].ScanDetail.ProcessedKeys)
+	require.Equal(t, int64(7), runawayChecker.processedKeys.Load())
+
+	unansweredTask := &copTask{taskID: 3}
+	responses, remains, err = worker.handleBatchCopResponse(bo, &requestLockHints{}, nil, &coprocessor.Response{}, map[uint64]*batchedCopTask{
+		unansweredTask.taskID: {task: unansweredTask},
+	})
+	require.NoError(t, err)
+	require.Empty(t, responses)
+	require.Len(t, remains, 1)
+	require.Same(t, unansweredTask, remains[0])
+	require.Equal(t, uint64(2), batched.Load())
+	require.Equal(t, uint64(1), fallback.Load())
+}
+
+type apiV2StoreBatchLockClient struct {
+	tikv.Client
+	copResponse              *tikvrpc.Response
+	checkTxnStatusPrimaryKey []byte
+}
+
+type ignoredLockHintCopClient struct {
+	tikv.Client
+	lockTS        uint64
+	committedHint bool
+	lockResponses int32
+	alwaysLocked  bool
+	copRequests   atomic.Int32
+	missingHint   atomic.Bool
+	onRequest     func(*tikvrpc.Request) *tikvrpc.Response
+}
+
+func (c *ignoredLockHintCopClient) SendRequest(
+	ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration,
+) (*tikvrpc.Response, error) {
+	if c.onRequest != nil {
+		if resp := c.onRequest(req); resp != nil {
+			return resp, nil
+		}
+	}
+	if req.Type != tikvrpc.CmdCop {
+		return c.Client.SendRequest(ctx, addr, req, timeout)
+	}
+
+	hints := req.ResolvedLocks
+	if c.committedHint {
+		hints = req.CommittedLocks
+	}
+	found := false
+	for _, txnID := range hints {
+		if txnID == c.lockTS {
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.missingHint.Store(true)
+	}
+
+	requestCount := c.copRequests.Add(1)
+	if c.alwaysLocked || requestCount <= c.lockResponses {
+		return &tikvrpc.Response{Resp: &coprocessor.Response{Locked: &kvrpcpb.LockInfo{
+			Key:         []byte("key"),
+			PrimaryLock: []byte("primary"),
+			LockVersion: c.lockTS,
+			LockType:    kvrpcpb.Op_PessimisticLock,
+		}}}, nil
+	}
+	return &tikvrpc.Response{Resp: &coprocessor.Response{}}, nil
+}
+
+func newIgnoredLockHintCopWorker(
+	t *testing.T, client *ignoredLockHintCopClient, committedHint bool,
+) (*copIteratorWorker, *copTask) {
+	baseClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	testutils.BootstrapWithSingleStore(cluster)
+	client.Client = baseClient
+	client.committedHint = committedHint
+
+	tikvStore, err := tikv.NewTestTiKVStore(client, pdClient, nil, nil, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tikvStore.Close()) })
+	copStore, err := NewStore(tikvStore, nil)
+	require.NoError(t, err)
+	t.Cleanup(copStore.Close)
+
+	ctx := context.Background()
+	killed := uint32(0)
+	req := &kv.Request{
+		Tp:          kv.ReqTypeDAG,
+		StartTs:     100,
+		StoreType:   kv.TiKV,
+		KeyRanges:   kv.NewNonPartitionedKeyRanges(BuildKeyRanges("a", "z")),
+		Concurrency: 1,
+	}
+	it, errResp := (&CopClient{store: copStore}).BuildCopIterator(ctx, req, kv.NewVariables(&killed), &kv.ClientSendOption{})
+	require.Nil(t, errResp)
+	require.Len(t, it.tasks, 1)
+	if committedHint {
+		it.committedLocks.Put(client.lockTS)
+	} else {
+		it.resolvedLocks.Put(client.lockTS)
+	}
+	return newCopIteratorWorker(it, nil), it.tasks[0]
+}
+
+func (c *apiV2StoreBatchLockClient) SendRequest(
+	ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration,
+) (*tikvrpc.Response, error) {
+	switch req.Type {
+	case tikvrpc.CmdCop:
+		return c.copResponse, nil
+	case tikvrpc.CmdCheckTxnStatus:
+		c.checkTxnStatusPrimaryKey = append([]byte(nil), req.CheckTxnStatus().GetPrimaryKey()...)
+	}
+	return c.Client.SendRequest(ctx, addr, req, timeout)
+}
+
+type apiV2KeyspacePDClient struct {
+	pd.Client
+	meta *keyspacepb.KeyspaceMeta
+}
+
+func (c *apiV2KeyspacePDClient) LoadKeyspace(context.Context, string) (*keyspacepb.KeyspaceMeta, error) {
+	return c.meta, nil
+}
+
+func (c *apiV2KeyspacePDClient) WithCallerComponent(caller.Component) pd.Client {
+	// Keep this wrapper when client-go tags the PD client with its caller.
+	return c
+}
+
+func (c *apiV2KeyspacePDClient) GetGCStatesClient(uint32) pdgc.GCStatesClient {
+	// The mock PD implements GC state only for the legacy null keyspace. The
+	// safe point value, not its keyspace ID, is relevant to this test.
+	return c.Client.GetGCStatesClient(constants.NullKeyspaceID)
+}
+
+func testHandleBatchCopResponseResolvesAPIV2ChildLock(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	testutils.BootstrapWithSingleStore(cluster)
+
+	keyspaceMeta := &keyspacepb.KeyspaceMeta{
+		Keyspace: &keyspacepb.KeyspaceMeta_Id{Id: 42},
+		Name:     "test-keyspace",
+		State:    keyspacepb.KeyspaceState_ENABLED,
+	}
+	codec, err := tikv.NewCodecV2(tikv.ModeTxn, keyspaceMeta)
+	require.NoError(t, err)
+	child := &copTask{taskID: 1}
+	primaryKey := []byte("primary")
+	rawClient := &apiV2StoreBatchLockClient{
+		Client: mockClient,
+		copResponse: &tikvrpc.Response{Resp: &coprocessor.Response{
+			BatchResponses: []*coprocessor.StoreBatchTaskResponse{
+				{
+					TaskId: child.taskID,
+					Locked: &kvrpcpb.LockInfo{
+						Key:         codec.EncodeKey([]byte("key")),
+						PrimaryLock: codec.EncodeKey(primaryKey),
+						LockVersion: 1,
+						// Keep lock cleanup synchronous with the test.
+						LockType: kvrpcpb.Op_PessimisticLock,
+					},
+				},
+			},
+		}},
+	}
+	tikvStore, err := tikv.NewTestKeyspaceTiKVStore(
+		rawClient,
+		&apiV2KeyspacePDClient{Client: pdClient, meta: keyspaceMeta},
+		nil, nil, 0, *keyspaceMeta,
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tikvStore.Close()) })
+
+	decodedResp, err := tikvStore.GetTiKVClient().SendRequest(
+		context.Background(), "store1",
+		&tikvrpc.Request{
+			Type: tikvrpc.CmdCop,
+			Req: &coprocessor.Request{Tasks: []*coprocessor.StoreBatchTask{
+				{TaskId: child.taskID},
+			}},
+		},
+		time.Second,
+	)
+	require.NoError(t, err)
+
+	var resolvedLocks, committedLocks tikvutil.TSSet
+	worker := &copIteratorWorker{
+		req: &kv.Request{StartTs: 10},
+		kvclient: txnsnapshot.NewClientHelper(
+			tikvStore, &resolvedLocks, &committedLocks, false,
+		),
+		storeBatchedNum:         &atomic.Uint64{},
+		storeBatchedFallbackNum: &atomic.Uint64{},
+	}
+	_, _, err = worker.handleBatchCopResponse(
+		backoff.NewBackofferWithVars(context.Background(), 3000, nil),
+		&requestLockHints{},
+		nil,
+		decodedResp.Resp.(*coprocessor.Response),
+		map[uint64]*batchedCopTask{child.taskID: {task: child}},
+	)
+	require.NoError(t, err)
+	// Lock resolution must encode the decoded primary exactly once.
+	require.Equal(t, codec.EncodeKey(primaryKey), rawClient.checkTxnStatusPrimaryKey)
+}
+
+func TestHandleBatchCopResponse(t *testing.T) {
+	t.Run("resolves a child lock", testHandleBatchCopResponseResolvesChildLock)
+	t.Run("resolves an API V2 child lock", testHandleBatchCopResponseResolvesAPIV2ChildLock)
+	t.Run("handles merged and unanswered tasks", testHandleBatchCopResponseMergedAndUnansweredTasks)
+	t.Run("updates child buckets on version mismatch", testHandleBatchCopResponseUpdatesChildBucketsOnVersionNotMatch)
+	t.Run("counts fallbacks after Region split", testHandleBatchCopResponseFallbackCountersAfterRegionSplit)
+	t.Run("rebuilds a store batch after a Region cache miss", testHandleStoreBatchRegionCacheMiss)
+	t.Run("picks the store batch RPC timeout", testStoreBatchCopRPCTimeout)
+	t.Run("backs off when TiKV ignores lock hints", testCoprocessorBacksOffWhenTiKVIgnoresLockHint)
+	t.Run("stops after repeated ignored lock hints", testCoprocessorStopsAfterRepeatedIgnoredLockHint)
+	t.Run("backs off once per response for ignored lock hints", testCoprocessorBacksOffOncePerResponseForIgnoredLockHints)
+}
+
+func testCoprocessorBacksOffOncePerResponseForIgnoredLockHints(t *testing.T) {
+	for _, hint := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "resolved"},
+		{name: "committed", committed: true},
+	} {
+		t.Run(hint.name, func(t *testing.T) {
+			for _, test := range []struct {
+				name            string
+				children        int
+				parentTxnID     uint64
+				firstChildTxnID uint64
+				sharedLock      bool
+			}{
+				{name: "four children", children: 4, firstChildTxnID: 42},
+				{name: "many children", children: 64, firstChildTxnID: 42},
+				{name: "parent and children", children: 4, parentTxnID: 42, firstChildTxnID: 42},
+				{name: "unhinted parent", children: 4, parentTxnID: 41, firstChildTxnID: 42},
+				{name: "unhinted first child", children: 4, firstChildTxnID: 41},
+				{name: "different hinted transactions", children: 4, firstChildTxnID: 43},
+				{name: "shared child lock", children: 4, firstChildTxnID: 42, sharedLock: true},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					var cleanedKeys atomic.Int32
+					client := &ignoredLockHintCopClient{
+						lockTS: 42,
+						onRequest: func(req *tikvrpc.Request) *tikvrpc.Response {
+							switch req.Type {
+							case tikvrpc.CmdCheckTxnStatus:
+								var commitTS uint64
+								if hint.committed {
+									commitTS = req.CheckTxnStatus().LockTs + 1
+								}
+								return &tikvrpc.Response{Resp: &kvrpcpb.CheckTxnStatusResponse{CommitVersion: commitTS}}
+							case tikvrpc.CmdResolveLock:
+								cleanedKeys.Add(int32(len(req.ResolveLock().Keys)))
+								return &tikvrpc.Response{Resp: &kvrpcpb.ResolveLockResponse{}}
+							}
+							return nil
+						},
+					}
+					worker, task := newIgnoredLockHintCopWorker(t, client, hint.committed)
+					lockHints := &requestLockHints{}
+					if hint.committed {
+						lockHints.committed = []uint64{42, 43}
+					} else {
+						lockHints.resolved = []uint64{42, 43}
+					}
+					newLock := func(txnID uint64, key byte) *kvrpcpb.LockInfo {
+						return &kvrpcpb.LockInfo{
+							Key:         []byte{'k', key},
+							PrimaryLock: []byte{'p', byte(txnID)},
+							LockVersion: txnID,
+							LockTtl:     1,
+							TxnSize:     uint64(test.children + 1),
+							LockType:    kvrpcpb.Op_Put,
+						}
+					}
+					resp := &coprocessor.Response{}
+					expectedRetries, expectedCleanedKeys := test.children, test.children
+					if test.parentTxnID != 0 {
+						resp.Locked = newLock(test.parentTxnID, 0)
+						expectedRetries++
+						expectedCleanedKeys++
+					}
+					task.batchTaskList = make(map[uint64]*batchedCopTask, test.children)
+					for i := range test.children {
+						id := uint64(i + 1)
+						lock := newLock(42, byte(id))
+						if i == 0 {
+							lock.LockVersion = test.firstChildTxnID
+							lock.PrimaryLock = []byte{'p', byte(test.firstChildTxnID)}
+							if test.sharedLock {
+								lock = &kvrpcpb.LockInfo{SharedLockInfos: []*kvrpcpb.LockInfo{newLock(41, byte(id)), lock}}
+								expectedCleanedKeys++
+							}
+						}
+						task.batchTaskList[id] = &batchedCopTask{task: &copTask{taskID: id}}
+						resp.BatchResponses = append(resp.BatchResponses, &coprocessor.StoreBatchTaskResponse{TaskId: id, Locked: lock})
+					}
+					killed := uint32(0)
+					vars := kv.NewVariables(&killed)
+					vars.BackoffLockFast = 1
+					vars.BackOffWeight = 1
+					// One hinted-lock backoff fits, but repeated backoffs for the same
+					// response exhaust this budget without making the regression slow.
+					bo := backoff.NewBackofferWithVars(context.Background(), 20, vars)
+					result, err := worker.handleCopResponse(bo, lockHints, nil, &copResponse{pbResp: resp}, nil, nil, task, 0)
+					require.NoError(t, err)
+					require.Len(t, result.remains, expectedRetries)
+					require.Equal(t, 1, bo.GetBackoffTimes()["txnLockFast"])
+					// Suppressing duplicate hint backoffs must still resolve every lock.
+					require.Eventually(t, func() bool {
+						return cleanedKeys.Load() == int32(expectedCleanedKeys)
+					}, time.Second, time.Millisecond)
+				})
+			}
+		})
+	}
+}
+
+func testCoprocessorBacksOffWhenTiKVIgnoresLockHint(t *testing.T) {
+	const lockTS = uint64(42)
+	for _, test := range []struct {
+		name      string
+		committed bool
+	}{
+		{name: "resolved"},
+		{name: "committed", committed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &ignoredLockHintCopClient{
+				lockTS:        lockTS,
+				lockResponses: 2,
+			}
+			ctx := context.Background()
+			worker, task := newIgnoredLockHintCopWorker(t, client, test.committed)
+			bo := backoff.NewBackofferWithVars(ctx, 3000, nil)
+			for expectedBackoffs := 1; expectedBackoffs <= 2; expectedBackoffs++ {
+				result, err := worker.handleTaskOnce(bo, task)
+				require.NoError(t, err)
+				require.Equal(t, map[string]int{"txnLockFast": expectedBackoffs}, bo.GetBackoffTimes())
+				require.Len(t, result.remains, 1)
+				task = result.remains[0]
+			}
+
+			result, err := worker.handleTaskOnce(bo, task)
+			require.NoError(t, err)
+			require.NotNil(t, result.resp)
+			require.Empty(t, result.remains)
+			require.Equal(t, int32(3), client.copRequests.Load())
+			require.False(t, client.missingHint.Load())
+		})
+	}
+}
+
+func testCoprocessorStopsAfterRepeatedIgnoredLockHint(t *testing.T) {
+	client := &ignoredLockHintCopClient{
+		lockTS:       42,
+		alwaysLocked: true,
+	}
+	worker, task := newIgnoredLockHintCopWorker(t, client, false)
+	killed := uint32(0)
+	vars := kv.NewVariables(&killed)
+	vars.BackoffLockFast = 1
+	vars.BackOffWeight = 1
+	bo := backoff.NewBackofferWithVars(context.Background(), 2, vars)
+
+	for expectedBackoffs := 1; expectedBackoffs <= 2; expectedBackoffs++ {
+		result, err := worker.handleTaskOnce(bo, task)
+		require.NoError(t, err)
+		require.Equal(t, map[string]int{"txnLockFast": expectedBackoffs}, bo.GetBackoffTimes())
+		require.Len(t, result.remains, 1)
+		task = result.remains[0]
+	}
+
+	_, err := worker.handleTaskOnce(bo, task)
+	require.ErrorIs(t, err, derr.ErrResolveLockTimeout)
+	require.Equal(t, map[string]int{"txnLockFast": 2}, bo.GetBackoffTimes())
+	require.Equal(t, int32(3), client.copRequests.Load())
+	require.False(t, client.missingHint.Load())
+}
+
+func testHandleStoreBatchRegionCacheMiss(t *testing.T) {
+	// A false positive would replay ranges whose child result may already be in
+	// the response, so every uncertain response shape must use flat reconciliation.
+	worker := &copIteratorWorker{req: &kv.Request{}}
+	task := &copTask{batchTaskList: map[uint64]*batchedCopTask{1: {}}}
+	resp := &coprocessor.Response{RegionError: &errorpb.Error{EpochNotMatch: &errorpb.EpochNotMatch{}}}
+	require.False(t, worker.canRebuildWholeStoreBatch(nil, resp, task))
+	worker.req.AllowBatchTaskDataMerge = true
+	require.False(t, worker.canRebuildWholeStoreBatch(&tikv.RPCContext{}, resp, task))
+	resp.BatchResponses = []*coprocessor.StoreBatchTaskResponse{{TaskId: 1}}
+	require.False(t, worker.canRebuildWholeStoreBatch(nil, resp, task))
+	resp.BatchResponses = nil
+	resp.Data = []byte{1}
+	require.False(t, worker.canRebuildWholeStoreBatch(nil, resp, task))
+	resp.Data = nil
+	resp.RegionError = &errorpb.Error{ServerIsBusy: &errorpb.ServerIsBusy{}}
+	require.False(t, worker.canRebuildWholeStoreBatch(nil, resp, task))
+
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+	tikvStore, err := tikv.NewTestTiKVStore(mockClient, pdClient, nil, nil, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tikvStore.Close()) })
+	copStore, err := NewStore(tikvStore, nil)
+	require.NoError(t, err)
+	t.Cleanup(copStore.Close)
+
+	ctx := context.Background()
+	killed := uint32(0)
+	req := &kv.Request{
+		Tp:                      kv.ReqTypeAnalyze,
+		StoreType:               kv.TiKV,
+		KeyRanges:               kv.NewNonPartitionedKeyRanges(BuildKeyRanges("a", "z")),
+		Concurrency:             1,
+		StoreBatchSize:          3,
+		AllowBatchTaskDataMerge: true,
+	}
+	req.RequestSource.RequestSourceInternal = true
+	it, errRes := (&CopClient{store: copStore}).BuildCopIterator(ctx, req, kv.NewVariables(&killed), &kv.ClientSendOption{})
+	require.Nil(t, errRes)
+	require.Len(t, it.tasks, 1)
+	require.Zero(t, req.StoreBatchSize)
+	failedTask := it.tasks[0]
+	require.Len(t, failedTask.batchTaskList, 3)
+
+	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(regionIDs[0], newRegionID, []byte("d"), []uint64{newPeerID}, newPeerID)
+
+	cache := copStore.GetRegionCache()
+	cache.InvalidateCachedRegion(failedTask.region)
+	for _, child := range failedTask.batchTaskList {
+		cache.InvalidateCachedRegion(child.task.region)
+	}
+
+	result, err := newCopIteratorWorker(it, nil).handleCopResponse(
+		backoff.NewBackofferWithVars(ctx, 3000, nil), &requestLockHints{}, nil,
+		&copResponse{pbResp: &coprocessor.Response{RegionError: &errorpb.Error{EpochNotMatch: &errorpb.EpochNotMatch{}}}},
+		nil, nil, failedTask, 0,
+	)
+	require.NoError(t, err)
+	require.Zero(t, req.StoreBatchSize)
+	require.Len(t, result.remains, 2)
+	require.Len(t, result.remains[0].batchTaskList, 3)
+	require.Empty(t, result.remains[1].batchTaskList)
+}
+
+func testHandleBatchCopResponseResolvesChildLock(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	testutils.BootstrapWithSingleStore(cluster)
+	tikvStore, err := tikv.NewTestTiKVStore(mockClient, pdClient, nil, nil, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tikvStore.Close()) })
+
+	var resolvedLocks, committedLocks tikvutil.TSSet
+	kvClient := txnsnapshot.NewClientHelper(tikvStore, &resolvedLocks, &committedLocks, false)
+	kvClient.Stats = tikv.NewRegionRequestRuntimeStats()
+	child := &copTask{taskID: 1}
+	worker := &copIteratorWorker{
+		req:                     &kv.Request{StartTs: 10},
+		kvclient:                kvClient,
+		storeBatchedNum:         &atomic.Uint64{},
+		storeBatchedFallbackNum: &atomic.Uint64{},
+	}
+
+	_, _, err = worker.handleBatchCopResponse(
+		backoff.NewBackofferWithVars(context.Background(), 3000, nil),
+		&requestLockHints{},
+		nil,
+		&coprocessor.Response{BatchResponses: []*coprocessor.StoreBatchTaskResponse{{
+			TaskId: child.taskID,
+			Locked: &kvrpcpb.LockInfo{
+				Key:         []byte("key"),
+				PrimaryLock: []byte("primary"),
+				LockVersion: 1,
+				// Keep lock cleanup synchronous with the test.
+				LockType: kvrpcpb.Op_PessimisticLock,
+			},
+		}}},
+		map[uint64]*batchedCopTask{child.taskID: {task: child}},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, kvClient.Stats.GetRPCStatsCount())
+}
+
+func testHandleBatchCopResponseUpdatesChildBucketsOnVersionNotMatch(t *testing.T) {
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	_, regionIDs, _ := testutils.BootstrapWithMultiRegions(cluster, []byte("m"))
+	cluster.SplitRegionBuckets(regionIDs[0], [][]byte{{}, {'m'}}, 7)
+	cluster.SplitRegionBuckets(regionIDs[1], [][]byte{{'m'}, {'n'}, {}}, 11)
+
+	tikvStore, err := tikv.NewTestTiKVStore(mockClient, pdClient, nil, nil, 0)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, tikvStore.Close())
+	}()
+	copStore, err := NewStore(tikvStore, nil)
+	require.NoError(t, err)
+	defer copStore.Close()
+
+	cache := copStore.GetRegionCache()
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+	req := &kv.Request{}
+
+	parentTasks, err := buildCopTasks(bo, buildCopRanges("a", "b"), &buildCopTaskOpt{
+		req:   req,
+		cache: cache,
+	})
+	require.NoError(t, err)
+	require.Len(t, parentTasks, 1)
+	childTasks, err := buildCopTasks(bo, buildCopRanges("n", "o"), &buildCopTaskOpt{
+		req:   req,
+		cache: cache,
+	})
+	require.NoError(t, err)
+	require.Len(t, childTasks, 1)
+	parentTask := parentTasks[0]
+	childTask := childTasks[0]
+	require.Equal(t, uint64(7), parentTask.bucketsVer)
+	require.Equal(t, uint64(11), childTask.bucketsVer)
+
+	childTask.taskID = 1
+	var storeBatchedNum atomic.Uint64
+	var storeBatchedFallbackNum atomic.Uint64
+	worker := &copIteratorWorker{
+		store:                   copStore,
+		req:                     req,
+		storeBatchedNum:         &storeBatchedNum,
+		storeBatchedFallbackNum: &storeBatchedFallbackNum,
+	}
+	parentRPCCtx := &tikv.RPCContext{
+		Region:        parentTask.region,
+		BucketVersion: parentTask.bucketsVer,
+	}
+	bucketKeys := [][]byte{[]byte("m"), []byte("n"), {}}
+	resp := &coprocessor.Response{
+		BatchResponses: []*coprocessor.StoreBatchTaskResponse{
+			{
+				TaskId: childTask.taskID,
+				RegionError: &errorpb.Error{
+					BucketVersionNotMatch: &errorpb.BucketVersionNotMatch{
+						Version: 99,
+						Keys:    bucketKeys,
+					},
+				},
+			},
+		},
+	}
+
+	_, remains, err := worker.handleBatchCopResponse(bo, &requestLockHints{}, parentRPCCtx, resp, map[uint64]*batchedCopTask{
+		childTask.taskID: {task: childTask},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, remains)
+
+	loc, err := cache.LocateKey(bo.TiKVBackoffer(), []byte("n"))
+	require.NoError(t, err)
+	require.Equal(t, regionIDs[1], loc.Region.GetID())
+	require.Equal(t, uint64(99), loc.Buckets.GetVersion())
+	require.Equal(t, bucketKeys, loc.Buckets.GetKeys())
+}
+
+func testHandleBatchCopResponseFallbackCountersAfterRegionSplit(t *testing.T) {
+	// One failed batched child whose Region split in the meantime rebuilds
+	// into several retry tasks.
+	mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+	require.NoError(t, err)
+	testutils.BootstrapWithMultiRegions(cluster, []byte("f"), []byte("h"))
+	tikvStore, err := tikv.NewTestTiKVStore(mockClient, pdClient, nil, nil, 0)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, tikvStore.Close())
+	}()
+	copStore, err := NewStore(tikvStore, nil)
+	require.NoError(t, err)
+	defer copStore.Close()
+	cache := copStore.GetRegionCache()
+	bo := backoff.NewBackofferWithVars(context.Background(), 3000, nil)
+	req := &kv.Request{}
+
+	tasks, err := buildCopTasks(bo, buildCopRanges("f", "h"), &buildCopTaskOpt{
+		req:   req,
+		cache: cache,
+	})
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	failedChild := tasks[0]
+
+	// Split the child's Region underneath it and drop the stale cache entry,
+	// so the retry rebuild has to resolve two Regions.
+	newRegionID, newPeerID := cluster.AllocID(), cluster.AllocID()
+	cluster.Split(failedChild.region.GetID(), newRegionID, []byte("g"), []uint64{newPeerID}, newPeerID)
+	cache.InvalidateCachedRegion(failedChild.region)
+
+	failedChild.taskID = 1
+	var storeBatchedNum atomic.Uint64
+	var storeBatchedFallbackNum atomic.Uint64
+	worker := &copIteratorWorker{
+		store:                   copStore,
+		req:                     req,
+		storeBatchedNum:         &storeBatchedNum,
+		storeBatchedFallbackNum: &storeBatchedFallbackNum,
+	}
+	_, retryTasks, err := worker.handleBatchCopResponse(
+		bo,
+		&requestLockHints{},
+		nil,
+		&coprocessor.Response{
+			BatchResponses: []*coprocessor.StoreBatchTaskResponse{
+				{
+					TaskId: failedChild.taskID,
+					RegionError: &errorpb.Error{
+						EpochNotMatch: &errorpb.EpochNotMatch{},
+					},
+				},
+			},
+		},
+		map[uint64]*batchedCopTask{
+			failedChild.taskID: {task: failedChild},
+		},
+	)
+	require.NoError(t, err)
+	require.Len(t, retryTasks, 2)
+	for _, task := range retryTasks {
+		require.Empty(t, task.batchTaskList)
+	}
+	// One failed batched input rebuilds into one retry task per new Region,
+	// but counts as exactly one fallback.
+	require.Zero(t, storeBatchedNum.Load())
+	require.Equal(t, uint64(1), storeBatchedFallbackNum.Load())
+}
+
+// copTimeoutRecorder records the timeout of every coprocessor RPC and answers
+// it with an empty response.
+type copTimeoutRecorder struct {
+	tikv.Client
+	copTimeouts []time.Duration
+}
+
+func (c *copTimeoutRecorder) SendRequest(
+	ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration,
+) (*tikvrpc.Response, error) {
+	if req.Type != tikvrpc.CmdCop {
+		return c.Client.SendRequest(ctx, addr, req, timeout)
+	}
+	c.copTimeouts = append(c.copTimeouts, timeout)
+	return &tikvrpc.Response{Resp: &coprocessor.Response{}}, nil
+}
+
+func testStoreBatchCopRPCTimeout(t *testing.T) {
+	// Four Regions on one store build one primary task carrying three batched
+	// children, so the RPC holds four tasks in total.
+	const batchedChildren = 3
+	sendStoreBatch := func(t *testing.T, tweak func(req *kv.Request)) time.Duration {
+		mockClient, cluster, pdClient, err := testutils.NewMockTiKV("", nil)
+		require.NoError(t, err)
+		testutils.BootstrapWithMultiRegions(cluster, []byte("g"), []byte("n"), []byte("t"))
+		recorder := &copTimeoutRecorder{Client: mockClient}
+		tikvStore, err := tikv.NewTestTiKVStore(recorder, pdClient, nil, nil, 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, tikvStore.Close()) })
+		copStore, err := NewStore(tikvStore, nil)
+		require.NoError(t, err)
+		t.Cleanup(copStore.Close)
+
+		ctx := context.Background()
+		req := &kv.Request{
+			Tp:                      kv.ReqTypeAnalyze,
+			StoreType:               kv.TiKV,
+			KeyRanges:               kv.NewNonPartitionedKeyRanges(BuildKeyRanges("a", "z")),
+			StoreBatchSize:          batchedChildren,
+			AllowBatchTaskDataMerge: true,
+		}
+		tweak(req)
+		it, errRes := (&CopClient{store: copStore}).BuildCopIterator(ctx, req, kv.NewVariables(nil), &kv.ClientSendOption{})
+		require.Nil(t, errRes)
+		require.Len(t, it.tasks, 1)
+		require.Len(t, it.tasks[0].batchTaskList, batchedChildren)
+
+		_, err = newCopIteratorWorker(it, nil).handleTaskOnce(backoff.NewBackofferWithVars(ctx, 3000, nil), it.tasks[0])
+		require.NoError(t, err)
+		require.Len(t, recorder.copTimeouts, 1)
+		return recorder.copTimeouts[0]
+	}
+
+	coprReqTimeout := config.GetGlobalConfig().TiKVClient.CoprReqTimeout
+	require.Positive(t, coprReqTimeout)
+
+	t.Run("serial batch gets the per-task budget for every task", func(t *testing.T) {
+		// TiKV runs a serial store batch under the top task's deadline, which
+		// client-go derives from this RPC timeout.
+		timeout := sendStoreBatch(t, func(req *kv.Request) {
+			req.ExecuteBatchTasksSerially = true
+		})
+		require.Equal(t, coprReqTimeout*(batchedChildren+1), timeout)
+	})
+
+	t.Run("serial batch scales tikv_client_read_timeout", func(t *testing.T) {
+		timeout := sendStoreBatch(t, func(req *kv.Request) {
+			req.ExecuteBatchTasksSerially = true
+			req.TiKVClientReadTimeout = 500
+		})
+		require.Equal(t, 500*time.Millisecond*(batchedChildren+1), timeout)
+	})
+
+	t.Run("concurrent batch keeps the single-request timeout", func(t *testing.T) {
+		// Concurrently executed children each get their own deadline on TiKV,
+		// so the RPC budget must not grow with the batch.
+		timeout := sendStoreBatch(t, func(*kv.Request) {})
+		require.Equal(t, coprReqTimeout, timeout)
+	})
+}

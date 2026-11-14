@@ -1,0 +1,212 @@
+// Copyright 2017 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package types
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestContainsAnyAsterisk(t *testing.T) {
+	var tests = []struct {
+		expression        string
+		containsAsterisks bool
+	}{
+		{"$.a[1]", false},
+		{"$.a[*]", true},
+		{"$.*[1]", true},
+		{"$**.a[1]", true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.expression, func(t *testing.T) {
+			pe, err := ParseJSONPathExpr(test.expression)
+			require.NoError(t, err)
+			require.Equal(t, test.containsAsterisks, pe.flags.containsAnyAsterisk())
+		})
+	}
+}
+
+func TestValidatePathExpr(t *testing.T) {
+	var tests = []struct {
+		expression string
+		success    bool
+		legs       int
+	}{
+		{`   $  `, true, 0},
+		{"   $ .   key1  [  3  ]\t[*].*.key3", true, 5},
+		{"   $ .   key1  [  3  ]**[*].*.key3", true, 6},
+		{`$."key1 string"[  3  ][*].*.key3`, true, 5},
+		{`$."hello \"escaped quotes\" world\\n"[3][*].*.key3`, true, 5},
+		{`$[1 to 5]`, true, 1},
+		{`$[2 to 1]`, false, 1},
+		{`$[last]`, true, 1},
+		{`$[1 to last]`, true, 1},
+		{`$[1to3]`, false, 1},
+		{`$[last - 5 to last - 10]`, false, 1},
+		{`$[last to last]`, true, 1},
+		{`$[last ]`, true, 1},
+		{`$[last `, false, 0},
+		{`$[last  `, false, 0},
+		{"$[last\tto last]", true, 1},
+		{`$[last to]`, false, 0},
+		{`$[1 to]`, false, 0},
+		{`$[1 tox]`, false, 0},
+
+		{`$.\"escaped quotes\"[3][*].*.key3`, false, 0},
+		{`$.hello \"escaped quotes\" world[3][*].*.key3`, false, 0},
+		{`$NoValidLegsHere`, false, 0},
+		{`$        No Valid Legs Here .a.b.c`, false, 0},
+		{`$.a[b]`, false, 0},
+		{`$.*[b]`, false, 0},
+		{`$**.a[b]`, false, 0},
+		{`$.b[ 1 ].`, false, 0},
+		{`$.performance.txn-entry-size-limit`, false, 0},
+		{`$."performance".txn-entry-size-limit`, false, 0},
+		{`$."performance."txn-entry-size-limit`, false, 0},
+		{`$."performance."txn-entry-size-limit"`, false, 0},
+		{`$[`, false, 0},
+		{`$a.***[3]`, false, 0},
+		{`$1a`, false, 0},
+		{`$.ѿ`, false, 0},
+		{`$."ѿ"`, true, 1},
+		{"$.\"\\0\\", false, 0},
+		{`$.Ѡ`, false, 0}, // Ѡ is U+0460, and its lowest byte 0x60 is not a letter in MySQL.
+		{`$."Ѡ"`, true, 1},
+		{`$.µ`, true, 1},
+		// The expected results below are the same as MySQL 8.0, which checks
+		// letters and digits by the lowest byte of the code point.
+		{`$.é`, true, 1},
+		{`$.ß`, true, 1},
+		{`$.α`, true, 1},
+		{`$.с`, true, 1},
+		{`$.aб`, true, 1},
+		{`$.б`, false, 0},
+		{`$.ÿ`, false, 0},
+		{`$.Ā`, false, 0},
+		{`$.你`, false, 0},
+		{`$."你"`, true, 1},
+		// MySQL only treats ASCII whitespace as whitespace in a JSON path, so
+		// U+00A0 and U+0085 are part of the key, and U+3000 is not a letter.
+		{"$.a\u00a0b", true, 1},
+		{"$.a\u0085b", true, 1},
+		{"$.a\u00a0.b", true, 2},
+		{"$.a\u3000b", false, 0},
+		{"$.\xff", false, 0},
+		{"$.\"\xff\"", false, 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.expression, func(t *testing.T) {
+			pe, err := ParseJSONPathExpr(test.expression)
+			if test.success {
+				require.NoError(t, err)
+				require.Len(t, pe.legs, test.legs)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestPathKeyRoundTrip(t *testing.T) {
+	// The path built from a key by quoteJSONString, like the result of
+	// JSON_SEARCH, should be parsed back to the same key.
+	keys := []string{"a", "a b", "é", "你", "a\u00a0b", "a\u0085b", "a\u1680b", "a\u3000b", "a.b", "a\"b"}
+	for _, key := range keys {
+		pe, err := ParseJSONPathExpr("$." + quoteJSONString(key))
+		require.NoError(t, err, key)
+		require.Len(t, pe.legs, 1)
+		require.Equal(t, key, pe.legs[0].dotKey)
+	}
+}
+
+func TestPathExprToString(t *testing.T) {
+	var tests = []struct {
+		expression string
+	}{
+		{"$.a[1]"},
+		{"$.a[*]"},
+		{"$.*[2]"},
+		{"$**.a[3]"},
+		{`$."\"hello\""`},
+		{`$."a b"`},
+		{`$."one potato"`},
+	}
+	for _, test := range tests {
+		t.Run(test.expression, func(t *testing.T) {
+			pe, err := ParseJSONPathExpr(test.expression)
+			require.NoError(t, err)
+			require.Equal(t, test.expression, pe.String())
+		})
+	}
+}
+
+func TestPushBackOneIndexLeg(t *testing.T) {
+	var tests = []struct {
+		expression                string
+		index                     int
+		expected                  string
+		couldReturnMultipleValues bool
+	}{
+		{"$", 1, "$[1]", false},
+		{"$.a[1]", 1, "$.a[1][1]", false},
+		{"$.a[*]", 10, "$.a[*][10]", true},
+		{"$.*[2]", 2, "$.*[2][2]", true},
+		{"$**.a[3]", 3, "$**.a[3][3]", true},
+		{"$.a[1 to 3]", 3, "$.a[1 to 3][3]", true},
+		{"$.a[last-3 to last-3]", 3, "$.a[last-3 to last-3][3]", true},
+		{"$**.a[3]", -3, "$**.a[3][last-2]", true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.expression, func(t *testing.T) {
+			pe, err := ParseJSONPathExpr(test.expression)
+			require.NoError(t, err)
+
+			pe = pe.pushBackOneArraySelectionLeg(jsonPathArraySelectionIndex{index: jsonPathArrayIndexFromStart(test.index)})
+			require.Equal(t, test.expected, pe.String())
+			require.Equal(t, test.couldReturnMultipleValues, pe.CouldMatchMultipleValues())
+		})
+	}
+}
+
+func TestPushBackOneKeyLeg(t *testing.T) {
+	var tests = []struct {
+		expression                string
+		key                       string
+		expected                  string
+		couldReturnMultipleValues bool
+	}{
+		{"$", "aa", "$.aa", false},
+		{"$.a[1]", "aa", "$.a[1].aa", false},
+		{"$.a[1]", "*", "$.a[1].*", true},
+		{"$.a[*]", "k", "$.a[*].k", true},
+		{"$.*[2]", "bb", "$.*[2].bb", true},
+		{"$**.a[3]", "cc", "$**.a[3].cc", true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.expression, func(t *testing.T) {
+			pe, err := ParseJSONPathExpr(test.expression)
+			require.NoError(t, err)
+
+			pe = pe.pushBackOneKeyLeg(test.key)
+			require.Equal(t, test.expected, pe.String())
+			require.Equal(t, test.couldReturnMultipleValues, pe.CouldMatchMultipleValues())
+		})
+	}
+}

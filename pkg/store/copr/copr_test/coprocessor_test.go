@@ -1,0 +1,873 @@
+// Copyright 2022 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package copr_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/coprocessor"
+	"github.com/pingcap/kvproto/pkg/meta_storagepb"
+	rmpb "github.com/pingcap/kvproto/pkg/resource_manager"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/resourcegroup/runaway"
+	"github.com/pingcap/tidb/pkg/session"
+	"github.com/pingcap/tidb/pkg/store/copr"
+	"github.com/pingcap/tidb/pkg/store/mockstore"
+	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
+	"github.com/pingcap/tipb/go-tipb"
+	"github.com/stretchr/testify/require"
+	"github.com/tikv/client-go/v2/testutils"
+	"github.com/tikv/client-go/v2/tikvrpc"
+	pd "github.com/tikv/pd/client"
+	"github.com/tikv/pd/client/constants"
+	"github.com/tikv/pd/client/opt"
+	rmclient "github.com/tikv/pd/client/resource_group/controller"
+)
+
+// getKeyspaceAwareKey uses the actual store codec to encode keys properly
+// This ensures we use the single source of truth for keyspace encoding
+func getKeyspaceAwareKey(store kv.Storage, key []byte) []byte {
+	if !kerneltype.IsNextGen() {
+		return key
+	}
+
+	// Use the store's codec to encode the key - this is the single source of truth
+	codec := store.GetCodec()
+	return codec.EncodeKey(key)
+}
+
+func TestBuildCopIteratorWithRowCountHint(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+
+	// Get keyspace-aware region boundaries by creating a temp store to access codec
+	tempStore, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+	g := getKeyspaceAwareKey(tempStore, []byte("g"))
+	n := getKeyspaceAwareKey(tempStore, []byte("n"))
+	tKey := getKeyspaceAwareKey(tempStore, []byte("t"))
+	tempStore.Close()
+
+	store, err := mockstore.NewMockStore(
+		mockstore.WithClusterInspector(func(c testutils.Cluster) {
+			mockstore.BootstrapWithMultiRegions(c, g, n, tKey)
+		}),
+	)
+	require.NoError(t, err)
+	defer require.NoError(t, store.Close())
+	copClient := store.GetClient().(*copr.CopClient)
+	ctx := context.Background()
+	killed := uint32(0)
+	vars := kv.NewVariables(&killed)
+	opt := &kv.ClientSendOption{}
+
+	ranges := copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	req := &kv.Request{
+		Tp:          kv.ReqTypeDAG,
+		KeyRanges:   kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 1, 3, copr.CopSmallTaskRow}),
+		Concurrency: 15,
+	}
+	it, errRes := copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	conc, smallConc := it.GetConcurrency()
+	rateLimit := it.GetSendRate()
+	require.Equal(t, conc, 1)
+	require.Equal(t, smallConc, 1)
+	require.Equal(t, rateLimit.GetCapacity(), 2)
+
+	ranges = copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	req = &kv.Request{
+		Tp:          kv.ReqTypeDAG,
+		KeyRanges:   kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 1, 3, 3}),
+		Concurrency: 15,
+	}
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	conc, smallConc = it.GetConcurrency()
+	rateLimit = it.GetSendRate()
+	require.Equal(t, conc, 1)
+	require.Equal(t, smallConc, 2)
+	require.Equal(t, rateLimit.GetCapacity(), 3)
+
+	// cross-region long range
+	ranges = copr.BuildKeyRanges("a", "z")
+	req = &kv.Request{
+		Tp:          kv.ReqTypeDAG,
+		KeyRanges:   kv.NewNonParitionedKeyRangesWithHint(ranges, []int{10}),
+		Concurrency: 15,
+	}
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	conc, smallConc = it.GetConcurrency()
+	rateLimit = it.GetSendRate()
+	require.Equal(t, conc, 1)
+	require.Equal(t, smallConc, 2)
+	require.Equal(t, rateLimit.GetCapacity(), 3)
+
+	ranges = copr.BuildKeyRanges("a", "z")
+	req = &kv.Request{
+		Tp:          kv.ReqTypeDAG,
+		KeyRanges:   kv.NewNonParitionedKeyRangesWithHint(ranges, []int{copr.CopSmallTaskRow + 1}),
+		Concurrency: 15,
+	}
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	conc, smallConc = it.GetConcurrency()
+	rateLimit = it.GetSendRate()
+	require.Equal(t, conc, 4)
+	require.Equal(t, smallConc, 0)
+	require.Equal(t, rateLimit.GetCapacity(), 4)
+}
+
+func TestBuildCopIteratorWithSharedRequestLimiter(t *testing.T) {
+	store, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+	defer require.NoError(t, store.Close())
+
+	copClient := store.GetClient().(*copr.CopClient)
+	ctx := context.Background()
+	killed := uint32(0)
+	vars := kv.NewVariables(&killed)
+	opt := &kv.ClientSendOption{}
+	ranges := copr.BuildKeyRanges("a", "z")
+
+	testCases := []struct {
+		name      string
+		keepOrder bool
+	}{
+		{name: "keep-order", keepOrder: true},
+		{name: "non-keep-order", keepOrder: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			shared := kv.NewCoprRequestLimiter(7)
+			req := &kv.Request{
+				Tp:                 kv.ReqTypeDAG,
+				KeyRanges:          kv.NewNonPartitionedKeyRanges(ranges),
+				Concurrency:        15,
+				KeepOrder:          tc.keepOrder,
+				CoprRequestLimiter: shared,
+			}
+			it, errRes := copClient.BuildCopIterator(ctx, req, vars, opt)
+			require.Nil(t, errRes)
+			require.Same(t, shared, it.GetRequestLimiter())
+			require.Equal(t, 7, it.GetRequestLimiter().Capacity())
+		})
+	}
+}
+
+func TestQueryCopStoreLimiterLimitsSameStoreCoprRequests(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_distsql_scan_concurrency=8")
+	tk.MustExec("set @@tidb_query_cop_store_limit=1")
+	tk.MustExec("set @@tidb_enable_paging=off")
+	targetConnID := tk.Session().GetSessionVars().ConnectionID
+
+	tk.MustExec("create table t (id int primary key, v int)")
+	for i := range 100 {
+		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
+	}
+	tk.MustQuery("split table t by (20), (40), (60), (80)").Check(testkit.Rows("4 1"))
+	tk.MustQuery("select sum(v) from t where id >= 0").Check(testkit.Rows("4950"))
+
+	// Force the regular cop iterator worker path and keep all region tasks visible
+	// to the query-scoped per-store limiter.
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/distsql/TryCopLiteWorker", "return(1)"))
+	defer func() {
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/distsql/TryCopLiteWorker"))
+	}()
+
+	enteredFirstRequest := make(chan struct{})
+	enteredSecondAcquire := make(chan struct{})
+	releaseFirstRequest := make(chan struct{})
+	var firstRequestBlocked atomic.Bool
+	var firstRequestReleased atomic.Bool
+	var secondAcquireEntered atomic.Bool
+	var active atomic.Int64
+	var acquireCount atomic.Int64
+	var acquireStoreID atomic.Uint64
+	var differentStoreAcquireCount atomic.Int64
+	var maxActive atomic.Int64
+	var sendCount atomic.Int64
+	releaseFirst := func() {
+		if firstRequestReleased.CompareAndSwap(false, true) {
+			close(releaseFirstRequest)
+		}
+	}
+	defer releaseFirst()
+
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/store/copr/onBeforeAcquireCoprRequestLimiter", func(req *tikvrpc.Request, storeID uint64) {
+		copReq, ok := req.Req.(*coprocessor.Request)
+		if !ok || copReq.ConnectionId != targetConnID {
+			return
+		}
+
+		for {
+			current := acquireStoreID.Load()
+			if current != 0 {
+				if current != storeID {
+					differentStoreAcquireCount.Add(1)
+				}
+				break
+			}
+			if acquireStoreID.CompareAndSwap(0, storeID) {
+				break
+			}
+		}
+
+		if acquireCount.Add(1) == 2 && secondAcquireEntered.CompareAndSwap(false, true) {
+			close(enteredSecondAcquire)
+		}
+	})
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/store/copr/onBeforeSendReqCtx", func(req *tikvrpc.Request) {
+		copReq, ok := req.Req.(*coprocessor.Request)
+		if !ok || copReq.ConnectionId != targetConnID {
+			return
+		}
+
+		cur := active.Add(1)
+		sendCount.Add(1)
+		for {
+			old := maxActive.Load()
+			if cur <= old || maxActive.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		defer active.Add(-1)
+
+		if firstRequestBlocked.CompareAndSwap(false, true) {
+			close(enteredFirstRequest)
+			<-releaseFirstRequest
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		tk.MustQuery("select sum(v) from t where id >= 0").Check(testkit.Rows("4950"))
+		done <- nil
+	}()
+
+	select {
+	case <-enteredFirstRequest:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for the first cop request")
+	}
+
+	select {
+	case <-enteredSecondAcquire:
+	case err := <-done:
+		require.NoError(t, err)
+		require.Fail(t, "query should not finish before a second same-store cop request attempts to enter the limiter")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for the second same-store cop request to enter the limiter")
+	}
+	require.NotZero(t, acquireStoreID.Load())
+	require.Equal(t, int64(0), differentStoreAcquireCount.Load())
+	require.Equal(t, int64(1), active.Load())
+	require.Equal(t, int64(1), maxActive.Load())
+	require.Equal(t, int64(1), sendCount.Load())
+
+	releaseFirst()
+	require.NoError(t, <-done)
+	require.GreaterOrEqual(t, sendCount.Load(), int64(2))
+	require.Equal(t, int64(1), maxActive.Load())
+}
+
+func TestRequestLocalCoprLimiterLimitsConcurrentRequests(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@tidb_distsql_scan_concurrency=8")
+	tk.MustExec("set @@tidb_query_cop_store_limit=0")
+	tk.MustExec("set @@tidb_enable_paging=off")
+	targetConnID := tk.Session().GetSessionVars().ConnectionID
+
+	tk.MustExec("create table t (id int primary key, v int)")
+	for i := range 100 {
+		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i, i))
+	}
+	tk.MustQuery("split table t by (20), (40), (60), (80)").Check(testkit.Rows("4 1"))
+	tk.MustQuery("select sum(v) from t where id >= 0").Check(testkit.Rows("4950"))
+
+	requestLimiter := kv.NewCoprRequestLimiter(1)
+	var unexpectedQueryLimiter atomic.Bool
+	setRequestLimiter := func(req *kv.Request) {
+		if req.ConnID != targetConnID {
+			return
+		}
+		if req.QueryCopStoreLimiter != nil {
+			unexpectedQueryLimiter.Store(true)
+		}
+		req.CoprRequestLimiter = requestLimiter
+	}
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/distsql/TryCopLiteWorker", "return(1)"))
+	defer func() {
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/distsql/TryCopLiteWorker"))
+	}()
+
+	enteredFirstRequest := make(chan struct{})
+	enteredSecondAcquire := make(chan struct{})
+	releaseFirstRequest := make(chan struct{})
+	var firstRequestBlocked atomic.Bool
+	var firstRequestReleased atomic.Bool
+	var acquireCount atomic.Int64
+	var sendCount atomic.Int64
+	releaseFirst := func() {
+		if firstRequestReleased.CompareAndSwap(false, true) {
+			close(releaseFirstRequest)
+		}
+	}
+	defer releaseFirst()
+
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/store/copr/onBeforeAcquireCoprRequestLimiter", func(req *tikvrpc.Request, _ uint64) {
+		copReq, ok := req.Req.(*coprocessor.Request)
+		if !ok || copReq.ConnectionId != targetConnID {
+			return
+		}
+		if acquireCount.Add(1) == 2 {
+			close(enteredSecondAcquire)
+		}
+	})
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/store/copr/onBeforeSendReqCtx", func(req *tikvrpc.Request) {
+		copReq, ok := req.Req.(*coprocessor.Request)
+		if !ok || copReq.ConnectionId != targetConnID {
+			return
+		}
+		sendCount.Add(1)
+		if firstRequestBlocked.CompareAndSwap(false, true) {
+			close(enteredFirstRequest)
+			<-releaseFirstRequest
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnOthers)
+		ctx = context.WithValue(ctx, "CheckSelectRequestHook", setRequestLimiter)
+		rs, err := tk.Session().ExecuteInternal(ctx, "select sum(v) from t where id >= 0")
+		if err != nil {
+			done <- err
+			return
+		}
+		_, err = session.GetRows4Test(ctx, tk.Session(), rs)
+		if closeErr := rs.Close(); err == nil {
+			err = closeErr
+		}
+		done <- err
+	}()
+	select {
+	case <-enteredFirstRequest:
+	case err := <-done:
+		require.NoError(t, err)
+		require.Fail(t, "query finished before sending the first cop request")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for the first cop request")
+	}
+	select {
+	case <-enteredSecondAcquire:
+	case err := <-done:
+		require.NoError(t, err)
+		require.Fail(t, "query finished before the second request entered the request-local limiter")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for the second cop request to enter the request-local limiter")
+	}
+	require.Equal(t, int64(1), sendCount.Load())
+
+	releaseFirst()
+	require.NoError(t, <-done)
+	require.GreaterOrEqual(t, sendCount.Load(), int64(2))
+	require.False(t, unexpectedQueryLimiter.Load())
+}
+
+func TestBuildCopIteratorWithBatchStoreCopr(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+	// Note: In NextGen mode, keys are keyspace-prefixed, so we need to adjust region boundaries
+
+	// Get keyspace-aware region boundaries by creating a temp store to access codec
+	tempStore, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+	g := getKeyspaceAwareKey(tempStore, []byte("g"))
+	n := getKeyspaceAwareKey(tempStore, []byte("n"))
+	tKey := getKeyspaceAwareKey(tempStore, []byte("t"))
+	tempStore.Close()
+
+	store, err := mockstore.NewMockStore(
+		mockstore.WithClusterInspector(func(c testutils.Cluster) {
+			mockstore.BootstrapWithMultiRegions(c, g, n, tKey)
+		}),
+	)
+	require.NoError(t, err)
+	defer require.NoError(t, store.Close())
+	copClient := store.GetClient().(*copr.CopClient)
+	ctx := context.Background()
+	killed := uint32(0)
+	vars := kv.NewVariables(&killed)
+	opt := &kv.ClientSendOption{}
+
+	ranges := copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	req := &kv.Request{
+		Tp:             kv.ReqTypeDAG,
+		KeyRanges:      kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 1, 3, 3}),
+		Concurrency:    15,
+		StoreBatchSize: 1,
+	}
+	it, errRes := copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	tasks := it.GetTasks()
+	require.Equal(t, len(tasks), 2)
+	require.Equal(t, len(tasks[0].ToPBBatchTasks()), 1)
+	require.Equal(t, tasks[0].RowCountHint, 5)
+	require.Equal(t, len(tasks[1].ToPBBatchTasks()), 1)
+	require.Equal(t, tasks[1].RowCountHint, 9)
+
+	ranges = copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	req = &kv.Request{
+		Tp:             kv.ReqTypeDAG,
+		KeyRanges:      kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 1, 3, 3}),
+		Concurrency:    15,
+		StoreBatchSize: 3,
+	}
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	tasks = it.GetTasks()
+	require.Equal(t, len(tasks), 1)
+	require.Equal(t, len(tasks[0].ToPBBatchTasks()), 3)
+	require.Equal(t, tasks[0].RowCountHint, 14)
+
+	// paging will disable store batch.
+	ranges = copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	req = &kv.Request{
+		Tp:             kv.ReqTypeDAG,
+		KeyRanges:      kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 1, 3, 3}),
+		Concurrency:    15,
+		StoreBatchSize: 3,
+		Paging: struct {
+			Enable          bool
+			MinPagingSize   uint64
+			MaxPagingSize   uint64
+			PagingSizeBytes uint64
+		}{
+			Enable:        true,
+			MinPagingSize: 1,
+			MaxPagingSize: 1024,
+		},
+	}
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	tasks = it.GetTasks()
+	require.Equal(t, len(tasks), 4)
+
+	// byte-budget paging disables store batch without changing row-count paging.
+	ranges = copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	req = &kv.Request{
+		Tp:             kv.ReqTypeDAG,
+		StoreType:      kv.TiKV,
+		KeyRanges:      kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 1, 3, 3}),
+		Concurrency:    15,
+		StoreBatchSize: 3,
+	}
+	req.Paging.PagingSizeBytes = uint64(4 * 1024 * 1024)
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	tasks = it.GetTasks()
+	require.Equal(t, len(tasks), 4)
+	require.False(t, req.Paging.Enable)
+	require.Zero(t, req.Paging.MinPagingSize)
+	require.Zero(t, req.Paging.MaxPagingSize)
+	// The byte budget is kept for TiKV DAG requests.
+	require.Equal(t, uint64(4*1024*1024), req.Paging.PagingSizeBytes)
+
+	// A byte budget bounds a page but is not a read-size prediction, so RPCs
+	// sent before any page is observed carry no pre-charge hint. Cancel at the
+	// pre-send hook so this does not depend on a TiKV response.
+	req = &kv.Request{
+		Tp:          kv.ReqTypeDAG,
+		StoreType:   kv.TiKV,
+		KeyRanges:   kv.NewNonParitionedKeyRangesWithHint(copr.BuildKeyRanges("a", "c"), nil),
+		Concurrency: 15,
+	}
+	req.Paging.PagingSizeBytes = uint64(4 * 1024 * 1024)
+	func() {
+		predictedReadBytes := make(chan uint64, 1)
+		hintCtx, cancelHint := context.WithTimeout(ctx, 5*time.Second)
+		defer cancelHint()
+		// Disable explicitly: the same failpoint is enabled again below with a test cleanup.
+		require.NoError(t, failpoint.EnableCall("github.com/pingcap/tidb/pkg/store/copr/onBeforeSendReqCtx", func(rpcReq *tikvrpc.Request) {
+			if _, ok := rpcReq.Req.(*coprocessor.Request); !ok {
+				return
+			}
+			select {
+			case predictedReadBytes <- rpcReq.PredictedReadBytes:
+			default:
+			}
+			cancelHint()
+		}))
+		defer func() {
+			require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/store/copr/onBeforeSendReqCtx"))
+		}()
+		hintResp := copClient.Send(hintCtx, req, vars, opt)
+		_, err := hintResp.Next(hintCtx)
+		require.ErrorIs(t, err, context.Canceled)
+		require.NoError(t, hintResp.Close())
+		require.Zero(t, <-predictedReadBytes)
+	}()
+
+	// byte-budget paging only applies to TiKV DAG requests; a non-DAG request
+	// drops the budget so req.Paging.PagingSizeBytes is the single source of truth.
+	req = &kv.Request{
+		Tp:          kv.ReqTypeAnalyze,
+		StoreType:   kv.TiKV,
+		KeyRanges:   kv.NewNonParitionedKeyRangesWithHint(copr.BuildKeyRanges("a", "c"), nil),
+		Concurrency: 15,
+	}
+	req.Paging.PagingSizeBytes = uint64(4 * 1024 * 1024)
+	_, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	require.Zero(t, req.Paging.PagingSizeBytes)
+
+	// StoreBatchSize alone must not change legacy eligibility for internal,
+	// unhinted Analyze requests; the merged-response contract is explicit opt-in.
+	ranges = copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	req = &kv.Request{
+		Tp:             kv.ReqTypeAnalyze,
+		StoreType:      kv.TiKV,
+		KeyRanges:      kv.NewNonParitionedKeyRangesWithHint(ranges, nil),
+		Concurrency:    15,
+		StoreBatchSize: 3,
+	}
+	req.RequestSource.RequestSourceInternal = true
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	require.Len(t, it.GetTasks(), 4)
+
+	// BuildCopIterator clears StoreBatchSize in place; restore it so the second
+	// build changes only the capability.
+	req.StoreBatchSize = 3
+	req.AllowBatchTaskDataMerge = true
+	req.ExecuteBatchTasksSerially = true
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	tasks = it.GetTasks()
+	require.Len(t, tasks, 1)
+	require.Len(t, tasks[0].ToPBBatchTasks(), 3)
+	require.Equal(t, -1, tasks[0].RowCountHint)
+
+	// Cancel at the pre-send hook so this checks request encoding without depending
+	// on a TiKV response.
+	req.KeyRanges = kv.NewNonParitionedKeyRangesWithHint(copr.BuildKeyRanges("a", "c"), nil)
+	req.StoreBatchSize = 3
+	type batchRequestFlags struct {
+		allowMerge      bool
+		executeSerially bool
+	}
+	wireFlags := make(chan batchRequestFlags, 1)
+	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/store/copr/onBeforeSendReqCtx", func(rpcReq *tikvrpc.Request) {
+		copReq, ok := rpcReq.Req.(*coprocessor.Request)
+		if !ok || copReq.Tp != kv.ReqTypeAnalyze {
+			return
+		}
+		wireFlags <- batchRequestFlags{
+			allowMerge:      copReq.AllowBatchTaskDataMerge,
+			executeSerially: copReq.ExecuteBatchTasksSerially,
+		}
+		cancel()
+	})
+	resp := copClient.Send(sendCtx, req, vars, opt)
+	_, err = resp.Next(sendCtx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NoError(t, resp.Close())
+	flags := <-wireFlags
+	require.True(t, flags.allowMerge)
+	require.True(t, flags.executeSerially)
+
+	// only small tasks will be batched.
+	ranges = copr.BuildKeyRanges("a", "b", "h", "i", "o", "p")
+	req = &kv.Request{
+		Tp:             kv.ReqTypeDAG,
+		KeyRanges:      kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 33, 32}),
+		Concurrency:    15,
+		StoreBatchSize: 3,
+	}
+	it, errRes = copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	tasks = it.GetTasks()
+	require.Equal(t, len(tasks), 2)
+	require.Equal(t, len(tasks[0].ToPBBatchTasks()), 1)
+	require.Equal(t, len(tasks[1].ToPBBatchTasks()), 0)
+}
+
+type mockResourceGroupProvider struct {
+	rmclient.ResourceGroupProvider
+	cfg rmclient.Config
+}
+
+func (p *mockResourceGroupProvider) Get(ctx context.Context, key []byte, opts ...opt.MetaStorageOption) (*meta_storagepb.GetResponse, error) {
+	if !bytes.Equal(pd.ControllerConfigPathPrefixBytes, key) {
+		return nil, errors.New("unsupported configPath")
+	}
+	payload, _ := json.Marshal(&p.cfg)
+	return &meta_storagepb.GetResponse{
+		Count: 1,
+		Kvs: []*meta_storagepb.KeyValue{
+			{
+				Key:   key,
+				Value: payload,
+			},
+		},
+	}, nil
+}
+
+func (p *mockResourceGroupProvider) GetResourceGroup(ctx context.Context, name string, opts ...pd.GetResourceGroupOption) (*rmpb.ResourceGroup, error) {
+	group1 := "rg1"
+	if name == group1 {
+		return &rmpb.ResourceGroup{
+			Name: group1,
+			Mode: rmpb.GroupMode_RUMode,
+			RUSettings: &rmpb.GroupRequestUnitSettings{
+				RU: &rmpb.TokenBucket{
+					Settings: &rmpb.TokenLimitSettings{
+						FillRate:   2000,
+						BurstLimit: 2000,
+					},
+				},
+			},
+			RunawaySettings: &rmpb.RunawaySettings{
+				Rule: &rmpb.RunawayRule{
+					ExecElapsedTimeMs: 1000,
+				},
+				Action: rmpb.RunawayAction_DryRun,
+			},
+		}, nil
+	}
+	return nil, errors.New("not found")
+}
+
+func TestBuildCopIteratorWithRunawayChecker(t *testing.T) {
+	// nil --- 'g' --- 'n' --- 't' --- nil
+	// <-  0  -> <- 1 -> <- 2 -> <- 3 ->
+
+	// Get keyspace-aware region boundaries by creating a temp store to access codec
+	tempStore, err := mockstore.NewMockStore()
+	require.NoError(t, err)
+	g := getKeyspaceAwareKey(tempStore, []byte("g"))
+	n := getKeyspaceAwareKey(tempStore, []byte("n"))
+	tKey := getKeyspaceAwareKey(tempStore, []byte("t"))
+	tempStore.Close()
+
+	store, err := mockstore.NewMockStore(
+		mockstore.WithClusterInspector(func(c testutils.Cluster) {
+			mockstore.BootstrapWithMultiRegions(c, g, n, tKey)
+		}),
+	)
+	require.NoError(t, err)
+	defer require.NoError(t, store.Close())
+	copClient := store.GetClient().(*copr.CopClient)
+	ctx := context.Background()
+	killed := uint32(0)
+	vars := kv.NewVariables(&killed)
+	opt := &kv.ClientSendOption{}
+	mockPrivider := &mockResourceGroupProvider{
+		cfg: *rmclient.DefaultConfig(),
+	}
+
+	ranges := copr.BuildKeyRanges("a", "c", "d", "e", "h", "x", "y", "z")
+	resourceCtl, err := rmclient.NewResourceGroupController(context.Background(), 1, mockPrivider, nil, constants.NullKeyspaceID)
+	require.NoError(t, err)
+	manager := runaway.NewRunawayManager(resourceCtl, "mock://test", nil, nil, nil, nil)
+	defer manager.Stop()
+
+	sql := "select * from t"
+	group1 := "rg1"
+	checker := manager.DeriveChecker(group1, sql, "test", "test", time.Now())
+	manager.AddWatch(&runaway.QuarantineRecord{
+		ID:                1,
+		ResourceGroupName: group1,
+		Watch:             rmpb.RunawayWatchType_Exact,
+		WatchText:         sql,
+		Action:            rmpb.RunawayAction_CoolDown,
+	})
+	req := &kv.Request{
+		Tp:                kv.ReqTypeDAG,
+		KeyRanges:         kv.NewNonParitionedKeyRangesWithHint(ranges, []int{1, 1, 3, 3}),
+		Concurrency:       15,
+		RunawayChecker:    checker,
+		ResourceGroupName: group1,
+	}
+	checker.BeforeExecutor()
+	it, errRes := copClient.BuildCopIterator(ctx, req, vars, opt)
+	require.Nil(t, errRes)
+	concurrency, smallTaskConcurrency := it.GetConcurrency()
+	require.Equal(t, concurrency, 1)
+	require.Equal(t, smallTaskConcurrency, 0)
+}
+
+func TestQueryWithConcurrentSmallCop(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t1 (id int key, b int, c int, index idx_b(b)) partition by hash(id) partitions 10;")
+	for i := range 10 {
+		tk.MustExec(fmt.Sprintf("insert into t1 values (%v, %v, %v)", i, i, i))
+	}
+	tk.MustExec("create table t2 (id bigint unsigned key, b int, index idx_b (b));")
+	tk.MustExec("insert into t2 values (1,1), (18446744073709551615,2)")
+	tk.MustExec("set @@tidb_distsql_scan_concurrency=15")
+	tk.MustExec("set @@tidb_executor_concurrency=15")
+	tk.MustExec("set @@tidb_session_alias = 'concurrent_small_cop'")
+	assertCopWaves := func(sql string, indexRequests, tableRequests int) {
+		t.Helper()
+		waves := []struct {
+			scan     tipb.ExecType
+			expected int
+			arrived  atomic.Int32
+			ready    chan struct{}
+		}{
+			{scan: tipb.ExecType_TypeIndexScan, expected: indexRequests, ready: make(chan struct{})},
+			{scan: tipb.ExecType_TypeTableScan, expected: tableRequests, ready: make(chan struct{})},
+		}
+		// The deadline bounds a broken concurrency invariant, rather than
+		// imposing a latency requirement on a normally scheduled query.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		const hook = "github.com/pingcap/tidb/pkg/store/copr/onBeforeSendReqCtx"
+		require.NoError(t, failpoint.EnableCall(hook, func(req *tikvrpc.Request) {
+			copReq, ok := req.Req.(*coprocessor.Request)
+			if !ok || copReq.ConnectionAlias != "concurrent_small_cop" {
+				return
+			}
+			var dag tipb.DAGRequest
+			if err := dag.Unmarshal(copReq.Data); err != nil || len(dag.Executors) == 0 {
+				t.Errorf("invalid Cop DAG request: %v", err)
+				return
+			}
+			for i := range waves {
+				wave := &waves[i]
+				if dag.Executors[0].Tp != wave.scan {
+					continue
+				}
+				arrived := int(wave.arrived.Add(1))
+				if arrived > wave.expected {
+					t.Errorf("unexpected extra %s request: %s", wave.scan, sql)
+					return
+				}
+				if arrived == wave.expected {
+					close(wave.ready)
+				}
+				// No request in this wave may finish until all have reached the hook.
+				select {
+				case <-wave.ready:
+				case <-ctx.Done():
+					t.Errorf("only %d of %d %s requests overlapped: %s", wave.arrived.Load(), wave.expected, wave.scan, sql)
+				}
+				return
+			}
+			t.Errorf("unexpected Cop scan type %s: %s", dag.Executors[0].Tp, sql)
+		}))
+		defer func() { require.NoError(t, failpoint.Disable(hook)) }()
+		// Cancel before disabling the hook so a failed query releases blocked requests.
+		defer cancel()
+		tk.MustQueryWithContext(ctx, sql)
+		require.NoError(t, ctx.Err(), sql)
+		for i := range waves {
+			require.EqualValues(t, waves[i].expected, waves[i].arrived.Load(), sql)
+		}
+	}
+	// The index lookup needs one wave for all ten partition index scans,
+	// followed by one wave for all ten table lookups.
+	// Test for https://github.com/pingcap/tidb/pull/57522#discussion_r1875515863
+	assertCopWaves("select sum(c) from t1 use index (idx_b) where b < 10;", 10, 10)
+	// The covering index reader batches all ten partition ranges into one request.
+	assertCopWaves("select id, b from t1 use index (idx_b) where b < 10;", 1, 0)
+	// The table reader must scan all ten partitions in one wave.
+	assertCopWaves("select * from t1 where c < 10;", 0, 10)
+	// The ordered unsigned handle scan must read its two ranges in one wave.
+	assertCopWaves("select * from t2 where id >= 1 and id <= 18446744073709551615 order by id;", 0, 2)
+}
+
+func TestDMLWithLiteCopWorker(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t1 (id bigint auto_increment key, b int);")
+	tk.MustExec("insert into t1 (b) values (1),(2),(3),(4),(5),(6),(7),(8);")
+	for range 8 {
+		tk.MustExec("insert into t1 (b) select b from t1;")
+	}
+	tk.MustQuery("select count(*) from t1").Check(testkit.Rows("2048"))
+	tk.MustExec("set @@tidb_enable_paging = off")
+	tk.MustExec("set @@tidb_session_alias = 'dml_lite_worker_fallback'")
+	var fallbackTriggered atomic.Bool
+	copr.SetLiteWorkerFallbackHookForTest(func() {
+		fallbackTriggered.Store(true)
+	})
+	defer copr.SetLiteWorkerFallbackHookForTest(nil)
+
+	// First run update before split, it should not trigger fallback.
+	tk.MustExec("update t1 set b=b+1 where id >= 0;")
+	require.False(t, fallbackTriggered.Load(), "unexpected lite worker fallback before split")
+
+	// Then split while the next update request is paused so fallback path is deterministically exercised.
+	fallbackTriggered.Store(false)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var blocked atomic.Bool
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/store/copr/onBeforeSendReqCtx", func(req *tikvrpc.Request) {
+		copReq, ok := req.Req.(*coprocessor.Request)
+		if !ok || copReq.ConnectionAlias != "dml_lite_worker_fallback" {
+			return
+		}
+		if blocked.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := tk.Exec("update t1 set b=b+1 where id >= 0;")
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "timeout waiting for cop request")
+	}
+	tkSplit := testkit.NewTestKit(t, store)
+	tkSplit.MustExec("use test")
+	tkSplit.MustQuery("split table t1 by (1025);").Check(testkit.Rows("1 1"))
+	close(release)
+	require.NoError(t, <-done)
+	require.True(t, fallbackTriggered.Load(), "lite worker fallback hook not triggered")
+
+	// Test select after split table.
+	tk.MustExec("truncate table t1;")
+	tk.MustExec("insert into t1 (b) values (1),(2),(3),(4),(5),(6),(7),(8);")
+	tk.MustQuery("split table t1 by (3), (6), (9);").Check(testkit.Rows("3 1"))
+	tk.MustQuery("select b from t1 order by id").Check(testkit.Rows("1", "2", "3", "4", "5", "6", "7", "8"))
+}

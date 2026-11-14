@@ -1,0 +1,359 @@
+// Copyright 2015 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package server
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"net"
+	"net/http"
+	"path/filepath"
+	"testing"
+
+	"github.com/pingcap/tidb/pkg/config/deploymode"
+	"github.com/pingcap/tidb/pkg/config/diagnosticmode"
+	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/keyspace"
+	"github.com/pingcap/tidb/pkg/parser/auth"
+	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/extstore"
+	"github.com/pingcap/tidb/pkg/server/internal/packetio"
+	"github.com/pingcap/tidb/pkg/server/internal/testutil"
+	"github.com/pingcap/tidb/pkg/server/internal/util"
+	"github.com/pingcap/tidb/pkg/session/sessmgr"
+	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/testkit/testdata"
+	"github.com/pingcap/tidb/pkg/util/arena"
+	"github.com/pingcap/tidb/pkg/util/chunk"
+	"github.com/pingcap/tidb/pkg/util/intest"
+	"github.com/pingcap/tidb/pkg/util/replayer"
+	"github.com/stretchr/testify/require"
+	uatomic "go.uber.org/atomic"
+)
+
+type testStandbyController struct{}
+
+func (*testStandbyController) WaitForActivate() {}
+
+func (*testStandbyController) EndStandby(error) {}
+
+func (*testStandbyController) Handler(*Server) (string, *http.ServeMux) {
+	return "/test-standby/", http.NewServeMux()
+}
+
+func (*testStandbyController) OnConnActive() {}
+
+func (*testStandbyController) PrepareForActivation(StandbyReadyServer) error { return nil }
+
+func (*testStandbyController) OnServerCreated(*Server) {}
+
+func (*testStandbyController) OnServerShutdown(StandbyShutdownServer) {}
+
+func TestIssue46197(t *testing.T) {
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	storage, err := extstore.NewExtStorage(ctx, "file://"+tempDir, "")
+	require.NoError(t, err)
+	extstore.SetGlobalExtStorageForTest(storage)
+	defer func() {
+		extstore.SetGlobalExtStorageForTest(nil)
+		storage.Close()
+	}()
+
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tidbdrv := NewTiDBDriver(store)
+	cfg := util.NewTestConfig()
+	cfg.Port, cfg.Status.StatusPort = 0, 0
+	cfg.Status.ReportStatus = false
+	server, err := NewServer(cfg, tidbdrv)
+	require.NoError(t, err)
+	defer server.Close()
+
+	// Mock the content of the SQL file in PacketIO buffer.
+	// First 4 bytes are the header, followed by the actual content.
+	// This acts like we are sending "select * from t1;" from the client when tidb requests the "a.txt" file.
+	var inBuffer bytes.Buffer
+	_, err = inBuffer.Write([]byte{0x11, 0x00, 0x00, 0x01})
+	require.NoError(t, err)
+	_, err = inBuffer.Write([]byte("select * from t1;"))
+	require.NoError(t, err)
+
+	// clientConn setup
+	brc := util.NewBufferedReadConn(&testutil.BytesConn{Buffer: inBuffer})
+	pkt := packetio.New(brc)
+	pkt.SetBufWriter(bufio.NewWriter(bytes.NewBuffer(nil)))
+	cc := &clientConn{
+		server:     server,
+		alloc:      arena.NewAllocator(1024),
+		chunkAlloc: chunk.NewAllocator(),
+		pkt:        pkt,
+		capability: mysql.ClientLocalFiles,
+	}
+	cc.SetCtx(&TiDBContext{Session: tk.Session(), stmts: make(map[int]*TiDBStatement)})
+
+	tk.MustExec("use test")
+	tk.MustExec("create table t1 (a int, b int)")
+
+	// 3 is mysql.ComQuery, followed by the SQL text.
+	require.NoError(t, cc.dispatch(ctx, []byte("\u0003plan replayer dump explain 'a.txt'")))
+
+	// clean up
+	path := testdata.ConvertRowsToStrings(tk.MustQuery("select @@tidb_last_plan_replayer_token").Rows())
+	require.NoError(t, storage.DeleteFile(ctx, filepath.Join(replayer.GetPlanReplayerDirName(), path[0])))
+}
+
+func TestGetConAttrs(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	tidbdrv := NewTiDBDriver(store)
+	cfg := util.NewTestConfig()
+	cfg.Port, cfg.Status.StatusPort = 0, 0
+	cfg.Status.ReportStatus = false
+	server, err := NewServer(cfg, tidbdrv)
+	require.NoError(t, err)
+
+	cc := &clientConn{
+		server:     server,
+		alloc:      arena.NewAllocator(1024),
+		chunkAlloc: chunk.NewAllocator(),
+		pkt:        packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+		attrs: map[string]string{
+			"_client_name": "tidb_test",
+		},
+		user:     "userA",
+		peerHost: "foo.example.com",
+	}
+	cc.SetCtx(&TiDBContext{Session: tk.Session(), stmts: make(map[int]*TiDBStatement)})
+	server.registerConn(cc)
+
+	// Connection IDs come from a process-wide counter, so this session is not
+	// always ID 1 when another test in the same shard creates a testkit first.
+	connID := tk.Session().GetSessionVars().ConnectionID
+
+	// Get attributes for all clients
+	attrs := server.GetConAttrs(nil)
+	require.Equal(t, "tidb_test", attrs[connID]["_client_name"])
+
+	// Get attributes for userA@foo.example.com, which should have results for this connection.
+	userA := &auth.UserIdentity{Username: "userA", Hostname: "foo.example.com"}
+	attrs = server.GetConAttrs(userA)
+	require.Equal(t, "tidb_test", attrs[connID]["_client_name"])
+	_, hasClientName := attrs[connID]
+	require.True(t, hasClientName)
+
+	// Get attributes for userB@foo.example.com, which should NOT have results for this connection.
+	userB := &auth.UserIdentity{Username: "userB", Hostname: "foo.example.com"}
+	attrs = server.GetConAttrs(userB)
+	_, hasClientName = attrs[connID]
+	require.False(t, hasClientName)
+
+	newConn := func(connID uint64, gwConnID string) *clientConn {
+		tk := testkit.NewTestKit(t, store)
+		cc := &clientConn{
+			connectionID: connID,
+			server:       server,
+			alloc:        arena.NewAllocator(1024),
+			chunkAlloc:   chunk.NewAllocator(),
+			pkt:          packetio.NewForTest(bufio.NewWriter(bytes.NewBuffer(nil))),
+			attrs: map[string]string{
+				tidbGatewayAttrsConnKey: gwConnID,
+			},
+		}
+		cc.SetCtx(&TiDBContext{Session: tk.Session(), stmts: make(map[int]*TiDBStatement)})
+		require.True(t, server.registerConn(cc))
+		return cc
+	}
+
+	const normalCloseMsg = sessmgr.NormalCloseMsgKillStmt
+	keyspaceName := keyspace.GetKeyspaceNameBySettings()
+	noStandbyConn := newConn(100, "gw-no-standby")
+	server.KillWithNormalCloseMsg(noStandbyConn.connectionID, false, false, false, normalCloseMsg)
+	require.Empty(t, server.GetNormalClosedConn(keyspaceName, "gw-no-standby"))
+
+	server.StandbyController = &testStandbyController{}
+	killConn := newConn(101, "gw-kill-connection")
+	require.Empty(t, server.GetNormalClosedConn(keyspaceName, "gw-kill-connection"))
+	server.KillWithNormalCloseMsg(killConn.connectionID, false, false, false, normalCloseMsg)
+	require.Equal(t, normalCloseMsg, server.GetNormalClosedConn(keyspaceName, "gw-kill-connection"))
+	require.Equal(t, int32(connStatusWaitShutdown), killConn.getStatus())
+
+	queryConn := newConn(102, "gw-kill-query")
+	server.KillWithNormalCloseMsg(queryConn.connectionID, true, false, false, normalCloseMsg)
+	require.Empty(t, server.GetNormalClosedConn(keyspaceName, "gw-kill-query"))
+}
+
+func TestSeverHealth(t *testing.T) {
+	RunInGoTestChan = make(chan struct{})
+	RunInGoTest = true
+	store := testkit.CreateMockStore(t)
+	tidbdrv := NewTiDBDriver(store)
+	cfg := util.NewTestConfig()
+	cfg.Port, cfg.Status.StatusPort = 0, 0
+	cfg.Status.ReportStatus = false
+	server, err := NewServer(cfg, tidbdrv)
+	require.NoError(t, err)
+	require.False(t, server.health.Load(), "server should not be healthy")
+	go func() {
+		err = server.Run(nil)
+		require.NoError(t, err)
+	}()
+	defer server.Close()
+	for range RunInGoTestChan {
+		// wait for server to be healthy
+	}
+	require.True(t, server.health.Load(), "server should be healthy")
+}
+
+func TestInitTiDBListenerIsIdempotent(t *testing.T) {
+	originalRunInGoTest := RunInGoTest
+	RunInGoTest = true
+	t.Cleanup(func() {
+		RunInGoTest = originalRunInGoTest
+	})
+
+	socketDir := t.TempDir()
+
+	cfg := util.NewTestConfig()
+	cfg.Port = 0
+	cfg.Status.ReportStatus = false
+	cfg.Socket = filepath.Join(socketDir, "normal.sock")
+	svr := NewTestServer(cfg)
+	t.Cleanup(svr.Close)
+
+	require.NoError(t, svr.initTiDBListener())
+	require.NotNil(t, svr.Listener())
+	require.NotNil(t, svr.Socket())
+	listenAddr := svr.Listener().Addr().String()
+
+	require.NoError(t, svr.initTiDBListener())
+	require.Equal(t, listenAddr, svr.Listener().Addr().String())
+	require.NotNil(t, svr.Socket())
+
+	t.Run("diagnostic skip grant", func(t *testing.T) {
+		if !intest.InTest {
+			t.Skip("diagnosticmode.SetForTest requires the intest build tag")
+		}
+		t.Cleanup(diagnosticmode.SetForTest(true))
+
+		t.Run("socket only", func(t *testing.T) {
+			cfg := util.NewTestConfig()
+			cfg.Security.SkipGrantTable = true
+			cfg.Port = 0
+			cfg.Socket = filepath.Join(socketDir, "diagnostic.sock")
+			svr := NewTestServer(cfg)
+			t.Cleanup(svr.Close)
+
+			require.NoError(t, svr.initTiDBListener())
+			require.Nil(t, svr.Listener())
+			require.NotNil(t, svr.Socket())
+			socket := svr.Socket()
+			require.NoError(t, svr.initTiDBListener())
+			require.Nil(t, svr.Listener())
+			require.Same(t, socket, svr.Socket())
+			require.Zero(t, cfg.Port)
+		})
+
+		for _, name := range []string{"configured TCP", "existing TCP listener", "missing socket"} {
+			t.Run(name, func(t *testing.T) {
+				cfg := util.NewTestConfig()
+				cfg.Security.SkipGrantTable = true
+				cfg.Port = 0
+				cfg.Socket = filepath.Join(socketDir, "diagnostic.sock")
+				svr := NewTestServer(cfg)
+				t.Cleanup(svr.Close)
+				switch name {
+				case "configured TCP":
+					cfg.Port = 4000
+				case "existing TCP listener":
+					var err error
+					svr.listener, err = net.Listen("tcp", "127.0.0.1:0")
+					require.NoError(t, err)
+				case "missing socket":
+					cfg.Socket = ""
+				}
+				require.ErrorContains(t, svr.initTiDBListener(), "requires a Unix socket and no MySQL TCP listener")
+				require.Nil(t, svr.Socket())
+			})
+		}
+	})
+}
+
+func TestServerShutdownFlags(t *testing.T) {
+	svr := NewTestServer(util.NewTestConfig())
+	require.False(t, svr.GetForceShutdown())
+	require.False(t, svr.GetNeedRequestMgrFree())
+
+	svr.SetForceShutdown()
+	svr.SetNeedRequestMgrFree()
+	require.True(t, svr.GetForceShutdown())
+	require.True(t, svr.GetNeedRequestMgrFree())
+}
+
+type mockStandbyController struct {
+	serverHealth         bool
+	serverInShutdownMode bool
+	called               chan struct{}
+}
+
+func (c *mockStandbyController) WaitForActivate() {}
+
+func (c *mockStandbyController) EndStandby(error) {}
+
+func (c *mockStandbyController) Handler(_ *Server) (string, *http.ServeMux) {
+	return "", nil
+}
+
+func (c *mockStandbyController) OnConnActive() {}
+
+func (c *mockStandbyController) PrepareForActivation(StandbyReadyServer) error { return nil }
+
+func (c *mockStandbyController) OnServerCreated(_ *Server) {}
+
+func (c *mockStandbyController) OnServerShutdown(svr StandbyShutdownServer) {
+	server := svr.(*Server)
+	c.serverHealth = server.Health()
+	c.serverInShutdownMode = server.inShutdownMode.Load()
+	close(c.called)
+}
+
+func TestStartShutdownMarksUnhealthyBeforeStarterCallback(t *testing.T) {
+	if kerneltype.IsClassic() {
+		t.Skip("only for nextgen kernel")
+	}
+
+	originalMode := deploymode.Get()
+	require.NoError(t, deploymode.Set(deploymode.Starter))
+	t.Cleanup(func() {
+		require.NoError(t, deploymode.Set(originalMode))
+	})
+
+	svr := NewTestServer(util.NewTestConfig())
+	svr.health = uatomic.NewBool(true)
+	svr.inShutdownMode = uatomic.NewBool(false)
+	svr.StandbyController = &mockStandbyController{called: make(chan struct{})}
+
+	svr.startShutdown()
+
+	controller := svr.StandbyController.(*mockStandbyController)
+	require.False(t, controller.serverHealth)
+	require.True(t, controller.serverInShutdownMode)
+	select {
+	case <-controller.called:
+	default:
+		require.Fail(t, "starter shutdown callback was not called")
+	}
+}
